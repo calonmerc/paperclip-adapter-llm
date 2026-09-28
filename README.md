@@ -86,10 +86,12 @@ Get a key at https://platform.deepseek.com.
 
 ## Installation
 
-This adapter is installed via Paperclip's **Local Path** option pointing at this repo's built `dist/` directory. The `dist/` directory is committed to git, so no build step is required at install time.
+This adapter is installed via Paperclip's **Local Path** option pointing at this repo's built `dist/` directory. The `dist/` directory is committed to git, so no build step is required at install time — but `node_modules/` is gitignored, so its runtime dependencies (`@paperclipai/adapter-utils`, `@paperclipai/shared`) still need to be installed once after cloning.
 
 ```bash
 git clone https://github.com/calonmerc/paperclip-adapter-llm.git
+cd paperclip-adapter-llm
+npm install --omit=dev
 # In Paperclip UI → Adapters → Add → Local Path
 # Path: /absolute/path/to/paperclip-adapter-llm
 ```
