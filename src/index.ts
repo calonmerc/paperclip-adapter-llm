@@ -199,8 +199,8 @@ export interface LlmConfig {
   topP?: number;
   stream?: boolean;
   reasoning?: boolean;
-  /** OpenRouter-specific. */
-  transforms?: string[];
+  /** OpenRouter-specific. Comma-separated string when set via the config-schema form field. */
+  transforms?: string[] | string;
   /** OpenRouter-specific. */
   route?: "fallback" | "no-fallback";
   /** OpenRouter-specific. */

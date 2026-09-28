@@ -13,7 +13,6 @@
  * Optional hooks not implemented (deferred to v3):
  *   - getQuotaWindows     — OpenRouter exposes /key endpoint, can be added
  *   - onHireApproved      — only used by cloud adapters
- *   - getConfigSchema     — UI form fields are still declared in src/ui/build-config.ts
  */
 
 import path from "node:path";
@@ -26,9 +25,10 @@ import type {
 
 import { execute } from "./execute.js";
 import { testEnvironment, listModels, listOpenRouterModels } from "./test.js";
+import { getConfigSchema } from "./config-schema.js";
 import { type, label, models, agentConfigurationDoc } from "../index.js";
 
-export { execute, testEnvironment, listModels, listOpenRouterModels };
+export { execute, testEnvironment, listModels, listOpenRouterModels, getConfigSchema };
 
 // ----- sessionCodec -----
 
@@ -169,5 +169,6 @@ export function createServerAdapter() {
     listSkills,
     syncSkills,
     listModels,
+    getConfigSchema,
   };
 }

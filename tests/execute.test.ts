@@ -208,6 +208,19 @@ describe("execute()", () => {
     expect(result.exitCode).toBe(0);
   });
 
+  it("splits a comma-separated transforms string (as sent by the config-schema text field) into an array", async () => {
+    fetchMock = setupFetchMock([assistantResponse("done")]);
+
+    await execute(
+      makeContext({
+        config: { model: "x", apiKey: "k", transforms: "middle-out, foo" } as any,
+      }),
+    );
+
+    const chatCall = fetchMock.calls.find((c) => c.path.endsWith("/chat/completions"));
+    expect((chatCall!.body as any).transforms).toEqual(["middle-out", "foo"]);
+  });
+
   it("returns errorCode missing_api_key when no apiKey/authToken/env var is available", async () => {
     fetchMock = setupFetchMock([assistantResponse("done")]);
 

@@ -13,12 +13,12 @@
  * Optional hooks not implemented (deferred to v3):
  *   - getQuotaWindows     — OpenRouter exposes /key endpoint, can be added
  *   - onHireApproved      — only used by cloud adapters
- *   - getConfigSchema     — UI form fields are still declared in src/ui/build-config.ts
  */
 import type { AdapterSessionCodec, AdapterSkillContext, AdapterSkillSnapshot } from "@paperclipai/adapter-utils";
 import { execute } from "./execute.js";
 import { testEnvironment, listModels, listOpenRouterModels } from "./test.js";
-export { execute, testEnvironment, listModels, listOpenRouterModels };
+import { getConfigSchema } from "./config-schema.js";
+export { execute, testEnvironment, listModels, listOpenRouterModels, getConfigSchema };
 /**
  * OpenRouter doesn't have first-class server-side sessions; we persist the
  * last generation id so the run viewer can show a stable display id and
@@ -56,5 +56,6 @@ export declare function createServerAdapter(): {
     listSkills: typeof listSkills;
     syncSkills: typeof syncSkills;
     listModels: typeof listModels;
+    getConfigSchema: typeof getConfigSchema;
 };
 //# sourceMappingURL=index.d.ts.map

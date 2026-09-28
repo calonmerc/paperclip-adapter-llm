@@ -203,7 +203,12 @@ async function callChatCompletions(
     body.tool_choice = "auto";
   }
   if (config.reasoning) body.reasoning = { effort: "high" };
-  if (config.transforms?.length) body.transforms = config.transforms;
+  const transforms = Array.isArray(config.transforms)
+    ? config.transforms
+    : typeof config.transforms === "string"
+      ? config.transforms.split(",").map((t) => t.trim()).filter(Boolean)
+      : undefined;
+  if (transforms?.length) body.transforms = transforms;
   if (config.route) body.route = config.route;
 
   const response = await fetch(endpoints.chat, {

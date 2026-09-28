@@ -1,5 +1,33 @@
 # Changelog
 
+## [0.3.1] - 2026-09-28
+
+### Fixed
+- Agent creation/edit UI showed no per-agent config fields (apiKey, baseUrl,
+  systemPrompt, temperature, maxTokens, stream, reasoning, route, etc.) —
+  only the generic "Adapter type" / "Model" / "Thinking effort" fields that
+  Paperclip renders for every adapter type. Root cause: `createServerAdapter()`
+  didn't implement the optional `getConfigSchema()` hook, so Paperclip's
+  `GET /api/adapters/llm/config-schema` 404s and the UI's `SchemaConfigFields`
+  component (the default `ConfigFields` renderer for non-builtin/external
+  adapters) has nothing to render into the "Configuration" section.
+- Added `src/server/config-schema.ts` implementing `getConfigSchema()`,
+  wired into `createServerAdapter()`. Covers every `LlmConfig` field except
+  `model` (intentionally excluded — Paperclip's built-in model picker in the
+  "Adapter" section already owns it via `models`/`listModels`/`detectModel`).
+  `apiKey` is marked `meta: { secret: true }` so Paperclip stores it as a
+  managed secret reference rather than a plaintext adapterConfig value,
+  matching the convention used by the built-in `hermes-gateway` adapter.
+  This also surfaces `maxTurns`, `autoApprove`, `skillsDir`, and
+  `instructionsFilePath` — fields `LlmConfig` already supported but that had
+  no UI at all before this fix — plus `transforms`/`httpReferer`/`xTitle`,
+  which existed in `buildConfig()` but were missing from the old
+  `src/ui/build-config.ts` `configFields` array.
+- `execute.ts`'s `transforms` handling now accepts either a `string[]` (the
+  legacy path) or a comma-separated `string` (what the new config-schema
+  text field produces) and normalizes to an array before sending it to the
+  chat/completions request body.
+
 ## [0.3.0] - 2026-09-28
 
 ### Changed (security)

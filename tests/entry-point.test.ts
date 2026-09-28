@@ -27,6 +27,26 @@ describe("package main entry", () => {
     expect(typeof adapter.agentConfigurationDoc).toBe("string");
     expect(typeof adapter.execute).toBe("function");
     expect(typeof adapter.testEnvironment).toBe("function");
+    expect(typeof adapter.getConfigSchema).toBe("function");
+  });
+
+  it("getConfigSchema() returns per-agent config fields (regression guard for GET .../config-schema 404ing)", async () => {
+    // Paperclip's agent-config UI only renders per-agent config fields (API
+    // key, base URL, system prompt, etc.) for adapters that implement
+    // getConfigSchema — without it, GET /api/adapters/llm/config-schema 404s
+    // and the "Configuration" section of the agent form stays empty.
+    const mod: any = await import("../dist/index.js");
+    const adapter = mod.createServerAdapter();
+    const schema = await adapter.getConfigSchema();
+
+    expect(Array.isArray(schema.fields)).toBe(true);
+    const keys = schema.fields.map((f: { key: string }) => f.key);
+    expect(keys).toEqual(expect.arrayContaining(["apiKey", "baseUrl", "maxTurns", "autoApprove", "skillsDir", "instructionsFilePath"]));
+    // model is intentionally excluded — Paperclip's built-in model picker owns it.
+    expect(keys).not.toContain("model");
+
+    const apiKeyField = schema.fields.find((f: { key: string }) => f.key === "apiKey");
+    expect(apiKeyField?.meta?.secret).toBe(true);
   });
 
   it("re-exports the resolveEndpoints helper", async () => {
