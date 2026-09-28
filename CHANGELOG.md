@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.3.2] - 2026-09-28
+
+### Fixed
+- Runs could report success (`exitCode: 0`) while leaving their issue stuck
+  at `in_progress` with no terminal status, triggering Paperclip's
+  `missing_disposition` recovery flow (`server/src/services/recovery/
+  successful-run-handoff.ts` in the Paperclip host — fires whenever
+  `run.status === "succeeded"` but the issue never left `in_progress`).
+  Root cause: the final `api.updateIssue(currentIssueId, { status:
+  nextStatus, ... })` call in `execute.ts` (the one that marks an issue
+  `done`/`blocked` at the end of a run) was wrapped in a try/catch that only
+  logged to stderr on failure — most commonly a `sameRunLock` 409 ("Issue
+  run ownership conflict", see `checkoutIssue`'s doc comment in
+  `paperclip-api.ts`) racing the heartbeat dispatcher's own lock. The run
+  would still return `exitCode: 0` even though the disposition was never
+  recorded.
+- The final status update now retries once after a short delay, and if it
+  still fails, the run now reports failure (`exitCode: 1`, `errorCode:
+  "issue_status_update_failed"`) instead of silently succeeding — so
+  Paperclip's normal run-failure handling takes over rather than its
+  ambiguous-success recovery nagging the agent for a disposition it already
+  tried to give.
+
 ## [0.3.1] - 2026-09-28
 
 ### Fixed

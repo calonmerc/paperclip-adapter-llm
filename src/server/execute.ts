@@ -626,9 +626,30 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     if (nextStatus) {
       try {
         await api.updateIssue(currentIssueId, { status: nextStatus, statusReason });
-      } catch (err) {
-        const reason = err instanceof Error ? err.message : String(err);
-        await writeRawStderr(onLog, `[llm] could not update final status: ${reason}`);
+      } catch (firstErr) {
+        // One retry: the most common cause is a transient sameRunLock 409
+        // (see checkoutIssue's doc comment) racing the heartbeat dispatcher's
+        // own lock, which often clears within a second.
+        await new Promise((r) => setTimeout(r, 750));
+        try {
+          await api.updateIssue(currentIssueId, { status: nextStatus, statusReason });
+        } catch (err) {
+          const reason = err instanceof Error ? err.message : String(err);
+          await writeRawStderr(onLog, `[llm] could not update final status: ${reason}`);
+          // A run that fails to record its own disposition must not report
+          // success. Paperclip's "successful run, issue still in_progress"
+          // recovery flow (missing_disposition) only fires when the run
+          // itself reports success — swallowing this failure here would
+          // produce exactly that failure mode instead of Paperclip's normal,
+          // honest run-failure handling.
+          if (stoppedReason !== "error") {
+            stoppedReason = "error";
+            runError = {
+              message: `Failed to record final issue status (${nextStatus}): ${reason}`,
+              code: "issue_status_update_failed",
+            };
+          }
+        }
       }
     }
   }

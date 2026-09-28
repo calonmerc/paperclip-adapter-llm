@@ -271,6 +271,39 @@ describe("execute()", () => {
     expect(commentCalls[0]!.body).toMatchObject({ body: expect.stringContaining("hello") });
   });
 
+  it("fails the run (does not silently report success) when the final disposition write can't be recorded, after one retry", async () => {
+    // Regression guard for Paperclip's "missing_disposition" recovery flow:
+    // it fires whenever a run reports success (exitCode 0 / run.status
+    // "succeeded") but the issue never left in_progress — e.g. because the
+    // final status PATCH lost a sameRunLock race (see checkoutIssue's doc
+    // comment in paperclip-api.ts) and was silently swallowed. A run that
+    // can't record its own disposition must report failure instead, so
+    // Paperclip's normal run-failure handling takes over rather than its
+    // ambiguous-success recovery nagging.
+    fetchMock = setupFetchMock([assistantResponse("all done")]);
+    const recordingFetch = globalThis.fetch;
+    let finalStatusPatchAttempts = 0;
+    globalThis.fetch = (async (input: any, init?: any) => {
+      const url = typeof input === "string" ? input : input.url;
+      const method = (init?.method || "GET").toUpperCase();
+      if (method === "PATCH" && new URL(url).pathname === "/api/issues/issue-1") {
+        const body = init?.body ? JSON.parse(String(init.body)) : undefined;
+        if (body?.status === "done") {
+          finalStatusPatchAttempts += 1;
+          return new Response(JSON.stringify({ error: "Issue run ownership conflict" }), { status: 409 });
+        }
+      }
+      return recordingFetch(input, init);
+    }) as typeof fetch;
+
+    const result = await execute(makeContext());
+
+    expect(finalStatusPatchAttempts).toBe(2); // one retry after the first failure
+    expect(result.exitCode).toBe(1);
+    expect(result.errorCode).toBe("issue_status_update_failed");
+    expect(result.errorMessage).toContain("Failed to record final issue status (done)");
+  });
+
   it("returns an AdapterExecutionResult with the current schema (no removed fields)", async () => {
     fetchMock = setupFetchMock([assistantResponse("done")]);
 
