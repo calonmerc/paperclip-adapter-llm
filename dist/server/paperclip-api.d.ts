@@ -48,6 +48,13 @@ export declare class PaperclipApi {
      * Keep this list in sync if Paperclip ever adds new statuses.
      */
     checkoutIssue(issueId: string, agentId: string, expectedStatuses?: string[]): Promise<Record<string, unknown>>;
+    /**
+     * Create an issue-thread interaction — a structured question, confirmation,
+     * or task suggestion that pauses the issue for a human/board response.
+     * Targets Paperclip's `createIssueThreadInteractionSchema` (see
+     * packages/shared/src/validators/issue.ts in the Paperclip host repo).
+     */
+    createIssueInteraction(issueId: string, body: Record<string, unknown>): Promise<Record<string, unknown>>;
     listIssueComments(issueId: string): Promise<Record<string, unknown>>;
     addIssueComment(issueId: string, body: {
         body: string;

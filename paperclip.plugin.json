@@ -4,7 +4,7 @@
   "id": "llm",
   "name": "LLM Adapter (OpenAI-compatible)",
   "description": "Generic OpenAI-compatible adapter — works with OpenRouter, NVIDIA NIM, Ollama, vLLM, DeepSeek, and any OpenAI-compatible endpoint",
-  "version": "0.3.2",
+  "version": "0.4.0",
   "entry": {
     "adapter": "./src/index.ts"
   },

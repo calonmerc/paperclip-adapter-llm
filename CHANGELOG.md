@@ -1,5 +1,36 @@
 # Changelog
 
+## [0.4.0] - 2026-09-28
+
+### Added
+- New `ask_user_questions` tool, wired to Paperclip's real issue-thread
+  interactions API (`POST /api/issues/:id/interactions`, `kind:
+  "ask_user_questions"`). Fixes a real bug we observed in production: the
+  model already knew this Paperclip capability exists (it's a public,
+  documented API used by native adapters like Claude Code/Codex) but had no
+  tool to call it, so it fell back to writing the JSON it would have sent as
+  plain assistant text — which then got posted verbatim as a garbled raw-JSON
+  issue comment instead of a real interactive question card.
+- The tool exposes a simplified schema (`title`, `questions[].prompt` /
+  `.required` / `.multi_select` / `.options[].label` / `.description`) and
+  translates it into Paperclip's stricter storage payload (generated
+  `q{n}`/`q{n}_o{n}` ids, `selectionMode`, and a single `freeText` option for
+  prompt-only/no-options questions) — deliberately omitting the payload's
+  optional dual-representation `questionSet` field, which is unnecessary on
+  creation per its own validator.
+- `execute.ts` now tracks whether an interaction was created during the run
+  and routes the final disposition to `in_review` instead of `done` when it
+  was — asking a question isn't "done," and Paperclip's own valid-disposition
+  list treats a pending issue-thread interaction as the correct `in_review`
+  path.
+- `DEFAULT_SYSTEM_PROMPT` now tells the model about the tool explicitly
+  rather than relying on it to infer the tool exists.
+- Not yet verified end-to-end against a live Paperclip server — the payload
+  shape was built by reading `packages/shared/src/validators/issue.ts` in
+  the Paperclip host repo directly, not from a working example. If the real
+  server rejects it, the likely culprits are the `resolverPolicy` default or
+  something in the `continuationPolicy` enum.
+
 ## [0.3.2] - 2026-09-28
 
 ### Fixed

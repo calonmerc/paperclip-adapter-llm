@@ -398,6 +398,40 @@ describe("execute()", () => {
     expect(toolMessage.tool_call_id).toBe("call-1");
   });
 
+  it("marks the issue in_review (not done) when the model asks a clarifying question via ask_user_questions", async () => {
+    // Regression guard: before ask_user_questions existed, a model that
+    // wanted to ask a human a question had no tool for it, so it dumped the
+    // JSON as plain text — which then got posted as a raw comment and the
+    // issue was (wrongly) marked "done" since the loop just saw "no tool
+    // calls, must be finished". Now the tool exists and creating an
+    // interaction must route the final status to in_review instead.
+    fetchMock = setupFetchMock([
+      toolCallResponse([
+        {
+          id: "call-1",
+          name: "ask_user_questions",
+          args: { questions: [{ prompt: "Which environment should I deploy to?" }] },
+        },
+      ]),
+      assistantResponse("Asked the user which environment to deploy to."),
+    ]);
+
+    const result = await execute(makeContext());
+    expect(result.exitCode).toBe(0);
+
+    const interactionCalls = fetchMock.calls.filter(
+      (c) => c.method === "POST" && c.path === "/api/issues/issue-1/interactions",
+    );
+    expect(interactionCalls.length).toBe(1);
+    expect(interactionCalls[0]!.body).toMatchObject({ kind: "ask_user_questions" });
+
+    const statusPatches = fetchMock.calls.filter(
+      (c) => c.method === "PATCH" && c.path === "/api/issues/issue-1",
+    );
+    expect(statusPatches.at(-1)!.body).toMatchObject({ status: "in_review" });
+    expect(statusPatches.some((c) => (c.body as any)?.status === "done")).toBe(false);
+  });
+
   it("routes hire_agent through createApproval (not hireAgent) when autoApprove is unset", async () => {
     fetchMock = setupFetchMock([
       toolCallResponse([

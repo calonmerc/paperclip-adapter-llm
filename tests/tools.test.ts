@@ -25,7 +25,7 @@ describe("tools.ts", () => {
     const api = makeApi(async () => jsonResponse({}));
     const tools = buildTools({ api, agentId: "agent-1", companyId: "company-1", currentIssueId: null, autoApprove: false });
 
-    expect(tools.length).toBe(9);
+    expect(tools.length).toBe(10);
     const names = toolSchemas(tools).map((s) => s.function.name);
     expect(names).toEqual([
       "get_issue",
@@ -37,6 +37,7 @@ describe("tools.ts", () => {
       "list_agents",
       "hire_agent",
       "request_approval",
+      "ask_user_questions",
     ]);
   });
 
@@ -231,5 +232,102 @@ describe("tools.ts", () => {
         payload: { amount: 500, summary: "Need more budget" },
       },
     });
+  });
+
+  it("ask_user_questions posts a select question with generated ids and marks interactionCreated", async () => {
+    const calls: Array<{ path: string; body: any }> = [];
+    const api = makeApi(async (input: any, init: any) => {
+      calls.push({ path: new URL(typeof input === "string" ? input : input.url).pathname, body: init?.body ? JSON.parse(init.body) : undefined });
+      return jsonResponse({ id: "interaction-1" });
+    });
+    const interactionCreated = { value: false };
+    const tools = buildTools({
+      api,
+      agentId: "agent-1",
+      companyId: "company-1",
+      currentIssueId: "issue-7",
+      autoApprove: false,
+      interactionCreated,
+    });
+
+    const result = await findTool(tools, "ask_user_questions")!.execute({
+      title: "Deploy target",
+      questions: [
+        {
+          prompt: "Which environment?",
+          multi_select: false,
+          options: [{ label: "Staging" }, { label: "Production", description: "Live traffic" }],
+        },
+      ],
+    });
+
+    expect(result.isError).toBe(false);
+    expect(interactionCreated.value).toBe(true);
+    expect(calls.at(-1)).toMatchObject({
+      path: "/api/issues/issue-7/interactions",
+      body: {
+        kind: "ask_user_questions",
+        continuationPolicy: "wake_assignee",
+        title: "Deploy target",
+        payload: {
+          version: 1,
+          title: "Deploy target",
+          questions: [
+            {
+              id: "q1",
+              prompt: "Which environment?",
+              selectionMode: "single",
+              required: true,
+              options: [
+                { id: "q1_o1", label: "Staging" },
+                { id: "q1_o2", label: "Production", description: "Live traffic" },
+              ],
+            },
+          ],
+        },
+      },
+    });
+  });
+
+  it("ask_user_questions represents an options-less question as a single free-text option", async () => {
+    const calls: Array<{ body: any }> = [];
+    const api = makeApi(async (_input: any, init: any) => {
+      calls.push({ body: init?.body ? JSON.parse(init.body) : undefined });
+      return jsonResponse({ id: "interaction-1" });
+    });
+    const tools = buildTools({ api, agentId: "agent-1", companyId: "company-1", currentIssueId: "issue-7", autoApprove: false });
+
+    const result = await findTool(tools, "ask_user_questions")!.execute({
+      questions: [{ prompt: "What's the deploy tag?" }],
+    });
+
+    expect(result.isError).toBe(false);
+    expect(calls.at(-1)!.body.payload.questions[0]).toMatchObject({
+      id: "q1",
+      selectionMode: "single",
+      options: [{ id: "q1_answer", label: "Your answer", freeText: true }],
+    });
+  });
+
+  it("ask_user_questions requires at least one question with a non-empty prompt", async () => {
+    const api = makeApi(async () => jsonResponse({}));
+    const tools = buildTools({ api, agentId: "agent-1", companyId: "company-1", currentIssueId: "issue-7", autoApprove: false });
+
+    const noQuestions = await findTool(tools, "ask_user_questions")!.execute({ questions: [] });
+    expect(noQuestions.isError).toBe(true);
+    expect(noQuestions.content).toContain("At least one question is required");
+
+    const emptyPrompt = await findTool(tools, "ask_user_questions")!.execute({ questions: [{ prompt: "" }] });
+    expect(emptyPrompt.isError).toBe(true);
+    expect(emptyPrompt.content).toContain("non-empty prompt");
+  });
+
+  it("ask_user_questions fails gracefully with no current issue and no issue_id", async () => {
+    const api = makeApi(async () => jsonResponse({}));
+    const tools = buildTools({ api, agentId: "agent-1", companyId: "company-1", currentIssueId: null, autoApprove: false });
+
+    const result = await findTool(tools, "ask_user_questions")!.execute({ questions: [{ prompt: "Which one?" }] });
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain("No current issue");
   });
 });

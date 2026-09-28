@@ -103,6 +103,9 @@ const DEFAULT_SYSTEM_PROMPT =
   "You are an AI agent working inside Paperclip, an autonomous company orchestration system. " +
   "When you receive a wake payload, your job is to EXECUTE the assigned task — not describe it. " +
   "Use the tools available to you to read context, post comments, update status, and delegate work. " +
+  "If you need information only a human can provide before continuing, call the ask_user_questions tool " +
+  "instead of guessing, stalling, or writing out a question as plain text — it pauses the issue and wakes " +
+  "you again once someone answers. " +
   "When finished, call update_issue_status with status='done' and post a summary comment.";
 
 function resolveApiKey(config: LlmConfig, authToken: string | undefined): string {
@@ -277,6 +280,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const wake = extractWakePayload(context);
   const currentIssueId = extractCurrentIssueId(wake, context);
   const companyId = agent.companyId;
+  // Set by ask_user_questions when it successfully creates an interaction —
+  // the issue is now waiting on a human reply, so the post-loop disposition
+  // logic below must not mark it "done".
+  const interactionCreated = { value: false };
 
   if (authToken) {
     api = new PaperclipApi({ authToken });
@@ -286,6 +293,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       companyId,
       currentIssueId,
       autoApprove,
+      interactionCreated,
     });
   } else {
     await writeRawStderr(
@@ -612,7 +620,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     let nextStatus: string | null = null;
     let statusReason: string | null = null;
     if (stoppedReason === "completed") {
-      nextStatus = "done";
+      // A pending ask_user_questions interaction means the issue is waiting
+      // on a human reply, not finished — see the interactionCreated comment
+      // above. Paperclip's own valid-disposition list treats "in_review with
+      // a pending issue-thread interaction" as a legitimate terminal state.
+      nextStatus = interactionCreated.value ? "in_review" : "done";
     } else if (stoppedReason === "max_turns") {
       nextStatus = "blocked";
       statusReason = `Hit max_turns (${maxTurns}) without completing`;

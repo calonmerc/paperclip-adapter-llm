@@ -9,7 +9,7 @@
 
 ## What this is
 
-A fork of [`talhamahmood666/paperclip-adapter-openrouter`](https://github.com/talhamahmood666/paperclip-adapter-openrouter) with the OpenRouter base URL extracted into a configurable `baseUrl` field. `execute()` runs an in-process, multi-turn tool-calling loop against the configured chat/completions endpoint, exposing only 9 scoped Paperclip-API tools (`get_issue`, `update_issue_status`, `add_comment`, `list_comments`, `create_sub_issue`, `list_issues`, `list_agents`, `hire_agent`, `request_approval`) — no shell or filesystem access. `hire_agent` and other sensitive actions route through Paperclip's approval flow unless `autoApprove` is set. Skill loading and stream-json transcripts are unchanged from upstream.
+A fork of [`talhamahmood666/paperclip-adapter-openrouter`](https://github.com/talhamahmood666/paperclip-adapter-openrouter) with the OpenRouter base URL extracted into a configurable `baseUrl` field. `execute()` runs an in-process, multi-turn tool-calling loop against the configured chat/completions endpoint, exposing only 10 scoped Paperclip-API tools (`get_issue`, `update_issue_status`, `add_comment`, `list_comments`, `create_sub_issue`, `list_issues`, `list_agents`, `hire_agent`, `request_approval`, `ask_user_questions`) — no shell or filesystem access. `hire_agent` and other sensitive actions route through Paperclip's approval flow unless `autoApprove` is set. `ask_user_questions` creates a real Paperclip issue-thread interaction (`continuationPolicy: wake_assignee`) and routes the run's final disposition to `in_review` instead of `done` when used. Skill loading and stream-json transcripts are unchanged from upstream.
 
 If `baseUrl` is unset, the LLM endpoint defaults to OpenRouter.
 

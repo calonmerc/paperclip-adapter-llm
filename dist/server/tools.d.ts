@@ -36,6 +36,14 @@ export interface BuildToolsContext {
     currentIssueId: string | null;
     /** When false, hire_agent and similar mutating actions go through request_approval first. */
     autoApprove: boolean;
+    /**
+     * Mutable out-param: ask_user_questions sets .value = true after it
+     * successfully creates an interaction, so execute() knows the issue is
+     * now waiting on a human reply and must not mark it "done".
+     */
+    interactionCreated?: {
+        value: boolean;
+    };
 }
 export declare function buildTools(ctx: BuildToolsContext): Tool[];
 /** Get the schemas to send to the model. */

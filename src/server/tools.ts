@@ -41,6 +41,12 @@ export interface BuildToolsContext {
   currentIssueId: string | null;
   /** When false, hire_agent and similar mutating actions go through request_approval first. */
   autoApprove: boolean;
+  /**
+   * Mutable out-param: ask_user_questions sets .value = true after it
+   * successfully creates an interaction, so execute() knows the issue is
+   * now waiting on a human reply and must not mark it "done".
+   */
+  interactionCreated?: { value: boolean };
 }
 
 // ----- helpers -----
@@ -390,6 +396,114 @@ function requestApprovalTool(ctx: BuildToolsContext): Tool {
   };
 }
 
+interface AskUserQuestionsOptionInput {
+  label?: unknown;
+  description?: unknown;
+}
+
+interface AskUserQuestionsQuestionInput {
+  prompt?: unknown;
+  required?: unknown;
+  multi_select?: unknown;
+  options?: unknown;
+}
+
+function askUserQuestionsTool(ctx: BuildToolsContext): Tool {
+  return {
+    schema: {
+      type: "function",
+      function: {
+        name: "ask_user_questions",
+        description:
+          "Ask a human a structured question and pause this issue for their reply — use this instead of " +
+          "guessing or stalling when you need information only a human can provide. Creates a Paperclip " +
+          "issue-thread interaction (continuationPolicy=wake_assignee): you will be woken again once someone " +
+          "answers. End your turn right after calling this — do not keep working on the issue in the same run.",
+        parameters: {
+          type: "object",
+          properties: {
+            title: { type: "string", description: "Short title shown on the question card." },
+            questions: {
+              type: "array",
+              minItems: 1,
+              items: {
+                type: "object",
+                properties: {
+                  prompt: { type: "string", description: "The question text." },
+                  required: { type: "boolean", description: "Default true." },
+                  multi_select: {
+                    type: "boolean",
+                    description: "Allow selecting more than one option. Default false.",
+                  },
+                  options: {
+                    type: "array",
+                    description: "Answer choices. Omit (or leave empty) for a free-text question.",
+                    items: {
+                      type: "object",
+                      properties: {
+                        label: { type: "string" },
+                        description: { type: "string" },
+                      },
+                      required: ["label"],
+                    },
+                  },
+                },
+                required: ["prompt"],
+              },
+            },
+          },
+          required: ["questions"],
+        },
+      },
+    },
+    execute: async (args) => {
+      const id = asString(args.issue_id, ctx.currentIssueId ?? "");
+      if (!id) return fail("No current issue to attach the question to.");
+
+      const rawQuestions = Array.isArray(args.questions) ? args.questions : [];
+      if (rawQuestions.length === 0) return fail("At least one question is required.");
+
+      const questions = rawQuestions.map((raw, qi) => {
+        const q = (raw && typeof raw === "object" ? raw : {}) as AskUserQuestionsQuestionInput;
+        const rawOptions = Array.isArray(q.options) ? q.options : [];
+        const options =
+          rawOptions.length > 0
+            ? rawOptions.map((raw2, oi) => {
+                const o = (raw2 && typeof raw2 === "object" ? raw2 : {}) as AskUserQuestionsOptionInput;
+                const option: Record<string, unknown> = {
+                  id: `q${qi + 1}_o${oi + 1}`,
+                  label: asString(o.label, `Option ${oi + 1}`),
+                };
+                if (typeof o.description === "string" && o.description) option.description = o.description;
+                return option;
+              })
+            : [{ id: `q${qi + 1}_answer`, label: "Your answer", freeText: true }];
+        return {
+          id: `q${qi + 1}`,
+          prompt: asString(q.prompt),
+          selectionMode: q.multi_select === true ? "multi" : "single",
+          required: q.required !== false,
+          options,
+        };
+      });
+      if (questions.some((q) => !q.prompt)) return fail("Every question needs a non-empty prompt.");
+
+      const title = typeof args.title === "string" && args.title.trim() ? args.title.trim() : null;
+
+      return safeCall("ask_user_questions", async () => {
+        const result = await ctx.api.createIssueInteraction(id, {
+          kind: "ask_user_questions",
+          continuationPolicy: "wake_assignee",
+          title,
+          payload: { version: 1, title, questions },
+        });
+        if (ctx.interactionCreated) ctx.interactionCreated.value = true;
+        return result;
+      });
+    },
+  };
+}
+
 // ----- public API -----
 
 export function buildTools(ctx: BuildToolsContext): Tool[] {
@@ -403,6 +517,7 @@ export function buildTools(ctx: BuildToolsContext): Tool[] {
     listAgentsTool(ctx),
     hireAgentTool(ctx),
     requestApprovalTool(ctx),
+    askUserQuestionsTool(ctx),
   ];
 }
 

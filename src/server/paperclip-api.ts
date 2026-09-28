@@ -159,6 +159,16 @@ export class PaperclipApi {
   }
 
 
+  /**
+   * Create an issue-thread interaction — a structured question, confirmation,
+   * or task suggestion that pauses the issue for a human/board response.
+   * Targets Paperclip's `createIssueThreadInteractionSchema` (see
+   * packages/shared/src/validators/issue.ts in the Paperclip host repo).
+   */
+  createIssueInteraction(issueId: string, body: Record<string, unknown>): Promise<Record<string, unknown>> {
+    return this.request("POST", `/api/issues/${encodeURIComponent(issueId)}/interactions`, body);
+  }
+
   // ----- Comments -----
 
   listIssueComments(issueId: string): Promise<Record<string, unknown>> {

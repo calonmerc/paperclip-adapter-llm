@@ -42,6 +42,9 @@ const DEFAULT_MAX_TURNS = 25;
 const DEFAULT_SYSTEM_PROMPT = "You are an AI agent working inside Paperclip, an autonomous company orchestration system. " +
     "When you receive a wake payload, your job is to EXECUTE the assigned task — not describe it. " +
     "Use the tools available to you to read context, post comments, update status, and delegate work. " +
+    "If you need information only a human can provide before continuing, call the ask_user_questions tool " +
+    "instead of guessing, stalling, or writing out a question as plain text — it pauses the issue and wakes " +
+    "you again once someone answers. " +
     "When finished, call update_issue_status with status='done' and post a summary comment.";
 function resolveApiKey(config, authToken) {
     const key = (config.apiKey && config.apiKey.length > 0 ? config.apiKey : undefined) ||
@@ -195,6 +198,10 @@ export async function execute(ctx) {
     const wake = extractWakePayload(context);
     const currentIssueId = extractCurrentIssueId(wake, context);
     const companyId = agent.companyId;
+    // Set by ask_user_questions when it successfully creates an interaction —
+    // the issue is now waiting on a human reply, so the post-loop disposition
+    // logic below must not mark it "done".
+    const interactionCreated = { value: false };
     if (authToken) {
         api = new PaperclipApi({ authToken });
         tools = buildTools({
@@ -203,6 +210,7 @@ export async function execute(ctx) {
             companyId,
             currentIssueId,
             autoApprove,
+            interactionCreated,
         });
     }
     else {
@@ -494,7 +502,11 @@ export async function execute(ctx) {
         let nextStatus = null;
         let statusReason = null;
         if (stoppedReason === "completed") {
-            nextStatus = "done";
+            // A pending ask_user_questions interaction means the issue is waiting
+            // on a human reply, not finished — see the interactionCreated comment
+            // above. Paperclip's own valid-disposition list treats "in_review with
+            // a pending issue-thread interaction" as a legitimate terminal state.
+            nextStatus = interactionCreated.value ? "in_review" : "done";
         }
         else if (stoppedReason === "max_turns") {
             nextStatus = "blocked";
