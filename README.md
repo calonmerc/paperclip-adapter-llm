@@ -89,7 +89,7 @@ Get a key at https://platform.deepseek.com.
 This adapter is installed via Paperclip's **Local Path** option pointing at this repo's built `dist/` directory. The `dist/` directory is committed to git, so no build step is required at install time.
 
 ```bash
-git clone https://github.com/souzix76/paperclip-adapter-llm.git
+git clone https://github.com/calonmerc/paperclip-adapter-llm.git
 # In Paperclip UI → Adapters → Add → Local Path
 # Path: /absolute/path/to/paperclip-adapter-llm
 ```
