@@ -1,5 +1,32 @@
 # Changelog
 
+## [0.4.2] - 2026-09-28
+
+### Fixed
+- Two bugs in `ask_user_questions` found live against a real Paperclip
+  instance, both stemming from v0.4.0's assumption that forcing the issue
+  to `in_review` after creating an interaction was correct:
+  1. Paperclip's own `in_review` review-path validator
+     (`assertInReviewReviewPath` in the host's issues route) rejects an
+     agent-authored `in_review` transition unless it recognizes a specific
+     linked review path (`reviewInteractionId`, `assigneeUserId`, an
+     execution-state participant, a monitor, or a linked approval) — a bare
+     `PATCH {status: "in_review"}` doesn't satisfy it even with a pending
+     `ask_user_questions` interaction sitting right there. The run hard-failed
+     with `invalid_issue_disposition` / `issue_status_update_failed`.
+  2. Nothing stopped the model from calling `ask_user_questions` again on
+     the next turn — observed in production asking the same question three
+     times in a row, each creating a separate pending interaction.
+- Fix: the tool loop now stops immediately once `ask_user_questions`
+  successfully creates an interaction (the model cannot get a real answer
+  within the same run regardless), and the post-loop disposition logic no
+  longer attempts any status transition when that happens — it leaves the
+  issue exactly as it was. This is sufficient: Paperclip's
+  `missing_disposition` recovery (`decideSuccessfulRunHandoff` in the host
+  repo) already skips any issue with a pending interaction or approval
+  (`hasPendingInteractionOrApproval`), so there was never a need to move it
+  to `in_review` in the first place.
+
 ## [0.4.1] - 2026-09-28
 
 ### Fixed

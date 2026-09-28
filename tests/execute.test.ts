@@ -398,13 +398,26 @@ describe("execute()", () => {
     expect(toolMessage.tool_call_id).toBe("call-1");
   });
 
-  it("marks the issue in_review (not done) when the model asks a clarifying question via ask_user_questions", async () => {
-    // Regression guard: before ask_user_questions existed, a model that
-    // wanted to ask a human a question had no tool for it, so it dumped the
-    // JSON as plain text — which then got posted as a raw comment and the
-    // issue was (wrongly) marked "done" since the loop just saw "no tool
-    // calls, must be finished". Now the tool exists and creating an
-    // interaction must route the final status to in_review instead.
+  it("stops the turn right after ask_user_questions succeeds and leaves issue status untouched", async () => {
+    // Regression guard, two bugs found live against a real Paperclip
+    // instance:
+    //  1. Before ask_user_questions existed, a model that wanted to ask a
+    //     human a question had no tool for it, so it dumped the JSON as
+    //     plain text, which got posted as a raw comment and the issue was
+    //     wrongly marked "done".
+    //  2. The first fix for #1 forced the issue to in_review, which
+    //     Paperclip's own in_review review-path validator
+    //     (assertInReviewReviewPath) rejected outright ("Agent-authored
+    //     updates that move an issue to in_review must include a real
+    //     review path"), hard-failing the run. It also let the model keep
+    //     calling ask_user_questions again on the next turn — observed
+    //     asking the same question three times in a row in production.
+    // The fix: stop the tool loop the instant an interaction is created
+    // (never let the model call it again in this run), and don't touch
+    // issue status at all — Paperclip's missing_disposition recovery
+    // already exempts any issue with a pending interaction
+    // (hasPendingInteractionOrApproval in decideSuccessfulRunHandoff), so
+    // there's nothing for the adapter to do.
     fetchMock = setupFetchMock([
       toolCallResponse([
         {
@@ -413,11 +426,15 @@ describe("execute()", () => {
           args: { questions: [{ prompt: "Which environment should I deploy to?" }] },
         },
       ]),
+      // Never consumed — the loop must stop before requesting another turn.
       assistantResponse("Asked the user which environment to deploy to."),
     ]);
 
     const result = await execute(makeContext());
     expect(result.exitCode).toBe(0);
+
+    const chatCalls = fetchMock.calls.filter((c) => c.path.endsWith("/chat/completions"));
+    expect(chatCalls.length).toBe(1); // no second round-trip after the tool call
 
     const interactionCalls = fetchMock.calls.filter(
       (c) => c.method === "POST" && c.path === "/api/issues/issue-1/interactions",
@@ -426,10 +443,9 @@ describe("execute()", () => {
     expect(interactionCalls[0]!.body).toMatchObject({ kind: "ask_user_questions" });
 
     const statusPatches = fetchMock.calls.filter(
-      (c) => c.method === "PATCH" && c.path === "/api/issues/issue-1",
+      (c) => c.method === "PATCH" && c.path === "/api/issues/issue-1" && (c.body as any)?.status !== "in_progress",
     );
-    expect(statusPatches.at(-1)!.body).toMatchObject({ status: "in_review" });
-    expect(statusPatches.some((c) => (c.body as any)?.status === "done")).toBe(false);
+    expect(statusPatches.length).toBe(0);
   });
 
   it("routes hire_agent through createApproval (not hireAgent) when autoApprove is unset", async () => {

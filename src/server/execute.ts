@@ -579,8 +579,22 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           stoppedReason = "repeat_loop";
           break;
         }
+
+        // Once an interaction is pending, stop — the model cannot get a real
+        // answer within this run, and letting it keep calling the tool (seen
+        // in practice: the same question asked 2-3x with slightly different
+        // wording each time) just creates duplicate pending interactions.
+        if (toolName === "ask_user_questions" && interactionCreated.value) {
+          await writeRawStderr(
+            onLog,
+            "[llm] ask_user_questions created an interaction — ending the turn now instead of continuing.",
+          );
+          stoppedReason = "completed";
+          break;
+        }
       }
       if (stoppedReason === "repeat_loop") break;
+      if (stoppedReason === "completed" && interactionCreated.value) break;
     }
 
     if (turn >= maxTurns && stoppedReason !== "error") {
@@ -621,10 +635,17 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     let statusReason: string | null = null;
     if (stoppedReason === "completed") {
       // A pending ask_user_questions interaction means the issue is waiting
-      // on a human reply, not finished — see the interactionCreated comment
-      // above. Paperclip's own valid-disposition list treats "in_review with
-      // a pending issue-thread interaction" as a legitimate terminal state.
-      nextStatus = interactionCreated.value ? "in_review" : "done";
+      // on a human reply, not finished — leave status untouched rather than
+      // forcing in_review ourselves. Paperclip's own in_review review-path
+      // validator (assertInReviewReviewPath in the host's issues route)
+      // rejects an agent-authored in_review transition unless it recognizes
+      // a specific linked review path, which a bare status patch doesn't
+      // satisfy — that hard-fails the run instead of helping. It doesn't
+      // need to: Paperclip's separate missing_disposition recovery already
+      // skips any issue with a pending interaction or approval
+      // (hasPendingInteractionOrApproval), so simply not touching status
+      // here is sufficient and avoids guessing at that validator's rules.
+      nextStatus = interactionCreated.value ? null : "done";
     } else if (stoppedReason === "max_turns") {
       nextStatus = "blocked";
       statusReason = `Hit max_turns (${maxTurns}) without completing`;
