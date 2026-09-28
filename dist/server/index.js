@@ -151,6 +151,15 @@ export function createServerAdapter() {
         syncSkills,
         listModels,
         getConfigSchema,
+        // Paperclip's heartbeat dispatcher (server/src/services/heartbeat.ts)
+        // only mints and injects `authToken` (the agent's scoped Paperclip API
+        // JWT) when this is true. Without it, every run executes with
+        // authToken undefined — execute() still returns exitCode 0, but every
+        // Paperclip API write it makes (comments, status updates, checkout,
+        // ask_user_questions) is silently skipped. Set for both purely-remote
+        // adapters (see the built-in hermes adapter) and local ones (see the
+        // built-in process adapter) — it gates the JWT, not local execution.
+        supportsLocalAgentJwt: true,
     };
 }
 //# sourceMappingURL=index.js.map

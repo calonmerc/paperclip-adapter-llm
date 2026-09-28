@@ -1,5 +1,39 @@
 # Changelog
 
+## [0.4.1] - 2026-09-28
+
+### Fixed
+- **Root cause found for a run of "missing disposition" / garbled
+  `ask_user_questions` incidents traced back to this adapter**:
+  `createServerAdapter()` never set `supportsLocalAgentJwt: true`.
+  Paperclip's heartbeat dispatcher (`server/src/services/heartbeat.ts` in
+  the host repo) only mints and injects `authToken` — the agent's scoped
+  Paperclip API JWT — into `execute()`'s context when the adapter declares
+  this flag. Without it, `authToken` was `undefined` on every single run,
+  which silently disabled every Paperclip API write the adapter makes
+  (comments, status updates, issue checkout, and the new
+  `ask_user_questions` tool) — while `execute()` still returned `exitCode:
+  0`, because none of these degraded paths are treated as fatal (by
+  design, for genuinely offline/degraded scenarios). Confirmed the built-in
+  `process` adapter and the remote-API-calling `hermes` adapter (same
+  shape as this one — no local execution either) both set this flag.
+- Added `supportsLocalAgentJwt: true` to `createServerAdapter()`'s return
+  value, plus a regression test asserting it's set.
+- This was very likely the actual root cause of the `missing_disposition`
+  incident diagnosed in v0.3.2 too — that fix only covers the case where an
+  `authToken`/API client *exists* but a specific write call fails; it does
+  nothing when there's no client at all, which is what "No authToken on
+  context" in the run log means. Both fixes are complementary and both
+  matter, but this one is the bigger gap.
+- Note: Paperclip's server also needs `PAPERCLIP_AGENT_JWT_SECRET` (or a
+  fallback `BETTER_AUTH_SECRET`) set for JWT minting to succeed at all
+  (`server/src/agent-auth-jwt.ts`'s `jwtConfig()`). If `authToken` is still
+  missing after upgrading to this version, that's the next thing to check
+  on the Paperclip server itself — most self-hosted instances already have
+  `BETTER_AUTH_SECRET` set for their own login/session auth, so this is
+  unlikely to be the blocker, but it's the fallback explanation if the flag
+  alone doesn't fix it.
+
 ## [0.4.0] - 2026-09-28
 
 ### Added

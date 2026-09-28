@@ -30,6 +30,18 @@ describe("package main entry", () => {
     expect(typeof adapter.getConfigSchema).toBe("function");
   });
 
+  it("declares supportsLocalAgentJwt (regression guard for authToken never being injected)", async () => {
+    // Paperclip's heartbeat dispatcher only mints and passes `authToken` to
+    // execute() when the adapter sets this. Without it, every run silently
+    // executes with no Paperclip API access at all (comments, status
+    // updates, checkout, ask_user_questions all skipped) while still
+    // reporting exitCode 0 — the root cause behind a real
+    // "missing_disposition" incident traced back to this repo.
+    const mod: any = await import("../dist/index.js");
+    const adapter = mod.createServerAdapter();
+    expect(adapter.supportsLocalAgentJwt).toBe(true);
+  });
+
   it("getConfigSchema() returns per-agent config fields (regression guard for GET .../config-schema 404ing)", async () => {
     // Paperclip's agent-config UI only renders per-agent config fields (API
     // key, base URL, system prompt, etc.) for adapters that implement

@@ -57,5 +57,6 @@ export declare function createServerAdapter(): {
     syncSkills: typeof syncSkills;
     listModels: typeof listModels;
     getConfigSchema: typeof getConfigSchema;
+    supportsLocalAgentJwt: boolean;
 };
 //# sourceMappingURL=index.d.ts.map
