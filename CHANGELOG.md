@@ -1,5 +1,35 @@
 # Changelog
 
+## [0.3.0] - 2026-09-28
+
+### Changed (security)
+- `execute()` no longer spawns a CLI subprocess. The wired implementation
+  (`src/server/execute.ts`) previously shelled out to `cli/dist/index.js`,
+  which gave the model five unrestricted tools: `read_file`/`write_file`/
+  `edit_file`/`list_files` (arbitrary path resolution, no sandbox root) and
+  `run_command` (raw `child_process.exec`, no allowlist). Any hired agent on
+  any configured endpoint had shell exec and full filesystem access on the
+  host running Paperclip.
+- `execute()` is now an in-process, multi-turn tool-calling loop (previously
+  dead code at `src/server/execute.ts.backup`, now promoted to the live
+  implementation) that only exposes scoped Paperclip-API tools from
+  `src/server/tools.ts`: `get_issue`, `update_issue_status`, `add_comment`,
+  `list_comments`, `create_sub_issue`, `list_issues`, `list_agents`,
+  `hire_agent` (approval-gated unless `autoApprove` is set), and
+  `request_approval`. It also adds an issue run-lock checkout before any
+  write and a repeat-tool-call loop breaker, neither of which the CLI-proxy
+  implementation had.
+- The promoted implementation was reconciled with the current `baseUrl`
+  generalization: it now calls `resolveEndpoints(config.baseUrl)` (from
+  `src/index.ts`) for the chat and cost endpoints instead of the hardcoded
+  `OPENROUTER_CHAT_ENDPOINT`/`OPENROUTER_GENERATION_ENDPOINT` constants it
+  originally used, so per-agent `baseUrl` (NIM/Ollama/vLLM/DeepSeek/etc.)
+  continues to work exactly as it did under the CLI-proxy implementation.
+  The `/generation` cost lookup is now skipped entirely on non-OpenRouter
+  endpoints rather than relying on a 404 fallback.
+- The entire `cli/` subpackage (the subprocess, its unsandboxed tools, and
+  its own build) has been deleted from the repo.
+
 ## [0.2.6] - 2026-05-07
 
 ### Fixed

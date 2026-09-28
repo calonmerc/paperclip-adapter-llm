@@ -1,6 +1,13 @@
 /**
  * Integration test for the LLM adapter execute() function.
  *
+ * execute() now runs an in-process, multi-turn tool-calling loop against an
+ * OpenAI-compatible chat/completions endpoint (no CLI subprocess). global
+ * fetch is replaced with an in-memory recorder that serves:
+ *   - POST .../chat/completions — a queue of canned ChatCompletionResponses
+ *   - GET  .../generation       — 404 (OpenRouter cost lookup, best-effort)
+ *   - /api/*                    — Paperclip API calls, recorded and asserted
+ *
  * Goals:
  *   1. Prompt build succeeds when config.skillsDir is omitted (regression
  *      guard for the "Cannot read properties of undefined (reading 'skillsDir')"
@@ -11,14 +18,9 @@
  *      updateIssueState / addComment names that triggered runtime TypeErrors.
  *   3. The returned AdapterExecutionResult conforms to the current schema
  *      (exitCode / signal / timedOut required; no `status` or `totalTokens`).
- *
- * Strategy:
- *   - PAPERCLIP_LLM_CLI_PATH is pointed at a per-test stub script written
- *     to /tmp. The stub emits whichever stream-json lines we want and exits
- *     with the requested code.
- *   - global fetch is replaced with an in-memory recorder so we can assert
- *     PaperclipApi calls without a live server. Non-/api requests get a
- *     404 to exercise the OpenRouter /generation 404 fallback.
+ *   4. The tool loop actually dispatches to src/server/tools.ts's scoped
+ *      Paperclip-API tools — not shell/filesystem — including the hire_agent
+ *      approval gate and the repeat-call / max-turns loop breakers.
  */
 
 import fs from "node:fs";
@@ -28,39 +30,49 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { execute } from "../src/server/execute.js";
 
-// --- Stub CLI scripts ------------------------------------------------------
-
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "llm-adapter-test-"));
 
-function writeStubCli(
-  name: string,
-  opts: { stdoutLines?: string[]; exitCode?: number; capturePromptTo?: string },
-): string {
-  const filePath = path.join(tmpDir, `${name}.mjs`);
-  const lines = JSON.stringify(opts.stdoutLines ?? []);
-  const exitCode = opts.exitCode ?? 0;
-  const capturePromptTo = opts.capturePromptTo ?? "";
-  const source = `#!/usr/bin/env node
-import fs from "node:fs";
-const lines = ${lines};
-const capturePromptTo = ${JSON.stringify(capturePromptTo)};
-let prompt = "";
-process.stdin.on("data", (chunk) => { prompt += chunk.toString(); });
-process.stdin.on("end", () => {
-  if (capturePromptTo) {
-    try { fs.writeFileSync(capturePromptTo, prompt); } catch {}
-  }
-  for (const line of lines) {
-    process.stdout.write(line + "\\n");
-  }
-  process.exit(${exitCode});
-});
-`;
-  fs.writeFileSync(filePath, source, { mode: 0o755 });
-  return filePath;
+// --- Chat-completion response builders -------------------------------------
+
+interface ToolCallSpec {
+  id: string;
+  name: string;
+  args: Record<string, unknown>;
 }
 
-// --- Fetch recorder --------------------------------------------------------
+function assistantResponse(text: string, opts: { id?: string } = {}) {
+  return {
+    id: opts.id ?? "gen-1",
+    choices: [
+      {
+        finish_reason: "stop",
+        message: { role: "assistant", content: text },
+      },
+    ],
+  };
+}
+
+function toolCallResponse(calls: ToolCallSpec[], opts: { id?: string } = {}) {
+  return {
+    id: opts.id ?? "gen-1",
+    choices: [
+      {
+        finish_reason: "tool_calls",
+        message: {
+          role: "assistant",
+          content: null,
+          tool_calls: calls.map((c) => ({
+            id: c.id,
+            type: "function",
+            function: { name: c.name, arguments: JSON.stringify(c.args) },
+          })),
+        },
+      },
+    ],
+  };
+}
+
+// --- Fetch recorder ----------------------------------------------------------
 
 interface CallLog {
   method: string;
@@ -68,8 +80,12 @@ interface CallLog {
   body?: unknown;
 }
 
-function setupFetchMock(): { calls: CallLog[]; restore: () => void } {
+function setupFetchMock(
+  chatResponses: unknown[] = [],
+  opts: { chatFailureStatus?: number } = {},
+): { calls: CallLog[]; restore: () => void } {
   const calls: CallLog[] = [];
+  const queue = [...chatResponses];
   const original = globalThis.fetch;
 
   globalThis.fetch = (async (input: any, init?: any) => {
@@ -80,6 +96,21 @@ function setupFetchMock(): { calls: CallLog[]; restore: () => void } {
     const reqPath = parsed.pathname;
 
     calls.push({ method, path: reqPath, body });
+
+    if (reqPath.endsWith("/chat/completions")) {
+      if (opts.chatFailureStatus) {
+        return new Response("boom", { status: opts.chatFailureStatus });
+      }
+      const next = queue.shift() ?? assistantResponse("done");
+      return new Response(JSON.stringify(next), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
+
+    if (reqPath.endsWith("/generation")) {
+      return new Response("not found", { status: 404 });
+    }
 
     if (reqPath.startsWith("/api/")) {
       return new Response(JSON.stringify({ ok: true, id: "issue-1" }), {
@@ -98,7 +129,7 @@ function setupFetchMock(): { calls: CallLog[]; restore: () => void } {
   };
 }
 
-// --- Context factory -------------------------------------------------------
+// --- Context factory ---------------------------------------------------------
 
 function makeContext(overrides: Partial<Parameters<typeof execute>[0]> = {}): Parameters<typeof execute>[0] {
   const onLog = vi.fn(async () => {});
@@ -136,16 +167,30 @@ function makeContext(overrides: Partial<Parameters<typeof execute>[0]> = {}): Pa
   } as Parameters<typeof execute>[0];
 }
 
-// --- Tests -----------------------------------------------------------------
+function findTranscriptResultEntry(ctx: Parameters<typeof execute>[0]): { subtype: string } | undefined {
+  const onLog = ctx.onLog as unknown as { mock: { calls: Array<[string, string]> } };
+  for (const [, chunk] of onLog.mock.calls) {
+    try {
+      const entry = JSON.parse(chunk.trim());
+      if (entry.kind === "result") return entry;
+    } catch {
+      // not JSON, ignore
+    }
+  }
+  return undefined;
+}
+
+// --- Tests --------------------------------------------------------------------
 
 describe("execute()", () => {
   let fetchMock: ReturnType<typeof setupFetchMock>;
   let originalEnv: NodeJS.ProcessEnv;
 
   beforeEach(() => {
-    fetchMock = setupFetchMock();
     originalEnv = { ...process.env };
     process.env.PAPERCLIP_API_URL = "http://localhost:9999";
+    delete process.env.LLM_API_KEY;
+    delete process.env.OPENROUTER_API_KEY;
   });
 
   afterEach(() => {
@@ -154,10 +199,7 @@ describe("execute()", () => {
   });
 
   it("builds the prompt when config.skillsDir is omitted", async () => {
-    process.env.PAPERCLIP_LLM_CLI_PATH = writeStubCli("done", {
-      stdoutLines: ['{"type":"done"}'],
-      exitCode: 0,
-    });
+    fetchMock = setupFetchMock([assistantResponse("done")]);
 
     const ctx = makeContext();
     expect((ctx.config as Record<string, unknown>).skillsDir).toBeUndefined();
@@ -166,11 +208,39 @@ describe("execute()", () => {
     expect(result.exitCode).toBe(0);
   });
 
+  it("returns errorCode missing_api_key when no apiKey/authToken/env var is available", async () => {
+    fetchMock = setupFetchMock([assistantResponse("done")]);
+
+    // No authToken means no PaperclipApi client either (tools disabled), so
+    // there's nothing to mark the issue blocked with — the run just fails
+    // cleanly with a missing_api_key error and never calls the model.
+    const result = await execute(
+      makeContext({ config: { model: "moonshotai/kimi-k2.6" } as any, authToken: undefined }),
+    );
+
+    expect(result.exitCode).toBe(1);
+    expect(result.errorCode).toBe("missing_api_key");
+    expect(result.errorMessage).toContain("LLM API key not found");
+    expect(fetchMock.calls.some((c) => c.path.endsWith("/chat/completions"))).toBe(false);
+    expect(fetchMock.calls.some((c) => c.path.startsWith("/api/issues"))).toBe(false);
+  });
+
+  it("disables tools and skips all issue writes when authToken is missing", async () => {
+    fetchMock = setupFetchMock([assistantResponse("no tools available")]);
+
+    const result = await execute(makeContext({ authToken: undefined }));
+
+    expect(result.exitCode).toBe(0);
+    // No PaperclipApi client is constructed without an authToken, so no
+    // issue reads/writes should happen at all.
+    expect(fetchMock.calls.some((c) => c.path.startsWith("/api/issues"))).toBe(false);
+    // The chat/completions request should carry no tools.
+    const chatCall = fetchMock.calls.find((c) => c.path.endsWith("/chat/completions"));
+    expect((chatCall!.body as any).tools).toBeUndefined();
+  });
+
   it("calls api.updateIssue and api.addIssueComment via the current adapter-utils API", async () => {
-    process.env.PAPERCLIP_LLM_CLI_PATH = writeStubCli("hello", {
-      stdoutLines: ['{"type":"assistant","content":"hello"}', '{"type":"done"}'],
-      exitCode: 0,
-    });
+    fetchMock = setupFetchMock([assistantResponse("hello")]);
 
     await execute(makeContext());
 
@@ -189,10 +259,7 @@ describe("execute()", () => {
   });
 
   it("returns an AdapterExecutionResult with the current schema (no removed fields)", async () => {
-    process.env.PAPERCLIP_LLM_CLI_PATH = writeStubCli("done", {
-      stdoutLines: ['{"type":"done"}'],
-      exitCode: 0,
-    });
+    fetchMock = setupFetchMock([assistantResponse("done")]);
 
     const result = await execute(makeContext());
 
@@ -208,11 +275,8 @@ describe("execute()", () => {
     expect((result.usage as Record<string, unknown> | undefined)?.costUsd).toBeUndefined();
   });
 
-  it("reports exitCode and marks the issue blocked when the CLI fails", async () => {
-    process.env.PAPERCLIP_LLM_CLI_PATH = writeStubCli("fail", {
-      stdoutLines: [],
-      exitCode: 1,
-    });
+  it("reports exitCode and marks the issue blocked when the model call fails", async () => {
+    fetchMock = setupFetchMock([], { chatFailureStatus: 500 });
 
     const result = await execute(makeContext());
 
@@ -226,11 +290,8 @@ describe("execute()", () => {
     expect(blocked).toBeDefined();
   });
 
-  it("does not throw when LLM_BASE_URL points at a non-OpenRouter endpoint and /generation 404s", async () => {
-    process.env.PAPERCLIP_LLM_CLI_PATH = writeStubCli("done", {
-      stdoutLines: ['{"type":"done"}'],
-      exitCode: 0,
-    });
+  it("does not throw when baseUrl points at a non-OpenRouter endpoint, and skips the /generation cost fetch", async () => {
+    fetchMock = setupFetchMock([assistantResponse("done")]);
 
     const result = await execute(
       makeContext({
@@ -244,29 +305,114 @@ describe("execute()", () => {
 
     expect(result.exitCode).toBe(0);
     expect(result.provider).toBe("llm");
+    expect(fetchMock.calls.some((c) => c.path.endsWith("/generation"))).toBe(false);
   });
 
-  it("falls back to a concise default prompt when the wake context is empty", async () => {
-    // Regression for the 0.2.4 fix: a heartbeat with no structured wake
-    // payload (manual "Run Heartbeat" with no scoped issue, or a wake
-    // schema the current server doesn't fill in) used to send empty
-    // stdin to the CLI, which exited 1 with "No prompt provided" and
-    // produced an empty transcript.
-    const captureFile = path.join(tmpDir, "captured-prompt.txt");
-    process.env.PAPERCLIP_LLM_CLI_PATH = writeStubCli("capture-empty", {
-      stdoutLines: ['{"type":"done"}'],
-      exitCode: 0,
-      capturePromptTo: captureFile,
-    });
+  it("attempts the /generation cost lookup on OpenRouter and tolerates a 404", async () => {
+    fetchMock = setupFetchMock([assistantResponse("done", { id: "gen-123" })]);
 
-    const ctx = makeContext({ context: {} });
+    const result = await execute(makeContext());
+
+    expect(result.exitCode).toBe(0);
+    expect(fetchMock.calls.some((c) => c.path.endsWith("/generation"))).toBe(true);
+    expect(result.costUsd ?? null).toBeNull();
+  }, 10000);
+
+  it("falls back to a concise default prompt when the wake context is empty", async () => {
+    fetchMock = setupFetchMock([assistantResponse("done")]);
+
+    const result = await execute(makeContext({ context: {} }));
+
+    expect(result.exitCode).toBe(0);
+    const chatCall = fetchMock.calls.find((c) => c.path.endsWith("/chat/completions"));
+    const messages = (chatCall!.body as any).messages as Array<{ role: string; content: string }>;
+    const userMessage = messages.find((m) => m.role === "user")!;
+    // 3-line fallback per the issue suggestion.
+    expect(userMessage.content.split("\n").filter((l) => l.trim().length > 0).length).toBe(3);
+    expect(userMessage.content).toContain("heartbeat");
+  });
+
+  it("dispatches tool calls to the scoped Paperclip-API tools (not shell/filesystem)", async () => {
+    fetchMock = setupFetchMock([
+      toolCallResponse([{ id: "call-1", name: "add_comment", args: { body: "progress update" } }]),
+      assistantResponse("done"),
+    ]);
+
+    await execute(makeContext());
+
+    const commentCalls = fetchMock.calls.filter(
+      (c) => c.method === "POST" && c.path === "/api/issues/issue-1/comments",
+    );
+    // One from the tool call itself, one from the final-answer comment.
+    expect(commentCalls.some((c) => (c.body as any)?.body === "progress update")).toBe(true);
+
+    const secondChatCall = fetchMock.calls.filter((c) => c.path.endsWith("/chat/completions"))[1];
+    const toolMessage = (secondChatCall!.body as any).messages.find((m: any) => m.role === "tool");
+    expect(toolMessage).toBeDefined();
+    expect(toolMessage.tool_call_id).toBe("call-1");
+  });
+
+  it("routes hire_agent through createApproval (not hireAgent) when autoApprove is unset", async () => {
+    fetchMock = setupFetchMock([
+      toolCallResponse([
+        { id: "call-1", name: "hire_agent", args: { name: "Sam", role: "Engineer", mission: "Ship things" } },
+      ]),
+      assistantResponse("done"),
+    ]);
+
+    await execute(makeContext());
+
+    const approvalCalls = fetchMock.calls.filter(
+      (c) => c.method === "POST" && c.path === "/api/companies/company-1/approvals",
+    );
+    expect(approvalCalls.length).toBe(1);
+    const hireCalls = fetchMock.calls.filter(
+      (c) => c.method === "POST" && c.path === "/api/companies/company-1/agent-hires",
+    );
+    expect(hireCalls.length).toBe(0);
+  });
+
+  it("breaks the loop and blocks the issue after 3 identical repeat tool calls", async () => {
+    const repeatedCall = toolCallResponse([{ id: "call-x", name: "list_agents", args: {} }]);
+    fetchMock = setupFetchMock([repeatedCall, repeatedCall, repeatedCall]);
+
+    const ctx = makeContext();
+    const result = await execute(ctx);
+
+    // The repeat-loop breaker is a soft stop (like max_turns): the run itself
+    // didn't error, so exitCode stays 0, but the issue is blocked and the
+    // transcript's "result" entry records the real outcome.
+    expect(result.exitCode).toBe(0);
+    const blocked = fetchMock.calls.find(
+      (c) =>
+        c.method === "PATCH" &&
+        c.path === "/api/issues/issue-1" &&
+        (c.body as any)?.status === "blocked",
+    );
+    expect(blocked).toBeDefined();
+    expect((blocked!.body as any).statusReason).toContain("stuck in a retry loop");
+
+    const resultEntry = findTranscriptResultEntry(ctx);
+    expect(resultEntry?.subtype).toBe("repeat_loop");
+  });
+
+  it("stops at max_turns and blocks the issue with a reason", async () => {
+    fetchMock = setupFetchMock([toolCallResponse([{ id: "call-1", name: "list_agents", args: {} }])]);
+
+    const ctx = makeContext({ config: { model: "x", apiKey: "k", maxTurns: 1 } as any });
     const result = await execute(ctx);
 
     expect(result.exitCode).toBe(0);
-    const captured = fs.readFileSync(captureFile, "utf8");
-    expect(captured.trim().length).toBeGreaterThan(0);
-    // 3-line fallback per the issue suggestion.
-    expect(captured.split("\n").filter((l) => l.trim().length > 0).length).toBe(3);
-    expect(captured).toContain("heartbeat");
+    const blocked = fetchMock.calls.find(
+      (c) =>
+        c.method === "PATCH" &&
+        c.path === "/api/issues/issue-1" &&
+        (c.body as any)?.status === "blocked",
+    );
+    expect(blocked).toBeDefined();
+    expect((blocked!.body as any).statusReason).toContain("max_turns");
+
+    const resultEntry = findTranscriptResultEntry(ctx);
+    expect(resultEntry?.subtype).toBe("max_turns");
   });
 });

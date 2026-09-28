@@ -9,9 +9,9 @@
 
 ## What this is
 
-A fork of [`talhamahmood666/paperclip-adapter-openrouter`](https://github.com/talhamahmood666/paperclip-adapter-openrouter) with the OpenRouter base URL extracted into a configurable `baseUrl` field. The full tool-loop, 8 native Paperclip tools (`get_issue`, `update_issue_status`, `add_comment`, `list_comments`, `create_sub_issue`, `list_issues`, `hire_agent`, `request_approval`), skill loading, and stream-json transcripts are all unchanged. Only the LLM endpoint layer is generalized.
+A fork of [`talhamahmood666/paperclip-adapter-openrouter`](https://github.com/talhamahmood666/paperclip-adapter-openrouter) with the OpenRouter base URL extracted into a configurable `baseUrl` field. `execute()` runs an in-process, multi-turn tool-calling loop against the configured chat/completions endpoint, exposing only 9 scoped Paperclip-API tools (`get_issue`, `update_issue_status`, `add_comment`, `list_comments`, `create_sub_issue`, `list_issues`, `list_agents`, `hire_agent`, `request_approval`) — no shell or filesystem access. `hire_agent` and other sensitive actions route through Paperclip's approval flow unless `autoApprove` is set. Skill loading and stream-json transcripts are unchanged from upstream.
 
-If `baseUrl` is unset, behavior is identical to the upstream OpenRouter adapter.
+If `baseUrl` is unset, the LLM endpoint defaults to OpenRouter.
 
 ## Configuration
 
@@ -77,7 +77,7 @@ Get a key at https://platform.deepseek.com.
 
 | Variable | Purpose |
 | --- | --- |
-| `LLM_API_KEY` | Primary auth env var (read by adapter and CLI). |
+| `LLM_API_KEY` | Primary auth env var, used as a fallback when `adapterConfig.apiKey` is unset. |
 | `LLM_BASE_URL` | Optional override for `baseUrl`. |
 | `LLM_MODEL` | Default model when no adapter config supplies one. |
 | `OPENROUTER_API_KEY` | Backwards-compat alias for `LLM_API_KEY`. |
@@ -97,23 +97,19 @@ git clone https://github.com/souzix76/paperclip-adapter-llm.git
 ## Building from source
 
 ```bash
-# Adapter
 npm install
 npm run build
-
-# CLI (separate package; required for the tool-loop subprocess)
-cd cli && npm install && npm run build
 ```
 
-Both packages emit to their respective `dist/` directories. The CLI build is independent of the adapter and uses `@openrouter/ai-sdk-provider`'s `baseURL` option to route arbitrary OpenAI-compatible providers.
+Emits to `dist/`.
 
 ## What's configurable end-to-end
 
 | Layer | Status |
 | --- | --- |
 | `/models` env-test | ✅ Uses `baseUrl` |
-| `/chat/completions` (the actual agent loop) | ✅ Uses `baseUrl` via CLI `--base-url` flag and `LLM_BASE_URL` env |
-| `/generation` cost reporting | ⚠️ OpenRouter-specific endpoint — silently 404s on other providers; cost shows `$0` for non-OpenRouter providers. (Future: parse `usage` from stream-json events.) |
+| `/chat/completions` (the actual agent loop) | ✅ Uses `baseUrl` directly via `resolveEndpoints(baseUrl)` — no subprocess |
+| `/generation` cost reporting | ⚠️ OpenRouter-specific endpoint — only attempted when `baseUrl` resolves to OpenRouter; cost shows `$0`/`null` for other providers. |
 | Backwards compatibility | ✅ Existing OpenRouter installs need zero config changes. |
 
 ## Programmatic API
@@ -141,11 +137,10 @@ The full `LlmConfig` type and `createServerAdapter()` factory are exported from 
 - `OPENROUTER_BASE_URL` / `_MODELS_ENDPOINT` / `_CHAT_ENDPOINT` / `_GENERATION_ENDPOINT` re-exported pointing at OpenRouter defaults.
 - `listOpenRouterModels` re-exported as alias for `listModels`.
 - `OPENROUTER_API_KEY` / `OPENROUTER_MODEL` env vars still honored.
-- `openrouter-cli` bin name kept alongside new `llm-cli`.
 
 ## Credits
 
-This adapter is forked from [`talhamahmood666/paperclip-adapter-openrouter`](https://github.com/talhamahmood666/paperclip-adapter-openrouter). All tool-loop logic, Paperclip API integration, skill loading, and transcript handling come from the upstream project. This fork only generalizes the LLM endpoint layer.
+This adapter is forked from [`talhamahmood666/paperclip-adapter-openrouter`](https://github.com/talhamahmood666/paperclip-adapter-openrouter). The in-process tool-loop design, Paperclip API integration, skill loading, and transcript handling originate from the upstream project. This fork generalizes the LLM endpoint layer via `resolveEndpoints(baseUrl)` and removes a CLI-subprocess execution path (with unrestricted filesystem/shell tools) that an earlier revision of this fork had introduced, restoring the scoped, Paperclip-API-only tool set as the sole execution path.
 
 ## License
 
