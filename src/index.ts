@@ -109,6 +109,13 @@ export const agentConfigurationDoc = `# llm adapter configuration
 - \`topP\` (number, optional) — Nucleus sampling. Default: 1
 - \`stream\` (boolean, optional) — SSE streaming. Default: true
 - \`reasoning\` (boolean, optional) — Extended thinking for supported models.
+- \`maxTurns\` (number, optional) — Max tool-loop turns per run. Default: 25
+- \`autoApprove\` (boolean, optional) — Skip approval gates for hire_agent and similar mutating tools.
+- \`skillsDir\` (string, optional) — Override path to the skills directory.
+- \`instructionsFilePath\` (string, optional) — Absolute path to a markdown file read at
+  runtime and prepended to the system prompt (takes precedence over \`systemPrompt\` if
+  both are set). Manageable through Paperclip's own "Instructions" bundle editor in the
+  agent UI — this adapter declares \`supportsInstructionsBundle\`.
 
 OpenRouter-specific fields (ignored by other providers):
 - \`transforms\` (string[]) — e.g. ["middle-out"]

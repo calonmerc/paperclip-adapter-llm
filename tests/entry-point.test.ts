@@ -42,6 +42,18 @@ describe("package main entry", () => {
     expect(adapter.supportsLocalAgentJwt).toBe(true);
   });
 
+  it("declares supportsInstructionsBundle (unlocks Paperclip's managed Instructions editor)", async () => {
+    // Without this, Paperclip's agent UI shows "Instructions bundles are
+    // only available for local adapters" for this adapter even though
+    // LlmConfig.instructionsFilePath already exists and is already read at
+    // runtime in execute.ts. resolveInstructionsPathKey() on the host
+    // defaults to "instructionsFilePath" when this is true and no explicit
+    // instructionsPathKey is set — matching this adapter's existing key.
+    const mod: any = await import("../dist/index.js");
+    const adapter = mod.createServerAdapter();
+    expect(adapter.supportsInstructionsBundle).toBe(true);
+  });
+
   it("getConfigSchema() returns per-agent config fields (regression guard for GET .../config-schema 404ing)", async () => {
     // Paperclip's agent-config UI only renders per-agent config fields (API
     // key, base URL, system prompt, etc.) for adapters that implement

@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.4.5] - 2026-09-28
+
+### Added
+- `supportsInstructionsBundle: true` on `createServerAdapter()` — same class
+  of fix as v0.4.1's `supportsLocalAgentJwt`. Without it, Paperclip's agent
+  UI showed "Instructions bundles are only available for local adapters"
+  for this adapter, even though `LlmConfig.instructionsFilePath` already
+  existed and was already read at runtime in `execute.ts`. Paperclip's
+  `resolveInstructionsPathKey()` (host's `server/src/routes/agents.ts`)
+  defaults to the config key `"instructionsFilePath"` when this flag is
+  true and no explicit `instructionsPathKey` is set — which is exactly this
+  adapter's existing field, so no other code change was needed. The bundle
+  editor writes its content to a file on the Paperclip server's own
+  filesystem and points `adapterConfig.instructionsFilePath` at it; since
+  `execute()` runs in-process inside that same server, this just works.
+  Confirmed against the host repo: the built-in `hermes` adapter (a
+  remote-API-calling adapter, same shape as this one) sets this flag too.
+- Documented `maxTurns`, `autoApprove`, `skillsDir`, and
+  `instructionsFilePath` in `agentConfigurationDoc` (they existed on
+  `LlmConfig` and in the config schema but were missing from the adapter's
+  own reference doc).
+
 ## [0.4.4] - 2026-09-28
 
 ### Fixed (unconfirmed — likely, not certain)

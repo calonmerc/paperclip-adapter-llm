@@ -58,5 +58,6 @@ export declare function createServerAdapter(): {
     listModels: typeof listModels;
     getConfigSchema: typeof getConfigSchema;
     supportsLocalAgentJwt: boolean;
+    supportsInstructionsBundle: boolean;
 };
 //# sourceMappingURL=index.d.ts.map

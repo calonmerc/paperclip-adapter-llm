@@ -179,5 +179,21 @@ export function createServerAdapter() {
     // adapters (see the built-in hermes adapter) and local ones (see the
     // built-in process adapter) — it gates the JWT, not local execution.
     supportsLocalAgentJwt: true,
+    // Unlocks Paperclip's managed "Instructions" bundle editor in the agent
+    // UI (previously showed "Instructions bundles are only available for
+    // local adapters" for this adapter). Paperclip resolves the config key
+    // that holds the instructions file path via
+    // resolveInstructionsPathKey() (server/src/routes/agents.ts in the host
+    // repo): when supportsInstructionsBundle is true and no explicit
+    // instructionsPathKey is set, it defaults to "instructionsFilePath" —
+    // which already exists on LlmConfig and is already read at runtime in
+    // execute.ts (fs.readFile(config.instructionsFilePath)). The bundle
+    // editor writes its content to a file on the Paperclip server's own
+    // filesystem and points adapterConfig.instructionsFilePath at it;
+    // since execute() runs in-process inside that same server (per the
+    // plugin-loader contract), no other change is needed. The built-in
+    // hermes adapter — remote-API-calling, same shape as this one, no
+    // local execution either — sets this too.
+    supportsInstructionsBundle: true,
   };
 }
