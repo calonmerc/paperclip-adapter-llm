@@ -252,23 +252,45 @@ describe("execute()", () => {
     expect((chatCall!.body as any).tools).toBeUndefined();
   });
 
-  it("calls api.updateIssue and api.addIssueComment via the current adapter-utils API", async () => {
-    fetchMock = setupFetchMock([assistantResponse("hello")]);
+  it("posts the final assistant text as a comment but does NOT auto-mark the issue done", async () => {
+    // Regression guard for a real incident: the CEO agent's final text
+    // explicitly said it was waiting on another agent's response, and the
+    // old code marked the issue "done" anyway just because that turn had
+    // no tool call. "The model stopped calling tools" is not a disposition
+    // — only an explicit update_issue_status call (or Paperclip's own
+    // missing_disposition recovery nagging the agent to make one) may set
+    // a final status. A plain text reply must leave status untouched.
+    fetchMock = setupFetchMock([assistantResponse("Waiting on a response from the Engineering agent before I can continue.")]);
 
     await execute(makeContext());
 
     const issuePatchCalls = fetchMock.calls.filter(
       (c) => c.method === "PATCH" && c.path === "/api/issues/issue-1",
     );
-    expect(issuePatchCalls.length).toBeGreaterThanOrEqual(1);
+    // Only the initial "in_progress" checkout patch — nothing after.
+    expect(issuePatchCalls.length).toBe(1);
     expect(issuePatchCalls[0]!.body).toMatchObject({ status: "in_progress" });
-    expect(issuePatchCalls.at(-1)!.body).toMatchObject({ status: "done" });
+    expect(issuePatchCalls.some((c) => (c.body as any)?.status === "done")).toBe(false);
 
     const commentCalls = fetchMock.calls.filter(
       (c) => c.method === "POST" && c.path === "/api/issues/issue-1/comments",
     );
     expect(commentCalls.length).toBeGreaterThanOrEqual(1);
-    expect(commentCalls[0]!.body).toMatchObject({ body: expect.stringContaining("hello") });
+    expect(commentCalls[0]!.body).toMatchObject({ body: expect.stringContaining("Waiting on a response") });
+  });
+
+  it("still respects an explicit update_issue_status('done') call from the model", async () => {
+    fetchMock = setupFetchMock([
+      toolCallResponse([{ id: "call-1", name: "update_issue_status", args: { status: "done" } }]),
+      assistantResponse("Shipped."),
+    ]);
+
+    await execute(makeContext());
+
+    const issuePatchCalls = fetchMock.calls.filter(
+      (c) => c.method === "PATCH" && c.path === "/api/issues/issue-1",
+    );
+    expect(issuePatchCalls.some((c) => (c.body as any)?.status === "done")).toBe(true);
   });
 
   it("fails the run (does not silently report success) when the final disposition write can't be recorded, after one retry", async () => {
@@ -279,8 +301,10 @@ describe("execute()", () => {
     // comment in paperclip-api.ts) and was silently swallowed. A run that
     // can't record its own disposition must report failure instead, so
     // Paperclip's normal run-failure handling takes over rather than its
-    // ambiguous-success recovery nagging.
-    fetchMock = setupFetchMock([assistantResponse("all done")]);
+    // ambiguous-success recovery nagging. Uses the max_turns path (a
+    // "blocked" disposition) since a plain completed run no longer writes
+    // any status itself — see the "does NOT auto-mark the issue done" test.
+    fetchMock = setupFetchMock([toolCallResponse([{ id: "call-1", name: "list_agents", args: {} }])]);
     const recordingFetch = globalThis.fetch;
     let finalStatusPatchAttempts = 0;
     globalThis.fetch = (async (input: any, init?: any) => {
@@ -288,7 +312,7 @@ describe("execute()", () => {
       const method = (init?.method || "GET").toUpperCase();
       if (method === "PATCH" && new URL(url).pathname === "/api/issues/issue-1") {
         const body = init?.body ? JSON.parse(String(init.body)) : undefined;
-        if (body?.status === "done") {
+        if (body?.status === "blocked") {
           finalStatusPatchAttempts += 1;
           return new Response(JSON.stringify({ error: "Issue run ownership conflict" }), { status: 409 });
         }
@@ -296,12 +320,12 @@ describe("execute()", () => {
       return recordingFetch(input, init);
     }) as typeof fetch;
 
-    const result = await execute(makeContext());
+    const result = await execute(makeContext({ config: { model: "x", apiKey: "k", maxTurns: 1 } as any }));
 
     expect(finalStatusPatchAttempts).toBe(2); // one retry after the first failure
     expect(result.exitCode).toBe(1);
     expect(result.errorCode).toBe("issue_status_update_failed");
-    expect(result.errorMessage).toContain("Failed to record final issue status (done)");
+    expect(result.errorMessage).toContain("Failed to record final issue status (blocked)");
   });
 
   it("returns an AdapterExecutionResult with the current schema (no removed fields)", async () => {

@@ -109,7 +109,12 @@ const DEFAULT_SYSTEM_PROMPT =
   "answer is authoritative and current — use it and do not re-ask the same or a similarly-worded question. " +
   "If you're unsure whether a prior question of yours was already answered, call get_issue and " +
   "list_comments before asking another one. " +
-  "When finished, call update_issue_status with status='done' and post a summary comment.";
+  "Every run must end with an explicit disposition via update_issue_status — there is no default. " +
+  "If the work is complete, call update_issue_status with status='done' and post a summary comment. " +
+  "If you're waiting on another agent, a delegated sub-issue, or anything else before you can continue, " +
+  "call update_issue_status with status='blocked' (or leave it in_progress if you will resume it yourself) " +
+  "and explain what you're waiting on — do not just describe that in a comment or plain text reply and " +
+  "stop, since nothing then marks the issue as unfinished.";
 
 function resolveApiKey(config: LlmConfig, authToken: string | undefined): string {
   const key =
@@ -650,18 +655,23 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     let nextStatus: string | null = null;
     let statusReason: string | null = null;
     if (stoppedReason === "completed") {
-      // A pending ask_user_questions interaction means the issue is waiting
-      // on a human reply, not finished — leave status untouched rather than
-      // forcing in_review ourselves. Paperclip's own in_review review-path
-      // validator (assertInReviewReviewPath in the host's issues route)
-      // rejects an agent-authored in_review transition unless it recognizes
-      // a specific linked review path, which a bare status patch doesn't
-      // satisfy — that hard-fails the run instead of helping. It doesn't
-      // need to: Paperclip's separate missing_disposition recovery already
-      // skips any issue with a pending interaction or approval
-      // (hasPendingInteractionOrApproval), so simply not touching status
-      // here is sufficient and avoids guessing at that validator's rules.
-      nextStatus = interactionCreated.value ? null : "done";
+      // Do NOT guess "done" here. "The model stopped calling tools" only
+      // means the turn ended — it says nothing about whether the work is
+      // actually finished. A real incident: the model's final text
+      // explicitly said it was waiting on another agent's response, and
+      // this code marked the issue "done" anyway because that text wasn't
+      // a tool call. The model already has update_issue_status and is
+      // already told (DEFAULT_SYSTEM_PROMPT, and Paperclip's own
+      // DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE) to call it with an
+      // explicit disposition before ending the heartbeat — if it didn't,
+      // that's a real gap, and the correct owner of that gap is
+      // Paperclip's own missing_disposition recovery (which re-wakes this
+      // same agent asking it to pick a real disposition), not a guess made
+      // here. This also covers the ask_user_questions case (a pending
+      // interaction already exempts the issue from that recovery via
+      // hasPendingInteractionOrApproval), so no separate branch is needed
+      // for it anymore.
+      nextStatus = null;
     } else if (stoppedReason === "max_turns") {
       nextStatus = "blocked";
       statusReason = `Hit max_turns (${maxTurns}) without completing`;

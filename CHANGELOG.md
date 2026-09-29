@@ -1,5 +1,32 @@
 # Changelog
 
+## [0.5.0] - 2026-09-28
+
+### Fixed (behavior change)
+- **The adapter no longer guesses "done."** Observed live: the CEO agent's
+  final response explicitly said it was waiting on another agent's
+  response, and the issue was marked `done` anyway — because the old logic
+  treated "the model's turn ended with no tool call" as synonymous with
+  "the work is finished" and defaulted `nextStatus` to `"done"`
+  unconditionally in that case, regardless of what the text actually said.
+- A plain-text final turn now leaves issue status **untouched**. The model
+  already has `update_issue_status` and is already instructed (both
+  `DEFAULT_SYSTEM_PROMPT` here and Paperclip's own
+  `DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE`) to call it explicitly with a
+  real disposition before ending a heartbeat. When it doesn't, the correct
+  owner of that gap is Paperclip's own `missing_disposition` recovery
+  (which re-wakes the same agent and asks it to pick a real disposition),
+  not a guess made in this adapter. This is a generalization of v0.4.2's
+  `ask_user_questions` fix (leave status untouched, let Paperclip's own
+  recovery own it) — that fix's special-case branch is no longer needed
+  since the new default already does the right thing.
+- `update_issue_status` calls the model makes explicitly are completely
+  unaffected — this only removes the *automatic* fallback to `"done"`.
+- Strengthened `DEFAULT_SYSTEM_PROMPT`: every run must end with an
+  explicit disposition; if the model is blocked/waiting on something, it
+  must call `update_issue_status` (status `blocked`, or leave
+  `in_progress`) and explain why — not just describe that in text and stop.
+
 ## [0.4.5] - 2026-09-28
 
 ### Added
