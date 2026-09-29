@@ -44,7 +44,10 @@ const DEFAULT_SYSTEM_PROMPT = "You are an AI agent working inside Paperclip, an 
     "Use the tools available to you to read context, post comments, update status, and delegate work. " +
     "If you need information only a human can provide before continuing, call the ask_user_questions tool " +
     "instead of guessing, stalling, or writing out a question as plain text — it pauses the issue and wakes " +
-    "you again once someone answers. " +
+    "you again once someone answers. If this wake includes an 'Interaction ... is answered' section, that " +
+    "answer is authoritative and current — use it and do not re-ask the same or a similarly-worded question. " +
+    "If you're unsure whether a prior question of yours was already answered, call get_issue and " +
+    "list_comments before asking another one. " +
     "When finished, call update_issue_status with status='done' and post a summary comment.";
 function resolveApiKey(config, authToken) {
     const key = (config.apiKey && config.apiKey.length > 0 ? config.apiKey : undefined) ||
@@ -262,7 +265,17 @@ export async function execute(ctx) {
     try {
         wakePrompt = renderPaperclipWakePrompt(wake, { resumedSession }) || "";
     }
-    catch {
+    catch (err) {
+        // Do not swallow this silently: renderPaperclipWakePrompt is what renders
+        // an answered ask_user_questions interaction's resolution ("Interaction
+        // {id} is answered. The answer below is authoritative; do not re-ask the
+        // resolved questions.") — if this throws on that wake shape, the model
+        // never sees the human's answer at all and re-derives a similar question
+        // from scratch instead of using it. Falling back silently made a real
+        // incident (the same question asked repeatedly across separate runs)
+        // undiagnosable from the run log alone.
+        const reason = err instanceof Error ? err.message : String(err);
+        await writeRawStderr(onLog, `[llm] renderPaperclipWakePrompt threw, falling back to a generic prompt: ${reason}`);
         wakePrompt = "";
     }
     if (wakePrompt.trim().length === 0) {
@@ -270,6 +283,9 @@ export async function execute(ctx) {
         wakePrompt = [
             `You have just received a heartbeat from Paperclip${issueLine}.`,
             "No structured wake context was provided — proceed using the tools available to you.",
+            "Before asking a new ask_user_questions question, call get_issue and list_comments first: " +
+                "a human may have already answered a question you asked in an earlier run. Use their answer " +
+                "instead of re-asking the same or a similarly-worded question.",
             "Take the next useful action toward your current responsibilities, then end the run.",
         ].join("\n");
     }

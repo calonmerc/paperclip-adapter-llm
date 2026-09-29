@@ -1,5 +1,35 @@
 # Changelog
 
+## [0.4.3] - 2026-09-28
+
+### Fixed (unconfirmed — instrumented for diagnosis, not a verified root cause)
+- Observed live: after a human answers an `ask_user_questions` interaction,
+  the agent's next wake sometimes asks a similarly-worded question again
+  instead of using the answer.
+- Paperclip's own `renderPaperclipWakePrompt` (in
+  `@paperclipai/adapter-utils/server-utils`) explicitly renders an
+  "Interaction {id} is answered. The answer below is authoritative; do not
+  re-ask the resolved questions." section with the human's answer when it
+  recognizes a resolved-interaction wake. Our `execute.ts` called this
+  inside a `try/catch` that silently swallowed any exception and fell back
+  to a generic 3-line prompt containing none of that — if
+  `renderPaperclipWakePrompt` throws (or returns empty) on this particular
+  wake shape, the model never sees the answer at all and re-derives a
+  similar question from scratch. This was unverifiable from the run log
+  because the failure was silent.
+- The catch block now logs the actual error via `writeRawStderr` instead of
+  swallowing it, so the next occurrence will show in the run log whether
+  this is really what's happening. Also added a defensive instruction (both
+  in `DEFAULT_SYSTEM_PROMPT` and the generic fallback prompt) telling the
+  model to treat an "Interaction ... is answered" section as authoritative
+  and to check `get_issue`/`list_comments` for a prior answer before asking
+  again — cheap insurance regardless of whether the render is actually
+  failing.
+- If the run log shows this stderr line next time, the real bug is
+  upstream (in `renderPaperclipWakePrompt` or in the wake payload shape
+  Paperclip sends this adapter) — bring that log line back for the next
+  round of diagnosis.
+
 ## [0.4.2] - 2026-09-28
 
 ### Fixed

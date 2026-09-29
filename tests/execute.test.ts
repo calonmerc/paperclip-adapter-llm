@@ -373,9 +373,12 @@ describe("execute()", () => {
     const chatCall = fetchMock.calls.find((c) => c.path.endsWith("/chat/completions"));
     const messages = (chatCall!.body as any).messages as Array<{ role: string; content: string }>;
     const userMessage = messages.find((m) => m.role === "user")!;
-    // 3-line fallback per the issue suggestion.
-    expect(userMessage.content.split("\n").filter((l) => l.trim().length > 0).length).toBe(3);
+    // 4-line fallback: heartbeat notice, no-structured-context notice, the
+    // check-for-a-prior-answer nudge (added alongside ask_user_questions so
+    // a degraded/fallback wake doesn't blindly re-ask), and "take action".
+    expect(userMessage.content.split("\n").filter((l) => l.trim().length > 0).length).toBe(4);
     expect(userMessage.content).toContain("heartbeat");
+    expect(userMessage.content).toContain("list_comments");
   });
 
   it("dispatches tool calls to the scoped Paperclip-API tools (not shell/filesystem)", async () => {
