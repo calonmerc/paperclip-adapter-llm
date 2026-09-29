@@ -28,11 +28,12 @@ describe("tools.ts", () => {
     const api = makeApi(async () => jsonResponse({}));
     const tools = buildTools({ api, agentId: "agent-1", companyId: "company-1", currentIssueId: null, autoApprove: false });
 
-    expect(tools.length).toBe(12);
+    expect(tools.length).toBe(13);
     const names = toolSchemas(tools).map((s) => s.function.name);
     expect(names).toEqual([
       "get_issue",
       "update_issue_status",
+      "update_issue",
       "add_comment",
       "list_comments",
       "create_sub_issue",
@@ -83,6 +84,73 @@ describe("tools.ts", () => {
     const result = await findTool(tools, "update_issue_status")!.execute({ status: "done" });
     expect(result.isError).toBe(true);
     expect(JSON.parse(result.content).error).toContain("update_issue_status failed");
+  });
+
+  it("update_issue_status offers the real Paperclip status values, including in_review (regression guard)", () => {
+    // Past bug: the enum here was ["open", "in_progress", "blocked", "done", "cancelled"] — "open"
+    // isn't a real Paperclip status at all, and "in_review" (a status this whole project's disposition
+    // work leans on heavily) was missing entirely, silently making it unreachable via this tool.
+    const api = makeApi(async () => jsonResponse({}));
+    const tools = buildTools({ api, agentId: "agent-1", companyId: "company-1", currentIssueId: "issue-1", autoApprove: false });
+    const schema = findTool(tools, "update_issue_status")!.schema;
+    const statusEnum = (schema.function.parameters as any).properties.status.enum;
+    expect(statusEnum).toEqual(["backlog", "todo", "in_progress", "in_review", "blocked", "done", "cancelled"]);
+  });
+
+  it("update_issue replaces the blocker set and other fields, defaulting to the current issue", async () => {
+    const calls: Array<{ method: string; path: string; body: any }> = [];
+    const api = makeApi(async (input: any, init: any) => {
+      calls.push({
+        method: (init?.method || "GET").toUpperCase(),
+        path: new URL(typeof input === "string" ? input : input.url).pathname,
+        body: init?.body ? JSON.parse(init.body) : undefined,
+      });
+      return jsonResponse({ id: "issue-1" });
+    });
+    const tools = buildTools({ api, agentId: "agent-1", companyId: "company-1", currentIssueId: "issue-1", autoApprove: false });
+
+    const result = await findTool(tools, "update_issue")!.execute({
+      blocked_by_issue_ids: ["issue-32"],
+      priority: "high",
+    });
+
+    expect(result.isError).toBe(false);
+    expect(calls[0]).toMatchObject({
+      method: "PATCH",
+      path: "/api/issues/issue-1",
+      body: { blockedByIssueIds: ["issue-32"], priority: "high" },
+    });
+  });
+
+  it("update_issue can clear all blockers with an empty array and unassign with an empty string", async () => {
+    const calls: Array<{ body: any }> = [];
+    const api = makeApi(async (_input: any, init: any) => {
+      calls.push({ body: init?.body ? JSON.parse(init.body) : undefined });
+      return jsonResponse({ id: "issue-1" });
+    });
+    const tools = buildTools({ api, agentId: "agent-1", companyId: "company-1", currentIssueId: "issue-1", autoApprove: false });
+
+    await findTool(tools, "update_issue")!.execute({ blocked_by_issue_ids: [], assignee_agent_id: "" });
+
+    expect(calls.at(-1)!.body).toMatchObject({ blockedByIssueIds: [], assigneeAgentId: null });
+  });
+
+  it("update_issue fails when no fields are supplied", async () => {
+    const api = makeApi(async () => jsonResponse({}));
+    const tools = buildTools({ api, agentId: "agent-1", companyId: "company-1", currentIssueId: "issue-1", autoApprove: false });
+
+    const result = await findTool(tools, "update_issue")!.execute({});
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain("No fields supplied");
+  });
+
+  it("update_issue fails gracefully with no current issue and no issue_id", async () => {
+    const api = makeApi(async () => jsonResponse({}));
+    const tools = buildTools({ api, agentId: "agent-1", companyId: "company-1", currentIssueId: null, autoApprove: false });
+
+    const result = await findTool(tools, "update_issue")!.execute({ title: "New title" });
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain("No issue_id supplied");
   });
 
   it("hire_agent routes through createApproval when autoApprove is false", async () => {
@@ -141,6 +209,16 @@ describe("tools.ts", () => {
     const result = await findTool(tools, "list_comments")!.execute({});
     expect(result.isError).toBe(false);
     expect(paths).toContain("/api/issues/issue-7/comments");
+  });
+
+  it("create_sub_issue offers the real Paperclip priority values (regression guard)", () => {
+    // Past bug: the enum here was ["low", "normal", "high", "urgent"] — none of those except
+    // "high"/"low" are real Paperclip priorities (the real set is critical/high/medium/low).
+    const api = makeApi(async () => jsonResponse({}));
+    const tools = buildTools({ api, agentId: "agent-1", companyId: "company-1", currentIssueId: "issue-1", autoApprove: false });
+    const schema = findTool(tools, "create_sub_issue")!.schema;
+    const priorityEnum = (schema.function.parameters as any).properties.priority.enum;
+    expect(priorityEnum).toEqual(["critical", "high", "medium", "low"]);
   });
 
   it("create_sub_issue requires a title and defaults parentId to the current issue", async () => {

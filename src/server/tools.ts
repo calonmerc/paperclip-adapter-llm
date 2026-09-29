@@ -128,15 +128,15 @@ function updateIssueStatusTool(ctx: BuildToolsContext): Tool {
       function: {
         name: "update_issue_status",
         description:
-          "Move an issue to a new status. Valid statuses: open, in_progress, blocked, done, cancelled. " +
-          "Defaults to the current issue.",
+          "Move an issue to a new status. Valid statuses: backlog, todo, in_progress, in_review, " +
+          "blocked, done, cancelled. Defaults to the current issue.",
         parameters: {
           type: "object",
           properties: {
             issue_id: { type: "string", description: "Issue id. Omit to use the current issue." },
             status: {
               type: "string",
-              enum: ["open", "in_progress", "blocked", "done", "cancelled"],
+              enum: ["backlog", "todo", "in_progress", "in_review", "blocked", "done", "cancelled"],
             },
             reason: { type: "string", description: "Optional explanation." },
           },
@@ -152,6 +152,65 @@ function updateIssueStatusTool(ctx: BuildToolsContext): Tool {
       return safeCall("update_issue_status", () =>
         ctx.api.updateIssue(id, { status, statusReason: args.reason ?? null }),
       );
+    },
+  };
+}
+
+function updateIssueTool(ctx: BuildToolsContext): Tool {
+  return {
+    schema: {
+      type: "function",
+      function: {
+        name: "update_issue",
+        description:
+          "Update an issue's fields other than status (use update_issue_status for status changes). " +
+          "Use this to fix a stale blocker set (e.g. blockers that point at a cancelled or done issue), " +
+          "reassign, retitle, or edit the description — instead of routing those changes through the " +
+          "issue owner. Only fields you supply are changed; omit anything you don't want to touch.",
+        parameters: {
+          type: "object",
+          properties: {
+            issue_id: { type: "string", description: "Issue id. Omit to use the current issue." },
+            title: { type: "string" },
+            description: { type: "string" },
+            priority: { type: "string", enum: ["critical", "high", "medium", "low"] },
+            blocked_by_issue_ids: {
+              type: "array",
+              items: { type: "string" },
+              description:
+                "Full replacement for the issue's blocker set — not a diff. Pass every issue id that " +
+                "should still block this one; omit any that no longer should (e.g. cancelled/done " +
+                "issues). Pass an empty array to clear all blockers.",
+            },
+            assignee_agent_id: {
+              type: "string",
+              description: "Agent id to assign to. Pass an empty string to unassign.",
+            },
+            assignee_user_id: {
+              type: "string",
+              description: "User id to assign to. Pass an empty string to unassign.",
+            },
+          },
+        },
+      },
+    },
+    execute: async (args) => {
+      const id = asString(args.issue_id, ctx.currentIssueId ?? "");
+      if (!id) return fail("No issue_id supplied and no current issue.");
+
+      const patch: Record<string, unknown> = {};
+      if (typeof args.title === "string" && args.title.trim()) patch.title = args.title.trim();
+      if (typeof args.description === "string") patch.description = args.description;
+      if (typeof args.priority === "string" && args.priority) patch.priority = args.priority;
+      if (Array.isArray(args.blocked_by_issue_ids)) {
+        patch.blockedByIssueIds = args.blocked_by_issue_ids.filter((v): v is string => typeof v === "string");
+      }
+      if (typeof args.assignee_agent_id === "string") patch.assigneeAgentId = args.assignee_agent_id || null;
+      if (typeof args.assignee_user_id === "string") patch.assigneeUserId = args.assignee_user_id || null;
+
+      if (Object.keys(patch).length === 0) return fail("No fields supplied to update.");
+
+      return safeCall("update_issue", () => ctx.api.updateIssue(id, patch));
     },
   };
 }
@@ -224,7 +283,7 @@ function createSubIssueTool(ctx: BuildToolsContext): Tool {
             title: { type: "string" },
             description: { type: "string" },
             assignee_agent_id: { type: "string", description: "Optional agent id to assign to." },
-            priority: { type: "string", enum: ["low", "normal", "high", "urgent"] },
+            priority: { type: "string", enum: ["critical", "high", "medium", "low"] },
           },
           required: ["title"],
         },
@@ -688,6 +747,7 @@ export function buildTools(ctx: BuildToolsContext): Tool[] {
   return [
     getIssueTool(ctx),
     updateIssueStatusTool(ctx),
+    updateIssueTool(ctx),
     addCommentTool(ctx),
     listCommentsTool(ctx),
     createSubIssueTool(ctx),

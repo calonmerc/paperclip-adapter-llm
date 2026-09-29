@@ -13,9 +13,9 @@ A fork of [`talhamahmood666/paperclip-adapter-openrouter`](https://github.com/ta
 
 ### Tools
 
-12 scoped tools, no shell access, no arbitrary filesystem access:
+13 scoped tools, no shell access, no arbitrary filesystem access:
 
-- `get_issue`, `update_issue_status`, `add_comment`, `list_comments`, `create_sub_issue`, `list_issues`, `list_agents` — standard Paperclip issue/company operations.
+- `get_issue`, `update_issue_status`, `update_issue`, `add_comment`, `list_comments`, `create_sub_issue`, `list_issues`, `list_agents` — standard Paperclip issue/company operations. `update_issue_status` is status only; `update_issue` covers everything else (title, description, priority, assignee, and — its original motivating use case — replacing a stale `blockedByIssueIds` set, e.g. blockers pointing at an issue that's since been cancelled).
 - `hire_agent`, `request_approval` — route through Paperclip's approval flow unless `autoApprove` is set.
 - `ask_user_questions` — creates a real Paperclip issue-thread interaction (`continuationPolicy: wake_assignee`) and ends the run immediately after (the model cannot get a real answer within the same run).
 - `issue_document` — reads/writes/lists real Paperclip documents on an issue (`PUT /api/issues/:id/documents/:key`), with revision history, visible in the Documents panel in the web UI. Use this for anything a human should actually see and review.

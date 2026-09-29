@@ -1,5 +1,44 @@
 # Changelog
 
+## [0.9.0] - 2026-09-29
+
+### Fixed
+- **`update_issue_status`'s status enum was wrong.** It offered
+  `["open", "in_progress", "blocked", "done", "cancelled"]` — "open" isn't
+  a real Paperclip status at all (the real set, `ISSUE_STATUSES` in the
+  host's `packages/shared/src/constants.ts`, is `backlog`, `todo`,
+  `in_progress`, `in_review`, `done`, `blocked`, `cancelled`), and
+  `in_review` — a status this project's whole disposition-handling effort
+  leans on — was missing entirely, silently unreachable via this tool
+  since the model was never offered it as an option.
+- **`create_sub_issue`'s priority enum was wrong too**: it offered
+  `["low", "normal", "high", "urgent"]` against the real set
+  (`ISSUE_PRIORITIES`) of `critical`, `high`, `medium`, `low`.
+- Both now match Paperclip's real enums exactly, with regression tests
+  asserting the schema's enum values directly (not just that a call
+  succeeds) so a future edit can't silently drift again.
+
+### Added
+- **New `update_issue` tool**, requested directly by a running agent: its
+  blocker set (`blockedByIssueIds`) pointed at a cancelled issue and it had
+  no tool to fix that itself, having to route the change through the issue
+  owner instead. `update_issue_status` only ever sent `{status,
+  statusReason}` — `PaperclipApi.updateIssue()` underneath it already
+  accepted an arbitrary patch object, so this is a new tool wrapping the
+  same client method with a safely-scoped field set: `title`,
+  `description`, `priority`, `blocked_by_issue_ids` (full replacement, not
+  a diff — pass every id that should still block, omit ones that
+  shouldn't), `assignee_agent_id`, `assignee_user_id` (empty string
+  unassigns either). Deliberately excludes riskier/policy fields from
+  Paperclip's real update schema (`executionPolicy`,
+  `executionWorkspaceSettings`, `reviewInteractionId`,
+  `onBehalfOfUserId`, etc.) that aren't safe for a generic agent tool to
+  expose. Status changes stay on `update_issue_status`, not duplicated
+  here.
+- `DEFAULT_SYSTEM_PROMPT` now tells the model about `update_issue`
+  specifically for fixing a stale blocker set.
+- 6 new tests.
+
 ## [0.8.0] - 2026-09-29
 
 ### Added

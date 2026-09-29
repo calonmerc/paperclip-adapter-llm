@@ -123,7 +123,11 @@ const DEFAULT_SYSTEM_PROMPT =
   "When you produce a document a human should actually read and review (a report, plan, spec, or " +
   "write-up), use the issue_document tool, not add_comment or memory_fs — it's a real document with " +
   "revision history, visible in the Documents panel in the Paperclip web UI. add_comment is for short " +
-  "chat-style updates; memory_fs is private/shared notes nobody in the UI ever sees.";
+  "chat-style updates; memory_fs is private/shared notes nobody in the UI ever sees. " +
+  "Use update_issue to fix an issue's other fields yourself — title, description, priority, " +
+  "assignee, or a stale blocker set (e.g. blockers pointing at an issue that's since been cancelled " +
+  "or done) — instead of routing the change through the issue owner. update_issue_status stays the " +
+  "tool for status changes specifically.";
 
 function resolveApiKey(config: LlmConfig, authToken: string | undefined): string {
   const key =
