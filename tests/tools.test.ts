@@ -309,6 +309,28 @@ describe("tools.ts", () => {
     });
   });
 
+  it("ask_user_questions accepts plain strings as options, not just {label} objects", async () => {
+    // Weaker function-calling models are more likely to pass a flat string
+    // array (["Staging", "Production"]) than an array of {label} objects —
+    // accept both instead of silently dropping to the free-text fallback.
+    const calls: Array<{ body: any }> = [];
+    const api = makeApi(async (_input: any, init: any) => {
+      calls.push({ body: init?.body ? JSON.parse(init.body) : undefined });
+      return jsonResponse({ id: "interaction-1" });
+    });
+    const tools = buildTools({ api, agentId: "agent-1", companyId: "company-1", currentIssueId: "issue-7", autoApprove: false });
+
+    const result = await findTool(tools, "ask_user_questions")!.execute({
+      questions: [{ prompt: "Which environment?", options: ["Staging", "Production"] }],
+    });
+
+    expect(result.isError).toBe(false);
+    expect(calls.at(-1)!.body.payload.questions[0].options).toEqual([
+      { id: "q1_o1", label: "Staging" },
+      { id: "q1_o2", label: "Production" },
+    ]);
+  });
+
   it("ask_user_questions requires at least one question with a non-empty prompt", async () => {
     const api = makeApi(async () => jsonResponse({}));
     const tools = buildTools({ api, agentId: "agent-1", companyId: "company-1", currentIssueId: "issue-7", autoApprove: false });

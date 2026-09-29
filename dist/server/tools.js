@@ -351,7 +351,13 @@ function askUserQuestionsTool(ctx) {
                 description: "Ask a human a structured question and pause this issue for their reply — use this instead of " +
                     "guessing or stalling when you need information only a human can provide. Creates a Paperclip " +
                     "issue-thread interaction (continuationPolicy=wake_assignee): you will be woken again once someone " +
-                    "answers. End your turn right after calling this — do not keep working on the issue in the same run.",
+                    "answers. End your turn right after calling this — do not keep working on the issue in the same run. " +
+                    "IMPORTANT: whenever the answer could reasonably be one of a short list of choices (yes/no, " +
+                    "approve/reject, a named environment, a person, a small set of options you can name), set `options` " +
+                    "so the human can tap an answer instead of typing one — do not leave `options` empty just because " +
+                    "it's easier. Only skip `options` for a genuinely open-ended question (e.g. 'what should the title " +
+                    'be?"). Example call: {"questions": [{"prompt": "Which environment should this deploy to?", ' +
+                    '"options": [{"label": "Staging"}, {"label": "Production"}]}]}.',
                 parameters: {
                     type: "object",
                     properties: {
@@ -370,14 +376,21 @@ function askUserQuestionsTool(ctx) {
                                     },
                                     options: {
                                         type: "array",
-                                        description: "Answer choices. Omit (or leave empty) for a free-text question.",
+                                        description: "Answer choices — set this whenever there's a nameable short list of likely answers " +
+                                            "(see the tool description). Each item is either a plain string or {label, description}. " +
+                                            "Only omit/leave empty for a genuinely open-ended free-text question.",
                                         items: {
-                                            type: "object",
-                                            properties: {
-                                                label: { type: "string" },
-                                                description: { type: "string" },
-                                            },
-                                            required: ["label"],
+                                            anyOf: [
+                                                { type: "string" },
+                                                {
+                                                    type: "object",
+                                                    properties: {
+                                                        label: { type: "string" },
+                                                        description: { type: "string" },
+                                                    },
+                                                    required: ["label"],
+                                                },
+                                            ],
                                         },
                                     },
                                 },
@@ -401,7 +414,10 @@ function askUserQuestionsTool(ctx) {
                 const rawOptions = Array.isArray(q.options) ? q.options : [];
                 const options = rawOptions.length > 0
                     ? rawOptions.map((raw2, oi) => {
-                        const o = (raw2 && typeof raw2 === "object" ? raw2 : {});
+                        if (typeof raw2 === "string") {
+                            return { id: `q${qi + 1}_o${oi + 1}`, label: raw2 || `Option ${oi + 1}` };
+                        }
+                        const o = raw2 && typeof raw2 === "object" ? raw2 : {};
                         const option = {
                             id: `q${qi + 1}_o${oi + 1}`,
                             label: asString(o.label, `Option ${oi + 1}`),

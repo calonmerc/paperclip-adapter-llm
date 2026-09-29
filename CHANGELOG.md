@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.4.4] - 2026-09-28
+
+### Fixed (unconfirmed — likely, not certain)
+- Observed live: every `ask_user_questions` question rendered with exactly
+  one answer choice, "Your answer" as free text — the model never supplied
+  `options`, even for questions with an obvious short answer set (e.g.
+  which environment to deploy to).
+- Leading explanation: the model in use (`llm/gpt-oss-20b`, a small
+  open-weight model) likely isn't reliably populating an *optional*,
+  two-levels-nested array-of-objects field (`questions[].options[].label`)
+  in a tool call, even when one would make sense — a known weak spot for
+  smaller function-calling models. Nothing in the adapter's own parsing
+  was silently dropping non-empty options (verified: a non-empty
+  `options` array, even malformed, would have produced generic "Option N"
+  labels, not zero options — the observed symptom is consistent with the
+  model omitting the field entirely, not a parsing bug).
+- Mitigations: the tool description is now explicit that `options` should
+  be set whenever there's a nameable short list of likely answers (with a
+  worked example in the description), and `options` now accepts plain
+  strings (`["Staging", "Production"]`) as well as `{label, description}`
+  objects — a flatter shape a weaker model is more likely to produce
+  correctly. Neither is a guaranteed fix for a model that just doesn't
+  attend to optional schema fields; if it persists, the more reliable fix
+  is a stronger model, not more prompt engineering.
+
 ## [0.4.3] - 2026-09-28
 
 ### Fixed (unconfirmed — instrumented for diagnosis, not a verified root cause)
