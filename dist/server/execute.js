@@ -414,6 +414,18 @@ export async function execute(ctx) {
     let turn = 0;
     let stoppedReason = "completed";
     let runError = null;
+    // Set when update_issue_status is called successfully — see the
+    // disposition-nudge block below, which exists because of a real,
+    // observed failure mode: models confidently write "Done — closed as
+    // done, verified in the API response" without ever having called the
+    // tool. Left unfixed, that just re-triggers Paperclip's own
+    // missing_disposition recovery on the next heartbeat, which costs a
+    // whole extra run and, per production evidence, doesn't reliably fix
+    // the underlying habit either — it can recur run after run on the same
+    // issue. One in-run corrective nudge is cheaper and more effective than
+    // waiting on the cross-run recovery loop.
+    let statusToolCalled = false;
+    let dispositionNudgeGiven = false;
     // Repeat-call detection: if the model calls the same tool with the same args
     // three times in a row, break the loop. Prevents 20+ retries when the model
     // misreads an error message and keeps "fixing" it the same wrong way.
@@ -456,8 +468,23 @@ export async function execute(ctx) {
                 await emitAssistant(onLog, text);
                 finalAssistantText = text;
             }
-            // No tool calls => model is done.
+            // No tool calls => model believes it's done. Before accepting that,
+            // give it exactly one chance to actually record a disposition if it
+            // hasn't — see the dispositionNudgeGiven comment above.
             if (toolCalls.length === 0) {
+                if (!statusToolCalled && !interactionCreated.value && !dispositionNudgeGiven && turn < maxTurns) {
+                    dispositionNudgeGiven = true;
+                    messages.push({
+                        role: "user",
+                        content: "You did not call update_issue_status (or ask_user_questions) in that reply. Every run must " +
+                            "end with an explicit disposition — Paperclip cannot infer one from this text, no matter how " +
+                            "clearly it states the work is finished. If the work is actually complete, call " +
+                            "update_issue_status now with status='done'. If you're blocked or waiting on something, call " +
+                            "it with status='blocked' and say what you're waiting on. If you need human input, call " +
+                            "ask_user_questions instead. Do not just restate that you're finished — call the tool.",
+                    });
+                    continue;
+                }
                 stoppedReason = "completed";
                 break;
             }
@@ -502,6 +529,8 @@ export async function execute(ctx) {
                     content: resultContent,
                     isError,
                 });
+                if (toolName === "update_issue_status" && !isError)
+                    statusToolCalled = true;
                 messages.push({
                     role: "tool",
                     tool_call_id: tc.id,

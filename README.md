@@ -26,6 +26,8 @@ A fork of [`talhamahmood666/paperclip-adapter-openrouter`](https://github.com/ta
 
 The adapter never guesses an issue's final disposition: a run only changes issue status when the model explicitly calls `update_issue_status`, or on `max_turns`/an unrecoverable error (both `blocked`). A plain-text turn with no such call leaves status untouched, and Paperclip's own `missing_disposition` recovery owns prompting the agent for a real disposition.
 
+Before accepting a plain-text "I'm done" as the end of a run, `execute()` gives the model exactly one in-run nudge if it never called `update_issue_status` or created an `ask_user_questions` interaction: a corrective message pointing out that no disposition was recorded and asking it to call the tool now. This exists because of a real, observed failure mode — a model confidently writing "closed done, verified in the API response" without ever having called the tool — that kept re-triggering Paperclip's cross-run `missing_disposition` recovery run after run on the same issue without fixing the underlying habit. One in-run nudge is cheaper and more effective than waiting on that slower loop. If the model still doesn't comply after the nudge, status is left untouched as before.
+
 ### Capability flags
 
 `createServerAdapter()` declares `supportsLocalAgentJwt` (required for Paperclip to inject the agent's scoped API `authToken` at all — without it every Paperclip API write is silently skipped) and `supportsInstructionsBundle` (unlocks Paperclip's managed "Instructions" editor for `adapterConfig.instructionsFilePath`, which is already read at runtime).

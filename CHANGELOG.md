@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.11.0] - 2026-09-29
+
+### Added
+- **In-run disposition nudge.** Diagnosed from a real, multi-run transcript
+  on a single issue (`DEBA-35`): a run's final comment confidently claimed
+  "Ready. DEBA-35 closed **done**... verified in the API response" — but
+  `update_issue_status` was never actually called, and the issue stayed
+  `in_progress`. Paperclip's own `missing_disposition` recovery correctly
+  re-triggered on the next heartbeat (that's the "blocked disposition
+  again" the user reported) — but the same pattern recurred *again* several
+  runs later on the same issue, showing the cross-run recovery loop alone
+  wasn't reliably fixing the underlying habit, only costing an extra full
+  run each time it happened.
+- `execute()` now tracks whether `update_issue_status` was called
+  successfully during the run. If the model stops calling tools without
+  having called it (and without a pending `ask_user_questions`
+  interaction, which already has its own valid no-status-change path), it
+  gets exactly **one** corrective nudge — a plain user-role message
+  pointing out that no disposition was recorded and asking it to call the
+  tool now — before the run is allowed to end. If it still doesn't comply,
+  behavior is unchanged from v0.5.0: status is left untouched and
+  Paperclip's own recovery owns it from there.
+- 2 new tests: the nudge firing and going unanswered (status still stays
+  untouched), and the nudge successfully recovering a disposition on the
+  model's second attempt.
+
 ## [0.10.0] - 2026-09-29
 
 ### Added

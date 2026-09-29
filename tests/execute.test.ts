@@ -290,17 +290,25 @@ describe("execute()", () => {
     expect((chatCall!.body as any).tools).toBeUndefined();
   });
 
-  it("posts the final assistant text as a comment but does NOT auto-mark the issue done", async () => {
-    // Regression guard for a real incident: the CEO agent's final text
+  it("posts the final assistant text as a comment but does NOT auto-mark the issue done, even after a disposition nudge goes unanswered", async () => {
+    // Regression guard for a real incident: an agent's final text
     // explicitly said it was waiting on another agent's response, and the
     // old code marked the issue "done" anyway just because that turn had
     // no tool call. "The model stopped calling tools" is not a disposition
     // — only an explicit update_issue_status call (or Paperclip's own
     // missing_disposition recovery nagging the agent to make one) may set
-    // a final status. A plain text reply must leave status untouched.
-    fetchMock = setupFetchMock([assistantResponse("Waiting on a response from the Engineering agent before I can continue.")]);
+    // a final status. A plain text reply must leave status untouched, even
+    // once the in-run disposition nudge (see the next test) has fired and
+    // the model still doesn't call the tool.
+    fetchMock = setupFetchMock([
+      assistantResponse("Waiting on a response from the Engineering agent before I can continue."),
+      assistantResponse("Still waiting — nothing has changed since my last update."),
+    ]);
 
     await execute(makeContext());
+
+    const chatCalls = fetchMock.calls.filter((c) => c.path.endsWith("/chat/completions"));
+    expect(chatCalls.length).toBe(2); // confirms the nudge actually fired and consumed a second turn
 
     const issuePatchCalls = fetchMock.calls.filter(
       (c) => c.method === "PATCH" && c.path === "/api/issues/issue-1",
@@ -314,7 +322,7 @@ describe("execute()", () => {
       (c) => c.method === "POST" && c.path === "/api/issues/issue-1/comments",
     );
     expect(commentCalls.length).toBeGreaterThanOrEqual(1);
-    expect(commentCalls[0]!.body).toMatchObject({ body: expect.stringContaining("Waiting on a response") });
+    expect(commentCalls[0]!.body).toMatchObject({ body: expect.stringContaining("Still waiting") });
   });
 
   it("still respects an explicit update_issue_status('done') call from the model", async () => {
@@ -325,6 +333,36 @@ describe("execute()", () => {
 
     await execute(makeContext());
 
+    const issuePatchCalls = fetchMock.calls.filter(
+      (c) => c.method === "PATCH" && c.path === "/api/issues/issue-1",
+    );
+    expect(issuePatchCalls.some((c) => (c.body as any)?.status === "done")).toBe(true);
+  });
+
+  it("nudges the model for a disposition when it stops without calling update_issue_status, and accepts one if given", async () => {
+    // Real incident: a model's final comment confidently claimed "closed
+    // done, verified in the API response" — but had never actually called
+    // update_issue_status, leaving the issue in_progress. Paperclip's own
+    // cross-run missing_disposition recovery kept re-triggering on the same
+    // issue run after run without fixing the underlying habit. This nudge
+    // gives the model one in-run chance to actually call the tool before
+    // the run ends, instead of only relying on that slower, evidently
+    // unreliable cross-run loop.
+    fetchMock = setupFetchMock([
+      assistantResponse("Closed out — everything's filed and done."), // no tool call: triggers the nudge
+      toolCallResponse([{ id: "call-1", name: "update_issue_status", args: { status: "done" } }]),
+      assistantResponse("Confirmed done."),
+    ]);
+
+    const result = await execute(makeContext());
+
+    const chatCalls = fetchMock.calls.filter((c) => c.path.endsWith("/chat/completions"));
+    expect(chatCalls.length).toBe(3);
+    // The nudge is a plain user-role message, not a tool result — confirm it reached the model.
+    const nudgedCallMessages = (chatCalls[1]!.body as any).messages as Array<{ role: string; content: string }>;
+    expect(nudgedCallMessages.some((m) => m.role === "user" && m.content.includes("did not call update_issue_status"))).toBe(true);
+
+    expect(result.exitCode).toBe(0);
     const issuePatchCalls = fetchMock.calls.filter(
       (c) => c.method === "PATCH" && c.path === "/api/issues/issue-1",
     );
