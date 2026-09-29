@@ -593,6 +593,7 @@ describe("issue_document", () => {
         path: new URL(typeof input === "string" ? input : input.url).pathname,
         body: init?.body ? JSON.parse(init.body) : undefined,
       });
+      if ((init?.method || "GET").toUpperCase() === "GET") return jsonResponse({ error: "not found" }, 404);
       return jsonResponse({ document: { key: "design-doc" } });
     });
     const tools = buildTools({ api, agentId: "agent-1", companyId: "company-1", currentIssueId: "issue-7", autoApprove: false });
@@ -606,11 +607,67 @@ describe("issue_document", () => {
     });
 
     expect(result.isError).toBe(false);
-    expect(calls[0]).toMatchObject({
-      method: "PUT",
+    const putCall = calls.find((c) => c.method === "PUT");
+    expect(putCall).toMatchObject({
       path: "/api/issues/issue-7/documents/design-doc",
       body: { title: "Design Doc", format: "markdown", body: "# Design\n\nDetails here.", changeSummary: "Initial draft" },
     });
+  });
+
+  it("auto-resolves baseRevisionId from the existing document before writing (regression guard)", async () => {
+    // Real incident: an agent reported "The document tool can't carry the
+    // required baseRevisionId for an existing key" and worked around it by
+    // publishing under a fresh key instead — because the tool never sent
+    // baseRevisionId at all, and Paperclip 409s any update to an existing
+    // key without it (packages/shared upsertIssueDocumentSchema +
+    // documents.ts's optimistic-concurrency check in the host repo). The
+    // fix resolves it automatically so the model never has to manage
+    // revision ids itself.
+    const calls: Array<{ method: string; path: string; body: any }> = [];
+    const api = makeApi(async (input: any, init: any) => {
+      const method = (init?.method || "GET").toUpperCase();
+      calls.push({ method, path: new URL(typeof input === "string" ? input : input.url).pathname, body: init?.body ? JSON.parse(init.body) : undefined });
+      if (method === "GET") return jsonResponse({ key: "design-doc", latestRevisionId: "rev-abc" });
+      return jsonResponse({ document: { key: "design-doc", latestRevisionId: "rev-def" } });
+    });
+    const tools = buildTools({ api, agentId: "agent-1", companyId: "company-1", currentIssueId: "issue-7", autoApprove: false });
+
+    const result = await findTool(tools, "issue_document")!.execute({
+      action: "write",
+      key: "design-doc",
+      body: "Updated content",
+    });
+
+    expect(result.isError).toBe(false);
+    expect(calls[0]!.method).toBe("GET");
+    const putCall = calls.find((c) => c.method === "PUT");
+    expect(putCall!.body).toMatchObject({ baseRevisionId: "rev-abc" });
+  });
+
+  it("retries once with a freshly-resolved baseRevisionId when the first write 409s", async () => {
+    const calls: Array<{ method: string; body: any }> = [];
+    let getCount = 0;
+    const api = makeApi(async (input: any, init: any) => {
+      const method = (init?.method || "GET").toUpperCase();
+      calls.push({ method, body: init?.body ? JSON.parse(init.body) : undefined });
+      if (method === "GET") {
+        getCount += 1;
+        return jsonResponse({ key: "design-doc", latestRevisionId: getCount === 1 ? "rev-stale" : "rev-fresh" });
+      }
+      if (method === "PUT" && calls.filter((c) => c.method === "PUT").length === 1) {
+        return jsonResponse({ error: "Document was updated by someone else" }, 409);
+      }
+      return jsonResponse({ document: { key: "design-doc" } });
+    });
+    const tools = buildTools({ api, agentId: "agent-1", companyId: "company-1", currentIssueId: "issue-7", autoApprove: false });
+
+    const result = await findTool(tools, "issue_document")!.execute({ action: "write", key: "design-doc", body: "New content" });
+
+    expect(result.isError).toBe(false);
+    const putCalls = calls.filter((c) => c.method === "PUT");
+    expect(putCalls.length).toBe(2);
+    expect(putCalls[0]!.body).toMatchObject({ baseRevisionId: "rev-stale" });
+    expect(putCalls[1]!.body).toMatchObject({ baseRevisionId: "rev-fresh" });
   });
 
   it("requires body for action='write'", async () => {

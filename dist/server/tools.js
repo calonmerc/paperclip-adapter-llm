@@ -674,14 +674,40 @@ function issueDocumentTool(ctx) {
                         return fail("key is required for action='write'.");
                     if (typeof args.body !== "string" || !args.body)
                         return fail("body is required for action='write'.");
+                    const key = slugifyDocumentKey(rawKey);
                     const title = typeof args.title === "string" && args.title.trim() ? args.title.trim() : null;
                     const changeSummary = typeof args.change_summary === "string" && args.change_summary.trim() ? args.change_summary.trim() : null;
-                    return safeCall("issue_document(write)", () => ctx.api.upsertIssueDocument(id, slugifyDocumentKey(rawKey), {
-                        title,
-                        format: "markdown",
-                        body: args.body,
-                        changeSummary,
-                    }));
+                    const body = args.body;
+                    return safeCall("issue_document(write)", async () => {
+                        // Paperclip requires baseRevisionId to exactly match the
+                        // document's current latestRevisionId on every update to an
+                        // existing key (optimistic concurrency) — omitting it always
+                        // 409s. Resolve it here instead of pushing revision tracking
+                        // onto the model: fetch the current doc (undefined if it
+                        // doesn't exist yet, which is correct for a create).
+                        const currentDoc = await ctx.api.getIssueDocument(id, key).catch(() => null);
+                        const baseRevisionId = typeof currentDoc?.latestRevisionId === "string" ? currentDoc.latestRevisionId : undefined;
+                        try {
+                            return await ctx.api.upsertIssueDocument(id, key, { title, format: "markdown", body, changeSummary, baseRevisionId });
+                        }
+                        catch (err) {
+                            // One retry: if baseRevisionId went stale because of a
+                            // concurrent write between our read and this write, re-fetch
+                            // and try exactly once more before giving up.
+                            if (err instanceof PaperclipApiError && err.status === 409) {
+                                const retryDoc = await ctx.api.getIssueDocument(id, key).catch(() => null);
+                                const retryRevisionId = typeof retryDoc?.latestRevisionId === "string" ? retryDoc.latestRevisionId : undefined;
+                                return await ctx.api.upsertIssueDocument(id, key, {
+                                    title,
+                                    format: "markdown",
+                                    body,
+                                    changeSummary,
+                                    baseRevisionId: retryRevisionId,
+                                });
+                            }
+                            throw err;
+                        }
+                    });
                 }
                 default:
                     return fail("action must be one of: read, write, list.");

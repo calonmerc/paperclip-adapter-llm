@@ -34,12 +34,23 @@ export declare class PaperclipApi {
     getHeartbeatContext(issueId: string): Promise<Record<string, unknown>>;
     listIssueDocuments(issueId: string): Promise<Record<string, unknown>[]>;
     getIssueDocument(issueId: string, key: string): Promise<Record<string, unknown>>;
-    /** Creates the document if `key` doesn't exist yet, otherwise adds a new revision. */
+    /**
+     * Creates the document if `key` doesn't exist yet, otherwise adds a new
+     * revision. Paperclip enforces strict optimistic concurrency on updates:
+     * `baseRevisionId` must be omitted when creating (an existing value 409s
+     * with "Document does not exist yet") and must exactly match the
+     * document's current `latestRevisionId` when updating (omitting it 409s
+     * with "Document update requires baseRevisionId"; a stale value 409s with
+     * "Document was updated by someone else"). Callers must resolve it via
+     * getIssueDocument() first — see issueDocumentTool in tools.ts, which does
+     * this automatically so the model never has to manage revision ids.
+     */
     upsertIssueDocument(issueId: string, key: string, body: {
         title?: string | null;
         format: "markdown";
         body: string;
         changeSummary?: string | null;
+        baseRevisionId?: string | null;
     }): Promise<Record<string, unknown>>;
     /**
      * Acquire the issue lock for the current run. Required before any

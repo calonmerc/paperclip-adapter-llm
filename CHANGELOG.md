@@ -1,5 +1,33 @@
 # Changelog
 
+## [0.11.1] - 2026-09-29
+
+### Fixed
+- **`issue_document`'s `write` action could never actually update an
+  existing document.** Reported directly by an agent: "The document tool
+  can't carry the required baseRevisionId for an existing key, so I'll
+  publish the promised deliverable under a fresh document key" — i.e. it
+  had already found and worked around the bug itself rather than fixing
+  the real document.
+  Confirmed in the host repo's `documents.ts`: Paperclip enforces strict
+  optimistic concurrency on document updates. `baseRevisionId` must be
+  omitted when creating a new key (a value 409s with "Document does not
+  exist yet") and must exactly equal the document's current
+  `latestRevisionId` when updating an existing one — omitting it always
+  409s with "Document update requires baseRevisionId", and a stale value
+  409s with "Document was updated by someone else". v0.8.0's `write` never
+  sent `baseRevisionId` at all, so every update to an existing key failed
+  every time; only first-time creates ever worked. The tool's own
+  description even claimed "Writing to an existing key adds a new
+  revision" — never actually true.
+- `write` now resolves `baseRevisionId` automatically: a `GET` on the key
+  before the `PUT` (absent doc → correctly omitted, i.e. create path), and
+  one retry with a freshly re-fetched revision id if the write still 409s
+  (a concurrent write raced between the read and the write). The model
+  never sees or manages revision ids — same "resolve it in the tool, not
+  the model" approach as `ask_user_questions`' generated option ids.
+- 3 new tests, including the exact 409-then-retry sequence.
+
 ## [0.11.0] - 2026-09-29
 
 ### Added
