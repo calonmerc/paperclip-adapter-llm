@@ -603,6 +603,85 @@ function memoryFsTool(ctx: BuildToolsContext): Tool {
   };
 }
 
+/** Documents require a lowercase [a-z0-9_-] key — slugify whatever the model gives us. */
+function slugifyDocumentKey(raw: string): string {
+  const slug = raw
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 64);
+  return slug || "document";
+}
+
+function issueDocumentTool(ctx: BuildToolsContext): Tool {
+  return {
+    schema: {
+      type: "function",
+      function: {
+        name: "issue_document",
+        description:
+          "Read, write, or list durable markdown documents attached to an issue — visible in the " +
+          "Documents panel in the Paperclip web UI, with full revision history. Use this for anything " +
+          "you want a human to actually see and review (reports, plans, specs, write-ups) — not " +
+          "add_comment (which is a chat-style timeline entry) and not memory_fs (which is private/shared " +
+          "notes nobody sees in the UI). Writing to an existing key adds a new revision; it does not " +
+          "delete history.",
+        parameters: {
+          type: "object",
+          properties: {
+            action: { type: "string", enum: ["read", "write", "list"] },
+            issue_id: { type: "string", description: "Issue id. Omit to use the current issue." },
+            key: {
+              type: "string",
+              description:
+                "Short id for the document, e.g. 'design-doc' or 'weekly-report'. Lowercase letters, " +
+                "numbers, - and _ only — anything else is auto-slugified. Required for read/write.",
+            },
+            title: { type: "string", description: "Display title. Optional for write." },
+            body: { type: "string", description: "Full markdown content. Required for write — replace, don't diff." },
+            change_summary: { type: "string", description: "One-line note on what changed this revision. Optional." },
+          },
+          required: ["action"],
+        },
+      },
+    },
+    execute: async (args) => {
+      const id = asString(args.issue_id, ctx.currentIssueId ?? "");
+      if (!id) return fail("No issue_id supplied and no current issue.");
+      const action = asString(args.action);
+
+      switch (action) {
+        case "list":
+          return safeCall("issue_document(list)", () => ctx.api.listIssueDocuments(id));
+        case "read": {
+          const rawKey = asString(args.key);
+          if (!rawKey) return fail("key is required for action='read'.");
+          return safeCall("issue_document(read)", () => ctx.api.getIssueDocument(id, slugifyDocumentKey(rawKey)));
+        }
+        case "write": {
+          const rawKey = asString(args.key);
+          if (!rawKey) return fail("key is required for action='write'.");
+          if (typeof args.body !== "string" || !args.body) return fail("body is required for action='write'.");
+          const title = typeof args.title === "string" && args.title.trim() ? args.title.trim() : null;
+          const changeSummary =
+            typeof args.change_summary === "string" && args.change_summary.trim() ? args.change_summary.trim() : null;
+          return safeCall("issue_document(write)", () =>
+            ctx.api.upsertIssueDocument(id, slugifyDocumentKey(rawKey), {
+              title,
+              format: "markdown",
+              body: args.body as string,
+              changeSummary,
+            }),
+          );
+        }
+        default:
+          return fail("action must be one of: read, write, list.");
+      }
+    },
+  };
+}
+
 // ----- public API -----
 
 export function buildTools(ctx: BuildToolsContext): Tool[] {
@@ -618,6 +697,7 @@ export function buildTools(ctx: BuildToolsContext): Tool[] {
     requestApprovalTool(ctx),
     askUserQuestionsTool(ctx),
     memoryFsTool(ctx),
+    issueDocumentTool(ctx),
   ];
 }
 

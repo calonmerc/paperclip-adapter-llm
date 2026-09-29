@@ -9,9 +9,29 @@
 
 ## What this is
 
-A fork of [`talhamahmood666/paperclip-adapter-openrouter`](https://github.com/talhamahmood666/paperclip-adapter-openrouter) with the OpenRouter base URL extracted into a configurable `baseUrl` field. `execute()` runs an in-process, multi-turn tool-calling loop against the configured chat/completions endpoint, exposing only 11 scoped tools (`get_issue`, `update_issue_status`, `add_comment`, `list_comments`, `create_sub_issue`, `list_issues`, `list_agents`, `hire_agent`, `request_approval`, `ask_user_questions`, `memory_fs`) — no shell access, and filesystem access is limited to `memory_fs`'s two scoped roots (see below), never arbitrary paths. `hire_agent` and other sensitive actions route through Paperclip's approval flow unless `autoApprove` is set. `ask_user_questions` creates a real Paperclip issue-thread interaction (`continuationPolicy: wake_assignee`) and ends the run immediately after (the model cannot get a real answer within the same run). The adapter never guesses an issue's final disposition: a run only changes issue status when the model explicitly calls `update_issue_status`, or on `max_turns`/an unrecoverable error (both `blocked`); a plain-text turn with no such call leaves status untouched and Paperclip's own `missing_disposition` recovery owns prompting the agent for a real disposition. The adapter declares `supportsLocalAgentJwt` (required for Paperclip to inject the agent's scoped API `authToken` at all — without it every Paperclip API write is silently skipped) and `supportsInstructionsBundle` (unlocks Paperclip's managed "Instructions" editor for `adapterConfig.instructionsFilePath`, which is already read at runtime). Company-managed skills toggled in Paperclip's Skills panel are symlinked into the skills directory `loadSkills()` reads from (`src/server/skills.ts`, via `@paperclipai/adapter-utils/server-utils`'s persistent-skill helpers) — operator-dropped skills in the same directory are left untouched. `memory_fs` (`src/server/memory-fs.ts`) gives file-based-memory skills like `para-memory-files` a real place to read/write: `scope: "private"` is one directory per agent, `scope: "shared"` is one directory every agent in the company can read and write. Every path is resolved and containment-checked against the chosen scope's root before any read/write — there is no way to escape it, and there is no shell execution (a plain keyword search stands in for the skill's `qmd` command). Stream-json transcripts are unchanged from upstream.
+A fork of [`talhamahmood666/paperclip-adapter-openrouter`](https://github.com/talhamahmood666/paperclip-adapter-openrouter) with the OpenRouter base URL extracted into a configurable `baseUrl` field. `execute()` runs an in-process, multi-turn tool-calling loop against the configured chat/completions endpoint. If `baseUrl` is unset, the LLM endpoint defaults to OpenRouter.
 
-If `baseUrl` is unset, the LLM endpoint defaults to OpenRouter.
+### Tools
+
+12 scoped tools, no shell access, no arbitrary filesystem access:
+
+- `get_issue`, `update_issue_status`, `add_comment`, `list_comments`, `create_sub_issue`, `list_issues`, `list_agents` — standard Paperclip issue/company operations.
+- `hire_agent`, `request_approval` — route through Paperclip's approval flow unless `autoApprove` is set.
+- `ask_user_questions` — creates a real Paperclip issue-thread interaction (`continuationPolicy: wake_assignee`) and ends the run immediately after (the model cannot get a real answer within the same run).
+- `issue_document` — reads/writes/lists real Paperclip documents on an issue (`PUT /api/issues/:id/documents/:key`), with revision history, visible in the Documents panel in the web UI. Use this for anything a human should actually see and review.
+- `memory_fs` — scoped file-based memory for skills like `para-memory-files` that expect real file read/write. Two isolated roots: `scope: "private"` (one directory per agent — what such skills call `$AGENT_HOME`) and `scope: "shared"` (one directory every agent in the company can read/write — for things a skill says to keep outside personal memory, e.g. its `plans/` convention). Every path is resolved and containment-checked against the chosen scope's root — there is no way to escape it, and no shell execution (a plain keyword search stands in for a skill's `qmd` command, if it references one). Not visible in the web UI — for that, use `issue_document` instead.
+
+### Disposition handling
+
+The adapter never guesses an issue's final disposition: a run only changes issue status when the model explicitly calls `update_issue_status`, or on `max_turns`/an unrecoverable error (both `blocked`). A plain-text turn with no such call leaves status untouched, and Paperclip's own `missing_disposition` recovery owns prompting the agent for a real disposition.
+
+### Capability flags
+
+`createServerAdapter()` declares `supportsLocalAgentJwt` (required for Paperclip to inject the agent's scoped API `authToken` at all — without it every Paperclip API write is silently skipped) and `supportsInstructionsBundle` (unlocks Paperclip's managed "Instructions" editor for `adapterConfig.instructionsFilePath`, which is already read at runtime).
+
+### Skills
+
+Company-managed skills toggled in Paperclip's Skills panel are symlinked into the skills directory `loadSkills()` reads from (`src/server/skills.ts`, via `@paperclipai/adapter-utils/server-utils`'s persistent-skill helpers) — operator-dropped skills in the same directory are left untouched. Stream-json transcripts are unchanged from upstream.
 
 ## Configuration
 

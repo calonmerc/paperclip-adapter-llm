@@ -101,6 +101,17 @@ export class PaperclipApi {
     getHeartbeatContext(issueId) {
         return this.request("GET", `/api/issues/${encodeURIComponent(issueId)}/heartbeat-context`);
     }
+    // ----- Documents (viewable in the issue's Documents panel in the web UI) -----
+    listIssueDocuments(issueId) {
+        return this.request("GET", `/api/issues/${encodeURIComponent(issueId)}/documents`);
+    }
+    getIssueDocument(issueId, key) {
+        return this.request("GET", `/api/issues/${encodeURIComponent(issueId)}/documents/${encodeURIComponent(key)}`);
+    }
+    /** Creates the document if `key` doesn't exist yet, otherwise adds a new revision. */
+    upsertIssueDocument(issueId, key, body) {
+        return this.request("PUT", `/api/issues/${encodeURIComponent(issueId)}/documents/${encodeURIComponent(key)}`, body);
+    }
     /**
      * Acquire the issue lock for the current run. Required before any
      * write operation (add_comment, update status) on an issue, otherwise

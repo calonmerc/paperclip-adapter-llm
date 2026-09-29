@@ -119,7 +119,11 @@ const DEFAULT_SYSTEM_PROMPT =
   "paths or shell commands — you have neither. Its scope='private' is what such skills call $AGENT_HOME " +
   "(only you can see it); scope='shared' is one directory every agent in this company can read and write " +
   "(use it for anything a skill says to keep outside personal memory, like plans/). There is no `qmd` " +
-  "command — use memory_fs with action='search' instead, in either scope.";
+  "command — use memory_fs with action='search' instead, in either scope. " +
+  "When you produce a document a human should actually read and review (a report, plan, spec, or " +
+  "write-up), use the issue_document tool, not add_comment or memory_fs — it's a real document with " +
+  "revision history, visible in the Documents panel in the Paperclip web UI. add_comment is for short " +
+  "chat-style updates; memory_fs is private/shared notes nobody in the UI ever sees.";
 
 function resolveApiKey(config: LlmConfig, authToken: string | undefined): string {
   const key =

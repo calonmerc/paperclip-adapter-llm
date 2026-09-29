@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.8.0] - 2026-09-29
+
+### Added
+- **New `issue_document` tool.** The user wanted agents to put write-ups
+  somewhere visible in the Paperclip web UI; the previous session's
+  `memory_fs` (v0.7.0) was the wrong tool for that — it's private/shared
+  *notes*, invisible in the UI by design. Paperclip has a real, separate
+  "documents" concept: `PUT /api/issues/:id/documents/:key` creates or
+  revises a markdown document attached to an issue, with full revision
+  history, rendered in the issue's Documents panel. `issue_document` wraps
+  `list`/`read`/`write` against the real API
+  (`PaperclipApi.listIssueDocuments` / `.getIssueDocument` /
+  `.upsertIssueDocument`, new in `src/server/paperclip-api.ts`). Document
+  keys are auto-slugified to Paperclip's required `[a-z0-9_-]` format so a
+  natural-language key like "Design Doc!!" still works.
+- `DEFAULT_SYSTEM_PROMPT` now distinguishes the three "write something"
+  tools for the model: `add_comment` (chat-style timeline entry),
+  `issue_document` (a real, human-reviewable document with history,
+  visible in the UI), and `memory_fs` (private/shared notes nobody in the
+  UI ever sees) — added after `memory_fs` alone left the model with no
+  tool actually aimed at the user's real request.
+- 5 new tests in `tests/tools.test.ts`.
+
 ## [0.7.0] - 2026-09-29
 
 ### Added

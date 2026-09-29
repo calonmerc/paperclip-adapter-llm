@@ -32,6 +32,15 @@ export declare class PaperclipApi {
     listCompanyIssues(companyId: string, query?: Record<string, string>): Promise<Record<string, unknown>>;
     createIssue(companyId: string, issue: Record<string, unknown>): Promise<Record<string, unknown>>;
     getHeartbeatContext(issueId: string): Promise<Record<string, unknown>>;
+    listIssueDocuments(issueId: string): Promise<Record<string, unknown>[]>;
+    getIssueDocument(issueId: string, key: string): Promise<Record<string, unknown>>;
+    /** Creates the document if `key` doesn't exist yet, otherwise adds a new revision. */
+    upsertIssueDocument(issueId: string, key: string, body: {
+        title?: string | null;
+        format: "markdown";
+        body: string;
+        changeSummary?: string | null;
+    }): Promise<Record<string, unknown>>;
     /**
      * Acquire the issue lock for the current run. Required before any
      * write operation (add_comment, update status) on an issue, otherwise

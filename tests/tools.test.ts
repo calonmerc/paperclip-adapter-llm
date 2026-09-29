@@ -28,7 +28,7 @@ describe("tools.ts", () => {
     const api = makeApi(async () => jsonResponse({}));
     const tools = buildTools({ api, agentId: "agent-1", companyId: "company-1", currentIssueId: null, autoApprove: false });
 
-    expect(tools.length).toBe(11);
+    expect(tools.length).toBe(12);
     const names = toolSchemas(tools).map((s) => s.function.name);
     expect(names).toEqual([
       "get_issue",
@@ -42,6 +42,7 @@ describe("tools.ts", () => {
       "request_approval",
       "ask_user_questions",
       "memory_fs",
+      "issue_document",
     ]);
   });
 
@@ -471,5 +472,79 @@ describe("memory_fs", () => {
     await findTool(tools, "memory_fs")!.execute({ action: "write", path: "note.md", content: "default scope" });
     const result = await findTool(tools, "memory_fs")!.execute({ action: "read", path: "note.md" });
     expect(JSON.parse(result.content).scope).toBe("private");
+  });
+});
+
+describe("issue_document", () => {
+  it("writes a document via PUT /api/issues/:id/documents/:key with a slugified key", async () => {
+    const calls: Array<{ method: string; path: string; body: any }> = [];
+    const api = makeApi(async (input: any, init: any) => {
+      calls.push({
+        method: (init?.method || "GET").toUpperCase(),
+        path: new URL(typeof input === "string" ? input : input.url).pathname,
+        body: init?.body ? JSON.parse(init.body) : undefined,
+      });
+      return jsonResponse({ document: { key: "design-doc" } });
+    });
+    const tools = buildTools({ api, agentId: "agent-1", companyId: "company-1", currentIssueId: "issue-7", autoApprove: false });
+
+    const result = await findTool(tools, "issue_document")!.execute({
+      action: "write",
+      key: "Design Doc!!",
+      title: "Design Doc",
+      body: "# Design\n\nDetails here.",
+      change_summary: "Initial draft",
+    });
+
+    expect(result.isError).toBe(false);
+    expect(calls[0]).toMatchObject({
+      method: "PUT",
+      path: "/api/issues/issue-7/documents/design-doc",
+      body: { title: "Design Doc", format: "markdown", body: "# Design\n\nDetails here.", changeSummary: "Initial draft" },
+    });
+  });
+
+  it("requires body for action='write'", async () => {
+    const api = makeApi(async () => jsonResponse({}));
+    const tools = buildTools({ api, agentId: "agent-1", companyId: "company-1", currentIssueId: "issue-7", autoApprove: false });
+
+    const result = await findTool(tools, "issue_document")!.execute({ action: "write", key: "design-doc" });
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain("body is required");
+  });
+
+  it("reads a document by key", async () => {
+    const paths: string[] = [];
+    const api = makeApi(async (input: any) => {
+      paths.push(new URL(typeof input === "string" ? input : input.url).pathname);
+      return jsonResponse({ key: "design-doc", body: "# Design" });
+    });
+    const tools = buildTools({ api, agentId: "agent-1", companyId: "company-1", currentIssueId: "issue-7", autoApprove: false });
+
+    const result = await findTool(tools, "issue_document")!.execute({ action: "read", key: "design-doc" });
+    expect(result.isError).toBe(false);
+    expect(paths).toContain("/api/issues/issue-7/documents/design-doc");
+  });
+
+  it("lists documents on the current issue", async () => {
+    const paths: string[] = [];
+    const api = makeApi(async (input: any) => {
+      paths.push(new URL(typeof input === "string" ? input : input.url).pathname);
+      return jsonResponse([{ key: "design-doc" }]);
+    });
+    const tools = buildTools({ api, agentId: "agent-1", companyId: "company-1", currentIssueId: "issue-7", autoApprove: false });
+
+    const result = await findTool(tools, "issue_document")!.execute({ action: "list" });
+    expect(result.isError).toBe(false);
+    expect(paths).toContain("/api/issues/issue-7/documents");
+  });
+
+  it("fails gracefully with no current issue and no issue_id", async () => {
+    const api = makeApi(async () => jsonResponse({}));
+    const tools = buildTools({ api, agentId: "agent-1", companyId: "company-1", currentIssueId: null, autoApprove: false });
+
+    const result = await findTool(tools, "issue_document")!.execute({ action: "list" });
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain("No issue_id supplied");
   });
 });
