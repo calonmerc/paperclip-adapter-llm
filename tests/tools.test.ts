@@ -28,7 +28,7 @@ describe("tools.ts", () => {
     const api = makeApi(async () => jsonResponse({}));
     const tools = buildTools({ api, agentId: "agent-1", companyId: "company-1", currentIssueId: null, autoApprove: false });
 
-    expect(tools.length).toBe(13);
+    expect(tools.length).toBe(14);
     const names = toolSchemas(tools).map((s) => s.function.name);
     expect(names).toEqual([
       "get_issue",
@@ -42,6 +42,7 @@ describe("tools.ts", () => {
       "hire_agent",
       "request_approval",
       "ask_user_questions",
+      "list_interactions",
       "memory_fs",
       "issue_document",
     ]);
@@ -434,6 +435,36 @@ describe("tools.ts", () => {
     const result = await findTool(tools, "ask_user_questions")!.execute({ questions: [{ prompt: "Which one?" }] });
     expect(result.isError).toBe(true);
     expect(result.content).toContain("No current issue");
+  });
+});
+
+describe("list_interactions", () => {
+  it("lists interactions on the current issue via GET /api/issues/:id/interactions", async () => {
+    const paths: string[] = [];
+    const api = makeApi(async (input: any) => {
+      paths.push(new URL(typeof input === "string" ? input : input.url).pathname);
+      return jsonResponse([
+        { id: "int-1", kind: "ask_user_questions", status: "answered", title: "Round 1" },
+      ]);
+    });
+    const tools = buildTools({ api, agentId: "agent-1", companyId: "company-1", currentIssueId: "issue-34", autoApprove: false });
+
+    const result = await findTool(tools, "list_interactions")!.execute({});
+
+    expect(result.isError).toBe(false);
+    expect(paths).toContain("/api/issues/issue-34/interactions");
+    expect(JSON.parse(result.content)).toEqual([
+      { id: "int-1", kind: "ask_user_questions", status: "answered", title: "Round 1" },
+    ]);
+  });
+
+  it("fails gracefully with no current issue and no issue_id", async () => {
+    const api = makeApi(async () => jsonResponse({}));
+    const tools = buildTools({ api, agentId: "agent-1", companyId: "company-1", currentIssueId: null, autoApprove: false });
+
+    const result = await findTool(tools, "list_interactions")!.execute({});
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain("No issue_id supplied");
   });
 });
 

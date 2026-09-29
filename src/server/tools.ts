@@ -592,6 +592,36 @@ function askUserQuestionsTool(ctx: BuildToolsContext): Tool {
   };
 }
 
+function listInteractionsTool(ctx: BuildToolsContext): Tool {
+  return {
+    schema: {
+      type: "function",
+      function: {
+        name: "list_interactions",
+        description:
+          "List every ask_user_questions / request_confirmation / suggest_tasks card ever created on an " +
+          "issue, oldest first, including their answers — pending, answered, accepted, rejected, or " +
+          "expired. Call this whenever you're not certain what's already been asked or answered on a " +
+          "multi-round task (e.g. a multi-part interview): each run starts with no memory of earlier " +
+          "runs, get_issue and list_comments do not show interaction history, and the wake prompt's " +
+          "'this interaction is answered' note only ever covers the single most recent card — not " +
+          "earlier ones. Check this before asking another round of questions.",
+        parameters: {
+          type: "object",
+          properties: {
+            issue_id: { type: "string", description: "Issue id. Omit to use the current issue." },
+          },
+        },
+      },
+    },
+    execute: async (args) => {
+      const id = asString(args.issue_id, ctx.currentIssueId ?? "");
+      if (!id) return fail("No issue_id supplied and no current issue.");
+      return safeCall("list_interactions", () => ctx.api.listIssueInteractions(id));
+    },
+  };
+}
+
 function memoryFsTool(ctx: BuildToolsContext): Tool {
   return {
     schema: {
@@ -756,6 +786,7 @@ export function buildTools(ctx: BuildToolsContext): Tool[] {
     hireAgentTool(ctx),
     requestApprovalTool(ctx),
     askUserQuestionsTool(ctx),
+    listInteractionsTool(ctx),
     memoryFsTool(ctx),
     issueDocumentTool(ctx),
   ];

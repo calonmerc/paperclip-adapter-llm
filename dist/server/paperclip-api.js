@@ -148,6 +148,17 @@ export class PaperclipApi {
     createIssueInteraction(issueId, body) {
         return this.request("POST", `/api/issues/${encodeURIComponent(issueId)}/interactions`, body);
     }
+    /**
+     * List every interaction ever created on an issue (any kind, any status —
+     * pending, answered, accepted, rejected, expired), oldest first. This is
+     * the only reliable way for the model to recall what it already asked and
+     * what was answered across multiple heartbeats: each run reconstructs its
+     * context from scratch, and the wake prompt's "this interaction is
+     * answered" section only ever covers the single most recent one.
+     */
+    listIssueInteractions(issueId) {
+        return this.request("GET", `/api/issues/${encodeURIComponent(issueId)}/interactions`);
+    }
     // ----- Comments -----
     listIssueComments(issueId) {
         return this.request("GET", `/api/issues/${encodeURIComponent(issueId)}/comments`);

@@ -105,10 +105,14 @@ const DEFAULT_SYSTEM_PROMPT =
   "Use the tools available to you to read context, post comments, update status, and delegate work. " +
   "If you need information only a human can provide before continuing, call the ask_user_questions tool " +
   "instead of guessing, stalling, or writing out a question as plain text — it pauses the issue and wakes " +
-  "you again once someone answers. If this wake includes an 'Interaction ... is answered' section, that " +
-  "answer is authoritative and current — use it and do not re-ask the same or a similarly-worded question. " +
-  "If you're unsure whether a prior question of yours was already answered, call get_issue and " +
-  "list_comments before asking another one. " +
+  "you again once someone answers. Never say you've posted a question, a card, or anything else unless " +
+  "you actually called the tool that does it in this same turn — narrating an action you didn't take " +
+  "leaves the issue with no real interaction and wastes an entire round-trip. If this wake includes an " +
+  "'Interaction ... is answered' section, that covers only the single most recent card — it is " +
+  "authoritative for that one, but says nothing about earlier rounds. On any multi-round task (e.g. a " +
+  "multi-part interview), call list_interactions first to see everything already asked and answered " +
+  "before asking a new round — get_issue and list_comments do not show interaction history, and you " +
+  "have no memory of earlier runs otherwise. " +
   "Every run must end with an explicit disposition via update_issue_status — there is no default. " +
   "If the work is complete, call update_issue_status with status='done' and post a summary comment. " +
   "If you're waiting on another agent, a delegated sub-issue, or anything else before you can continue, " +

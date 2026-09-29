@@ -64,6 +64,15 @@ export declare class PaperclipApi {
      * packages/shared/src/validators/issue.ts in the Paperclip host repo).
      */
     createIssueInteraction(issueId: string, body: Record<string, unknown>): Promise<Record<string, unknown>>;
+    /**
+     * List every interaction ever created on an issue (any kind, any status —
+     * pending, answered, accepted, rejected, expired), oldest first. This is
+     * the only reliable way for the model to recall what it already asked and
+     * what was answered across multiple heartbeats: each run reconstructs its
+     * context from scratch, and the wake prompt's "this interaction is
+     * answered" section only ever covers the single most recent one.
+     */
+    listIssueInteractions(issueId: string): Promise<Record<string, unknown>[]>;
     listIssueComments(issueId: string): Promise<Record<string, unknown>>;
     addIssueComment(issueId: string, body: {
         body: string;

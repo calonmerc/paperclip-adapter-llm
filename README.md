@@ -13,11 +13,12 @@ A fork of [`talhamahmood666/paperclip-adapter-openrouter`](https://github.com/ta
 
 ### Tools
 
-13 scoped tools, no shell access, no arbitrary filesystem access:
+14 scoped tools, no shell access, no arbitrary filesystem access:
 
 - `get_issue`, `update_issue_status`, `update_issue`, `add_comment`, `list_comments`, `create_sub_issue`, `list_issues`, `list_agents` — standard Paperclip issue/company operations. `update_issue_status` is status only; `update_issue` covers everything else (title, description, priority, assignee, and — its original motivating use case — replacing a stale `blockedByIssueIds` set, e.g. blockers pointing at an issue that's since been cancelled).
 - `hire_agent`, `request_approval` — route through Paperclip's approval flow unless `autoApprove` is set.
 - `ask_user_questions` — creates a real Paperclip issue-thread interaction (`continuationPolicy: wake_assignee`) and ends the run immediately after (the model cannot get a real answer within the same run).
+- `list_interactions` — lists every interaction ever created on an issue, oldest first, with answers. Each run reconstructs its context from scratch with no memory of earlier runs, and the wake prompt's "this interaction is answered" note only ever covers the single most recent card — this is the only reliable way for the model to recall a multi-round Q&A (e.g. a multi-part interview) across several heartbeats instead of losing track and re-asking.
 - `issue_document` — reads/writes/lists real Paperclip documents on an issue (`PUT /api/issues/:id/documents/:key`), with revision history, visible in the Documents panel in the web UI. Use this for anything a human should actually see and review.
 - `memory_fs` — scoped file-based memory for skills like `para-memory-files` that expect real file read/write. Two isolated roots: `scope: "private"` (one directory per agent — what such skills call `$AGENT_HOME`) and `scope: "shared"` (one directory every agent in the company can read/write — for things a skill says to keep outside personal memory, e.g. its `plans/` convention). Every path is resolved and containment-checked against the chosen scope's root — there is no way to escape it, and no shell execution (a plain keyword search stands in for a skill's `qmd` command, if it references one). Not visible in the web UI — for that, use `issue_document` instead.
 

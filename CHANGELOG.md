@@ -1,5 +1,43 @@
 # Changelog
 
+## [0.10.0] - 2026-09-29
+
+### Added
+- **New `list_interactions` tool** — the real root cause behind a multi-round
+  `ask_user_questions` interview (e.g. a "interview the board" style task)
+  appearing to repeat questions across rounds. Traced from an actual run
+  transcript: the model itself correctly diagnosed a *different*, already-
+  self-corrected problem (a prior run's comment claimed to have "posted the
+  questions as a card" without actually calling `ask_user_questions` — pure
+  narration, no tool call), but that investigation surfaced the real
+  structural gap: **this adapter had no tool that shows interaction
+  history.** `get_issue` and `list_comments` don't surface past
+  `ask_user_questions`/`request_confirmation`/`suggest_tasks` cards or their
+  answers at all, and the wake prompt's "this interaction is answered" note
+  only ever covers the single most recent card. Since every run
+  reconstructs its entire context from scratch with no memory of earlier
+  runs, by round 3+ of a multi-round Q&A the model had no reliable way to
+  recall what it already asked — only what happened to survive in the
+  latest wake's rendering.
+  - Wraps a new `PaperclipApi.listIssueInteractions()` against
+    `GET /api/issues/:id/interactions` (lists every interaction on the
+    issue, any kind, any status, oldest first — the full history, not just
+    the latest one).
+- `DEFAULT_SYSTEM_PROMPT` updated: replaced now-inaccurate advice to check
+  `get_issue`/`list_comments` for prior answers (they never showed
+  interaction history) with an instruction to call `list_interactions`
+  before starting a new round on a multi-round task. Also added an explicit
+  warning against narrating an action ("I've posted the questions as a
+  card...") without actually calling the corresponding tool in the same
+  turn — the specific failure mode observed in the source transcript.
+- 2 new tests.
+
+### Note
+The transcript this was diagnosed from was running an adapter build from
+before `issue_document`/`update_issue`/several other fixes in this
+changelog — a reminder that these fixes only take effect once the deployed
+instance is rebuilt and the Paperclip server is restarted.
+
 ## [0.9.0] - 2026-09-29
 
 ### Fixed
