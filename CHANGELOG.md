@@ -1,5 +1,41 @@
 # Changelog
 
+## [0.6.0] - 2026-09-28
+
+### Fixed
+- **Enabling a skill in Paperclip's Skills panel did nothing.** `listSkills`
+  hardcoded `desiredSkills: []` and only ever scanned a fixed local
+  directory — it never read `config.paperclipRuntimeSkills` (the company-
+  managed skill catalog) or `config.paperclipSkillSync` (the persisted
+  desired-skill preference) at all. `syncSkills` was literally just an
+  alias for `listSkills`, so toggling a skill in the UI never materialized
+  anything and the very next listing looked identical to before — Paperclip
+  itself was persisting the choice into `adapterConfig`, but nothing on the
+  adapter side ever acted on it.
+
+### Added
+- Real `listSkills`/`syncSkills` in `src/server/skills.ts`, built on
+  `@paperclipai/adapter-utils/server-utils` helpers
+  (`readPaperclipRuntimeSkillEntries`, `resolvePaperclipDesiredSkillNames`,
+  `buildPersistentSkillSnapshot`, `ensurePaperclipSkillSymlink`,
+  `readInstalledSkillTargets`) — the same helpers the built-in `cursor`
+  adapter uses, which has the same shape as this one (a runtime that scans
+  a skills directory, no native skills API of its own). `syncSkills`
+  symlinks each desired company-managed skill into the directory
+  `loadSkills()` already reads from, and removes a Paperclip-managed
+  symlink once it's no longer desired — without ever touching a skill the
+  operator dropped in manually.
+- `execute()` now also self-reconciles at the start of every run (mirroring
+  the built-in `hermes` adapter's pattern, gated on
+  `config.paperclipRuntimeSkills` being present so direct/test calls never
+  touch a real skills directory), so a desired-skill change takes effect on
+  the next run even if the Skills panel's sync endpoint was never
+  re-invoked since.
+- 11 new tests across `tests/skills.test.ts` and `tests/execute.test.ts`
+  covering listing, syncing, required-skill defaults, and the
+  execute()-time reconciliation, using real temp directories and real
+  symlinks (not mocks) since this is filesystem-level behavior.
+
 ## [0.5.0] - 2026-09-28
 
 ### Fixed (behavior change)

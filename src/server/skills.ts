@@ -9,11 +9,10 @@
  *   2. PAPERCLIP_SKILLS_DIR env var (server-wide override)
  *   3. ~/.paperclip-llm-adapter/skills (default managed root)
  *
- * v1 design: scan the root, load every subdirectory that contains a SKILL.md,
- * inject all of them. We do NOT yet integrate with Paperclip's "desired skills"
- * registry — that requires API access and is deferred to v3. For now, the
- * operator controls which skills an agent gets by what they put in the
- * skills directory.
+ * Scans the root, loads every subdirectory that contains a SKILL.md, injects
+ * all of them. This includes company-managed skills symlinked into the root
+ * by reconcilePaperclipSkills() (see below) as well as skills the operator
+ * drops in manually — both look the same to loadSkills().
  *
  * Failure mode: best-effort. Missing directory or unreadable files log a
  * warning and return what we have. Skill loading never fails the run.
@@ -21,8 +20,19 @@
 
 import fs from "node:fs/promises";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
+import type { AdapterSkillContext, AdapterSkillSnapshot } from "@paperclipai/adapter-utils";
+import {
+  buildPersistentSkillSnapshot,
+  ensurePaperclipSkillSymlink,
+  readInstalledSkillTargets,
+  readPaperclipRuntimeSkillEntries,
+  resolvePaperclipDesiredSkillNames,
+} from "@paperclipai/adapter-utils/server-utils";
 import type { OnLog } from "./transcript.js";
 import { writeRawStderr } from "./transcript.js";
+
+const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
 
 export interface LoadedSkill {
   name: string;
@@ -44,7 +54,7 @@ export function defaultSkillsDir(): string {
 /** @deprecated Prefer defaultSkillsDir() — value is process-dependent. */
 export const DEFAULT_SKILLS_DIR = defaultSkillsDir();
 
-function resolveSkillsRoot(agentConfig: Record<string, unknown> | undefined | null): string {
+export function resolveSkillsRoot(agentConfig: Record<string, unknown> | undefined | null): string {
   const cfg = agentConfig ?? {};
   const fromConfig = typeof cfg.skillsDir === "string" ? cfg.skillsDir.trim() : "";
   if (fromConfig) return fromConfig;
@@ -113,4 +123,96 @@ export function renderSkillsForPrompt(skills: LoadedSkill[]): string {
     "",
     blocks.join("\n\n---\n\n"),
   ].join("\n");
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Company-managed skills: list/sync/reconcile
+//
+// Paperclip's "Skills" panel lets the board toggle which company-managed
+// skills (config.paperclipRuntimeSkills) an agent should have. Those
+// choices are persisted by Paperclip itself into adapterConfig regardless
+// of what this adapter does — but the panel's immediate feedback and every
+// future listing come from calling listSkills/syncSkills below, and the
+// actual runtime behavior (whether a chosen skill's content is ever loaded)
+// depends on this adapter materializing it into the directory loadSkills()
+// reads from. Previously listSkills/syncSkills ignored all of this
+// (hardcoded desiredSkills: [], syncSkills was just an alias for
+// listSkills), so toggling a skill in the UI appeared to do nothing.
+//
+// Mirrors the built-in cursor-local adapter's skills.ts (same shape: a
+// directory-scanning runtime, no native skills API of its own).
+// ─────────────────────────────────────────────────────────────────
+
+async function buildLlmSkillSnapshot(config: Record<string, unknown>): Promise<AdapterSkillSnapshot> {
+  const availableEntries = await readPaperclipRuntimeSkillEntries(config, __moduleDir);
+  const desiredSkills = resolvePaperclipDesiredSkillNames(config, availableEntries);
+  const skillsHome = resolveSkillsRoot(config);
+  const installed = await readInstalledSkillTargets(skillsHome);
+  return buildPersistentSkillSnapshot({
+    adapterType: "llm",
+    availableEntries,
+    desiredSkills,
+    installed,
+    skillsHome,
+    locationLabel: skillsHome,
+    missingDetail: "Configured but not currently linked into the skills directory.",
+    externalConflictDetail: "Skill name is occupied by a different, non-Paperclip-managed file or directory.",
+    externalDetail: "Present in the skills directory but not managed by Paperclip.",
+  });
+}
+
+export async function listSkills(ctx: AdapterSkillContext): Promise<AdapterSkillSnapshot> {
+  return buildLlmSkillSnapshot(ctx.config);
+}
+
+/**
+ * Symlink every desired company-managed skill into the skills directory
+ * loadSkills() reads from, and remove any Paperclip-managed symlink that's
+ * no longer desired. Never touches a skill the operator dropped in manually
+ * (only unlinks entries whose installed target still matches the available
+ * entry's own source path).
+ *
+ * Called both from syncSkills() (when the board toggles a skill in the UI)
+ * and from execute() at the start of every run (so a company skill's
+ * desired-state change takes effect even if no one has re-opened the Skills
+ * panel since — see the callsite in execute.ts).
+ */
+export async function reconcilePaperclipSkills(
+  config: Record<string, unknown>,
+  requestedDesiredSkills?: string[],
+): Promise<string[]> {
+  const availableEntries = await readPaperclipRuntimeSkillEntries(config, __moduleDir);
+  // Union with required-skill defaults (resolved against an empty config) so
+  // a required skill can never be dropped by an explicit request that omits it.
+  const desiredSkills = requestedDesiredSkills
+    ? Array.from(new Set([...resolvePaperclipDesiredSkillNames({}, availableEntries), ...requestedDesiredSkills]))
+    : resolvePaperclipDesiredSkillNames(config, availableEntries);
+  const desiredSet = new Set(desiredSkills);
+  const skillsHome = resolveSkillsRoot(config);
+  await fs.mkdir(skillsHome, { recursive: true });
+  const installed = await readInstalledSkillTargets(skillsHome);
+  const availableByRuntimeName = new Map(availableEntries.map((entry) => [entry.runtimeName, entry]));
+
+  for (const entry of availableEntries) {
+    if (!desiredSet.has(entry.key)) continue;
+    const target = path.join(skillsHome, entry.runtimeName);
+    await ensurePaperclipSkillSymlink(entry.source, target);
+  }
+
+  for (const [name, installedEntry] of installed.entries()) {
+    const available = availableByRuntimeName.get(name);
+    if (!available || desiredSet.has(available.key)) continue;
+    if (installedEntry.targetPath !== available.source) continue;
+    await fs.unlink(path.join(skillsHome, name)).catch(() => {});
+  }
+
+  return desiredSkills;
+}
+
+export async function syncSkills(
+  ctx: AdapterSkillContext,
+  desiredSkills: string[],
+): Promise<AdapterSkillSnapshot> {
+  await reconcilePaperclipSkills(ctx.config, desiredSkills);
+  return buildLlmSkillSnapshot(ctx.config);
 }

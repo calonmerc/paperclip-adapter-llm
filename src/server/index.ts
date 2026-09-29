@@ -7,28 +7,25 @@
  *   - testEnvironment     — env diagnostics + model fetch
  *   - sessionCodec        — persist/restore lastGenerationId across heartbeats
  *   - detectModel         — read OPENROUTER_MODEL env if present
- *   - listSkills          — minimal stub (filesystem scan)
- *   - syncSkills          — no-op (skills are managed externally)
+ *   - listSkills          — company-managed skills (config.paperclipRuntimeSkills)
+ *                            plus whatever the operator drops in manually
+ *   - syncSkills          — symlinks desired company-managed skills into the
+ *                            skills directory loadSkills() reads from
  *
  * Optional hooks not implemented (deferred to v3):
  *   - getQuotaWindows     — OpenRouter exposes /key endpoint, can be added
  *   - onHireApproved      — only used by cloud adapters
  */
 
-import path from "node:path";
-import fs from "node:fs/promises";
-import type {
-  AdapterSessionCodec,
-  AdapterSkillContext,
-  AdapterSkillSnapshot,
-} from "@paperclipai/adapter-utils";
+import type { AdapterSessionCodec } from "@paperclipai/adapter-utils";
 
 import { execute } from "./execute.js";
 import { testEnvironment, listModels, listOpenRouterModels } from "./test.js";
 import { getConfigSchema } from "./config-schema.js";
+import { listSkills, syncSkills } from "./skills.js";
 import { type, label, models, agentConfigurationDoc } from "../index.js";
 
-export { execute, testEnvironment, listModels, listOpenRouterModels, getConfigSchema };
+export { execute, testEnvironment, listModels, listOpenRouterModels, getConfigSchema, listSkills, syncSkills };
 
 // ----- sessionCodec -----
 
@@ -79,75 +76,6 @@ export async function detectModel(): Promise<{
     return { model: fromEnv.trim(), provider: "llm", source: "env:OPENROUTER_MODEL" };
   }
   return { model: "openrouter/auto", provider: "llm", source: "default" };
-}
-
-// ----- listSkills / syncSkills -----
-
-/**
- * Minimal skill listing. We scan the same root our skill loader uses
- * (~/.openrouter-adapter/skills by default) and report each subdirectory
- * containing a SKILL.md as an external skill.
- *
- * v1 doesn't track desired-vs-installed because we don't sync from
- * Paperclip's managed skill store yet — that's a v3 feature.
- */
-function defaultSkillsRoot(): string {
-  const home = process.env.HOME || process.env.USERPROFILE || ".";
-  return path.join(home, ".paperclip-llm-adapter", "skills");
-}
-
-export async function listSkills(_ctx: AdapterSkillContext): Promise<AdapterSkillSnapshot> {
-  const root = process.env.PAPERCLIP_SKILLS_DIR?.trim() || defaultSkillsRoot();
-  const snapshot: AdapterSkillSnapshot = {
-    adapterType: "llm",
-    supported: true,
-    mode: "ephemeral",
-    desiredSkills: [],
-    entries: [],
-    warnings: [],
-  };
-
-  let entries: import("node:fs").Dirent[] = [];
-  try {
-    entries = await fs.readdir(root, { withFileTypes: true });
-  } catch {
-    snapshot.warnings.push(`Skills root ${root} not present.`);
-    return snapshot;
-  }
-
-  for (const entry of entries) {
-    if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
-    const skillDir = path.join(root, entry.name);
-    const skillMd = path.join(skillDir, "SKILL.md");
-    let hasSkillMd = true;
-    try {
-      await fs.access(skillMd);
-    } catch {
-      hasSkillMd = false;
-    }
-    if (!hasSkillMd) continue;
-    snapshot.entries.push({
-      key: entry.name,
-      runtimeName: entry.name,
-      desired: true,
-      managed: false,
-      state: "external",
-      origin: "external_unknown",
-      sourcePath: skillDir,
-      targetPath: skillDir,
-    });
-  }
-
-  return snapshot;
-}
-
-export async function syncSkills(
-  ctx: AdapterSkillContext,
-  _desiredSkills: string[],
-): Promise<AdapterSkillSnapshot> {
-  // v1: skills are managed externally (operator drops them in skillsRoot).
-  // We just return the current listing — no copy/sync work.
-  return listSkills(ctx);
 }
 
 // ----- createServerAdapter factory -----

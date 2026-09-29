@@ -48,7 +48,7 @@ import {
 } from "../index.js";
 import { PaperclipApi } from "./paperclip-api.js";
 import { buildTools, toolSchemas, findTool, type Tool } from "./tools.js";
-import { loadSkills, renderSkillsForPrompt } from "./skills.js";
+import { loadSkills, renderSkillsForPrompt, reconcilePaperclipSkills } from "./skills.js";
 import {
   emitInit,
   emitAssistant,
@@ -337,6 +337,25 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         onLog,
         `[llm] could not read instructionsFilePath ${instructionsFilePath}: ${reason}. Falling back to systemPrompt.`,
       );
+    }
+  }
+  // Materialize any desired company-managed skills (config.paperclipRuntimeSkills)
+  // into the skills directory before loadSkills() scans it, so a toggle made
+  // in the Skills panel takes effect on the very next run even if syncSkills
+  // was never re-invoked since. The marker check mirrors the built-in hermes
+  // adapter's same pattern — it avoids touching a real skills directory
+  // during direct unit/library calls that never went through Paperclip's
+  // real runtime (which is what actually sets paperclipRuntimeSkills).
+  const rawConfig = config as unknown as Record<string, unknown>;
+  if (Object.prototype.hasOwnProperty.call(rawConfig, "paperclipRuntimeSkills")) {
+    try {
+      const selected = await reconcilePaperclipSkills(rawConfig);
+      if (selected.length > 0) {
+        await emitSystem(onLog, `Reconciled ${selected.length} Paperclip-managed skill(s) into the skills directory.`);
+      }
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      await writeRawStderr(onLog, `[llm] could not reconcile Paperclip-managed skills (continuing): ${reason}`);
     }
   }
   try {

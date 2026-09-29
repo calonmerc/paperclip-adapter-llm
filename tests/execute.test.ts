@@ -208,6 +208,44 @@ describe("execute()", () => {
     expect(result.exitCode).toBe(0);
   });
 
+  it("reconciles company-managed skills into the skills directory when config.paperclipRuntimeSkills is present", async () => {
+    // Regression guard: enabling a skill in Paperclip's Skills panel appeared
+    // to do nothing, because nothing in execute() ever materialized a
+    // desired company-managed skill into the directory loadSkills() reads
+    // from. The marker check (paperclipRuntimeSkills present at all) mirrors
+    // the built-in hermes adapter's pattern and must not fire for calls that
+    // never went through Paperclip's real runtime.
+    fetchMock = setupFetchMock([assistantResponse("done")]);
+    const skillsDir = fs.mkdtempSync(path.join(tmpDir, "skills-"));
+    const sourceDir = fs.mkdtempSync(path.join(tmpDir, "skill-source-"));
+    fs.writeFileSync(path.join(sourceDir, "SKILL.md"), "# Onboarding\n\nDo the thing.");
+
+    const ctx = makeContext({
+      config: {
+        model: "x",
+        apiKey: "k",
+        skillsDir,
+        paperclipRuntimeSkills: [{ key: "acme/onboarding", runtimeName: "onboarding", source: sourceDir }],
+        paperclipSkillSync: { desiredSkills: ["acme/onboarding"] },
+      } as any,
+    });
+
+    const result = await execute(ctx);
+
+    expect(result.exitCode).toBe(0);
+    expect(fs.existsSync(path.join(skillsDir, "onboarding"))).toBe(true);
+    expect(fs.lstatSync(path.join(skillsDir, "onboarding")).isSymbolicLink()).toBe(true);
+  });
+
+  it("does not touch the filesystem for skills when config.paperclipRuntimeSkills is absent (direct/test calls)", async () => {
+    fetchMock = setupFetchMock([assistantResponse("done")]);
+    const skillsDir = fs.mkdtempSync(path.join(tmpDir, "skills-absent-"));
+
+    await execute(makeContext({ config: { model: "x", apiKey: "k", skillsDir } as any }));
+
+    expect(fs.readdirSync(skillsDir)).toEqual([]);
+  });
+
   it("splits a comma-separated transforms string (as sent by the config-schema text field) into an array", async () => {
     fetchMock = setupFetchMock([assistantResponse("done")]);
 
