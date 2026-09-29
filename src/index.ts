@@ -116,6 +116,11 @@ export const agentConfigurationDoc = `# llm adapter configuration
   runtime and prepended to the system prompt (takes precedence over \`systemPrompt\` if
   both are set). Manageable through Paperclip's own "Instructions" bundle editor in the
   agent UI — this adapter declares \`supportsInstructionsBundle\`.
+- \`agentHomeDir\` (string, optional) — Override base directory for the \`memory_fs\` tool
+  (scoped file-based memory for skills like \`para-memory-files\`). Defaults to
+  \`~/.paperclip-llm-adapter/homes\`. Two isolated scopes per company: \`private\`
+  (one directory per agent) and \`shared\` (one directory every agent in the company
+  can read/write). No shell access; a plain keyword search stands in for \`qmd\`.
 
 OpenRouter-specific fields (ignored by other providers):
 - \`transforms\` (string[]) — e.g. ["middle-out"]
@@ -224,6 +229,9 @@ export interface LlmConfig {
    * prepended to the system prompt. Takes precedence over systemPrompt
    * if both are set. */
   instructionsFilePath?: string;
+  /** Override base directory for the memory_fs tool. Defaults to
+   * ~/.paperclip-llm-adapter/homes. See memory-fs.ts. */
+  agentHomeDir?: string;
 }
 
 /** @deprecated Use LlmConfig. */

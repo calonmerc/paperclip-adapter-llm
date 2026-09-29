@@ -53,7 +53,12 @@ const DEFAULT_SYSTEM_PROMPT = "You are an AI agent working inside Paperclip, an 
     "If you're waiting on another agent, a delegated sub-issue, or anything else before you can continue, " +
     "call update_issue_status with status='blocked' (or leave it in_progress if you will resume it yourself) " +
     "and explain what you're waiting on — do not just describe that in a comment or plain text reply and " +
-    "stop, since nothing then marks the issue as unfinished.";
+    "stop, since nothing then marks the issue as unfinished. " +
+    "For file-based memory skills (e.g. para-memory-files): use the memory_fs tool, not real filesystem " +
+    "paths or shell commands — you have neither. Its scope='private' is what such skills call $AGENT_HOME " +
+    "(only you can see it); scope='shared' is one directory every agent in this company can read and write " +
+    "(use it for anything a skill says to keep outside personal memory, like plans/). There is no `qmd` " +
+    "command — use memory_fs with action='search' instead, in either scope.";
 function resolveApiKey(config, authToken) {
     const key = (config.apiKey && config.apiKey.length > 0 ? config.apiKey : undefined) ||
         authToken ||
@@ -219,6 +224,7 @@ export async function execute(ctx) {
             currentIssueId,
             autoApprove,
             interactionCreated,
+            config: config,
         });
     }
     else {

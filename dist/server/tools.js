@@ -12,6 +12,7 @@
  * normalizes for any provider that supports tools.
  */
 import { PaperclipApiError } from "./paperclip-api.js";
+import { resolveMemoryRoot, readMemoryFile, writeMemoryFile, listMemoryFiles, searchMemoryFiles, } from "./memory-fs.js";
 // ----- helpers -----
 function ok(content) {
     return {
@@ -452,6 +453,78 @@ function askUserQuestionsTool(ctx) {
         },
     };
 }
+function memoryFsTool(ctx) {
+    return {
+        schema: {
+            type: "function",
+            function: {
+                name: "memory_fs",
+                description: "Read, write, list, or search small text/markdown files for durable memory across runs " +
+                    "(e.g. the para-memory-files skill's PARA notes). Two isolated scopes: 'private' is a " +
+                    "directory only you can see (this is what that skill calls $AGENT_HOME); 'shared' is one " +
+                    "directory every agent in this company can read and write — use it for anything meant to be " +
+                    "seen by other agents, such as the skill's plans/ files. There is no shell access and no `qmd` " +
+                    "command here — use action='search' instead, which does a plain keyword search across the " +
+                    "scope's files (not semantic search, but finds the same notes). Paths are always relative to " +
+                    "the chosen scope's root and cannot escape it.",
+                parameters: {
+                    type: "object",
+                    properties: {
+                        action: { type: "string", enum: ["read", "write", "list", "search"] },
+                        scope: { type: "string", enum: ["private", "shared"], description: "Default: private." },
+                        path: {
+                            type: "string",
+                            description: "Relative path within the scope. Required for read/write. Optional for list (default: root).",
+                        },
+                        content: { type: "string", description: "File content. Required for action='write'." },
+                        query: { type: "string", description: "Keyword to search for. Required for action='search'." },
+                    },
+                    required: ["action"],
+                },
+            },
+        },
+        execute: async (args) => {
+            const action = asString(args.action);
+            const scope = args.scope === "shared" ? "shared" : "private";
+            const root = resolveMemoryRoot(ctx.config ?? {}, scope, { agentId: ctx.agentId, companyId: ctx.companyId });
+            try {
+                switch (action) {
+                    case "read": {
+                        const p = asString(args.path);
+                        if (!p)
+                            return fail("path is required for action='read'.");
+                        return ok({ path: p, scope, content: await readMemoryFile(root, p) });
+                    }
+                    case "write": {
+                        const p = asString(args.path);
+                        if (!p)
+                            return fail("path is required for action='write'.");
+                        if (typeof args.content !== "string")
+                            return fail("content is required for action='write'.");
+                        await writeMemoryFile(root, p, args.content);
+                        return ok({ path: p, scope, written: true });
+                    }
+                    case "list": {
+                        const entries = await listMemoryFiles(root, asString(args.path, "."));
+                        return ok({ scope, entries });
+                    }
+                    case "search": {
+                        const query = asString(args.query);
+                        if (!query)
+                            return fail("query is required for action='search'.");
+                        const matches = await searchMemoryFiles(root, query);
+                        return ok({ scope, query, matches });
+                    }
+                    default:
+                        return fail("action must be one of: read, write, list, search.");
+                }
+            }
+            catch (err) {
+                return fail(err instanceof Error ? err.message : String(err));
+            }
+        },
+    };
+}
 // ----- public API -----
 export function buildTools(ctx) {
     return [
@@ -465,6 +538,7 @@ export function buildTools(ctx) {
         hireAgentTool(ctx),
         requestApprovalTool(ctx),
         askUserQuestionsTool(ctx),
+        memoryFsTool(ctx),
     ];
 }
 /** Get the schemas to send to the model. */

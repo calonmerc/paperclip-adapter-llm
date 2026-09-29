@@ -4,7 +4,10 @@
  * the now-deleted execute.ts.backup), so this file had zero coverage before.
  */
 
-import { describe, expect, it } from "vitest";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { PaperclipApi } from "../src/server/paperclip-api.js";
 import { buildTools, findTool, toolSchemas } from "../src/server/tools.js";
@@ -25,7 +28,7 @@ describe("tools.ts", () => {
     const api = makeApi(async () => jsonResponse({}));
     const tools = buildTools({ api, agentId: "agent-1", companyId: "company-1", currentIssueId: null, autoApprove: false });
 
-    expect(tools.length).toBe(10);
+    expect(tools.length).toBe(11);
     const names = toolSchemas(tools).map((s) => s.function.name);
     expect(names).toEqual([
       "get_issue",
@@ -38,6 +41,7 @@ describe("tools.ts", () => {
       "hire_agent",
       "request_approval",
       "ask_user_questions",
+      "memory_fs",
     ]);
   });
 
@@ -351,5 +355,121 @@ describe("tools.ts", () => {
     const result = await findTool(tools, "ask_user_questions")!.execute({ questions: [{ prompt: "Which one?" }] });
     expect(result.isError).toBe(true);
     expect(result.content).toContain("No current issue");
+  });
+});
+
+describe("memory_fs", () => {
+  let agentHomeDir: string;
+
+  beforeEach(() => {
+    agentHomeDir = fs.mkdtempSync(path.join(os.tmpdir(), "llm-adapter-tool-homes-"));
+  });
+
+  afterEach(() => {
+    fs.rmSync(agentHomeDir, { recursive: true, force: true });
+  });
+
+  function toolsFor(agentId: string) {
+    const api = makeApi(async () => jsonResponse({}));
+    return buildTools({
+      api,
+      agentId,
+      companyId: "company-1",
+      currentIssueId: null,
+      autoApprove: false,
+      config: { agentHomeDir },
+    });
+  }
+
+  it("writes then reads back a private note", async () => {
+    const tools = toolsFor("agent-a");
+    const write = await findTool(tools, "memory_fs")!.execute({
+      action: "write",
+      scope: "private",
+      path: "memory/2026-09-29.md",
+      content: "Talked to Kyle about org storage.",
+    });
+    expect(write.isError).toBe(false);
+
+    const read = await findTool(tools, "memory_fs")!.execute({
+      action: "read",
+      scope: "private",
+      path: "memory/2026-09-29.md",
+    });
+    expect(read.isError).toBe(false);
+    expect(JSON.parse(read.content).content).toBe("Talked to Kyle about org storage.");
+  });
+
+  it("keeps private notes isolated between two agents in the same company", async () => {
+    const agentA = toolsFor("agent-a");
+    const agentB = toolsFor("agent-b");
+
+    await findTool(agentA, "memory_fs")!.execute({
+      action: "write",
+      scope: "private",
+      path: "secret.md",
+      content: "agent-a's private note",
+    });
+
+    const bReadsA = await findTool(agentB, "memory_fs")!.execute({
+      action: "read",
+      scope: "private",
+      path: "secret.md",
+    });
+    expect(bReadsA.isError).toBe(true);
+  });
+
+  it("lets two agents in the same company share notes via scope='shared'", async () => {
+    const agentA = toolsFor("agent-a");
+    const agentB = toolsFor("agent-b");
+
+    await findTool(agentA, "memory_fs")!.execute({
+      action: "write",
+      scope: "shared",
+      path: "plans/2026-09-29-launch.md",
+      content: "Launch plan drafted by agent-a.",
+    });
+
+    const bReadsShared = await findTool(agentB, "memory_fs")!.execute({
+      action: "read",
+      scope: "shared",
+      path: "plans/2026-09-29-launch.md",
+    });
+    expect(bReadsShared.isError).toBe(false);
+    expect(JSON.parse(bReadsShared.content).content).toBe("Launch plan drafted by agent-a.");
+  });
+
+  it("rejects a path that tries to escape the scope root", async () => {
+    const tools = toolsFor("agent-a");
+    const result = await findTool(tools, "memory_fs")!.execute({
+      action: "read",
+      scope: "private",
+      path: "../../../etc/passwd",
+    });
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain("outside the allowed directory");
+  });
+
+  it("search finds a keyword across files in the chosen scope", async () => {
+    const tools = toolsFor("agent-a");
+    await findTool(tools, "memory_fs")!.execute({
+      action: "write",
+      scope: "private",
+      path: "life/areas/people/kyle/summary.md",
+      content: "Kyle prefers async updates.",
+    });
+
+    const result = await findTool(tools, "memory_fs")!.execute({ action: "search", scope: "private", query: "async" });
+    expect(result.isError).toBe(false);
+    const { matches } = JSON.parse(result.content);
+    expect(matches).toHaveLength(1);
+    expect(matches[0].path).toBe("life/areas/people/kyle/summary.md");
+  });
+
+  it("defaults to scope='private' when scope is omitted", async () => {
+    const tools = toolsFor("agent-a");
+    await findTool(tools, "memory_fs")!.execute({ action: "write", path: "note.md", content: "default scope" });
+    const result = await findTool(tools, "memory_fs")!.execute({ action: "read", path: "note.md" });
+    expect(JSON.parse(result.content).scope).toBe("private");
   });
 });

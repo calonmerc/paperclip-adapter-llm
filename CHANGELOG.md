@@ -1,5 +1,42 @@
 # Changelog
 
+## [0.7.0] - 2026-09-29
+
+### Added
+- **New `memory_fs` tool**, so `llm`-type agents can actually use file-based
+  memory skills like Paperclip's bundled `para-memory-files` — which
+  otherwise expects real filesystem read/write under `$AGENT_HOME` plus a
+  `qmd` shell command for semantic recall, neither of which this adapter
+  provides (and `qmd` isn't something Paperclip installs or guarantees
+  anywhere — it's assumed present in whatever environment a native CLI
+  adapter happens to run in).
+- `memory_fs` is **not** a restoration of the unsandboxed CLI tools removed
+  in the 0.3.0 security fix. It has two isolated scopes, each confined to
+  one resolved root directory:
+  - `scope: "private"` — one directory per agent (`$AGENT_HOME` in the
+    skill's own terms); only that agent's own tool calls can reach it.
+  - `scope: "shared"` — one directory per **company**, readable and
+    writable by every `llm`-adapter agent in it. `para-memory-files`
+    explicitly wants some content (its `plans/` convention) kept "outside
+    personal memory so other agents can access them" — this is that.
+  - Every path is resolved and containment-checked
+    (`resolveSafePath` in `src/server/memory-fs.ts`) before any read or
+    write; `../` traversal and absolute-path overrides are both rejected.
+    There is no shell execution anywhere in this feature — `action:
+    "search"` does a plain case-insensitive keyword search across the
+    scope's files instead of shelling out to `qmd`.
+  - New optional `agentHomeDir` config field overrides the base directory
+    (default `~/.paperclip-llm-adapter/homes/<companyId>/...`).
+- `DEFAULT_SYSTEM_PROMPT` now explains the `$AGENT_HOME` → `scope:
+  "private"`, shared-plans → `scope: "shared"`, and `qmd` →
+  `action: "search"` mappings so file-based-memory skills' own instructions
+  translate correctly onto this adapter's real tool surface.
+- 23 new tests (`tests/memory-fs.test.ts`, plus additions to
+  `tests/tools.test.ts`) — heavy on the security boundary specifically:
+  path-traversal rejection, absolute-path-override rejection, and
+  confirming two agents in the same company get isolated private roots but
+  the *same* shared root.
+
 ## [0.6.0] - 2026-09-28
 
 ### Fixed

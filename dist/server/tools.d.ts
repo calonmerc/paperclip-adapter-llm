@@ -44,6 +44,8 @@ export interface BuildToolsContext {
     interactionCreated?: {
         value: boolean;
     };
+    /** Raw adapterConfig, needed by memory_fs to resolve agentHomeDir. */
+    config?: Record<string, unknown>;
 }
 export declare function buildTools(ctx: BuildToolsContext): Tool[];
 /** Get the schemas to send to the model. */

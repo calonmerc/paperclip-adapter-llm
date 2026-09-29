@@ -87,6 +87,16 @@ export function getConfigSchema(): AdapterConfigSchema {
         hint: "Override path to the skills directory. Defaults to ~/.paperclip-llm-adapter/skills.",
       },
       {
+        key: "agentHomeDir",
+        label: "Agent memory directory",
+        type: "text",
+        hint:
+          "Override the base directory for the memory_fs tool (file-based memory for skills like " +
+          "para-memory-files). Defaults to ~/.paperclip-llm-adapter/homes. Private notes live under " +
+          "<dir>/<companyId>/agents/<agentId>/; notes shared with every agent in the company live under " +
+          "<dir>/<companyId>/shared/.",
+      },
+      {
         key: "instructionsFilePath",
         label: "Instructions file path",
         type: "text",
