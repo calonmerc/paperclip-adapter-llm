@@ -34,6 +34,8 @@ export interface BuildToolsContext {
     companyId: string;
     /** The issue this run is working on, if any. Tools default to this when no id is supplied. */
     currentIssueId: string | null;
+    /** Human identifier of the current issue (e.g. "DEBA-39"), which models often pass instead of the id. */
+    currentIssueIdentifier?: string | null;
     /** When false, hire_agent and similar mutating actions go through request_approval first. */
     autoApprove: boolean;
     /**
@@ -46,7 +48,14 @@ export interface BuildToolsContext {
     };
     /** Raw adapterConfig, needed by memory_fs to resolve agentHomeDir. */
     config?: Record<string, unknown>;
+    /**
+     * Bound secrets (resolved from adapterConfig.env by Paperclip), by name.
+     * Only ever substituted into http_request calls — never returned to the model.
+     */
+    secrets?: Record<string, string>;
 }
+/** True when `issueId` (absent, the current issue's id, or its identifier) targets the current issue. */
+export declare function targetsCurrentIssue(ctx: Pick<BuildToolsContext, "currentIssueId" | "currentIssueIdentifier">, issueId: unknown): boolean;
 export declare function buildTools(ctx: BuildToolsContext): Tool[];
 /** Get the schemas to send to the model. */
 export declare function toolSchemas(tools: Tool[]): ToolSchema[];

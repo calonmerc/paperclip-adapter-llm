@@ -95,7 +95,7 @@ describe("tools.ts", () => {
     const tools = buildTools({ api, agentId: "agent-1", companyId: "company-1", currentIssueId: "issue-1", autoApprove: false });
     const schema = findTool(tools, "update_issue_status")!.schema;
     const statusEnum = (schema.function.parameters as any).properties.status.enum;
-    expect(statusEnum).toEqual(["backlog", "todo", "in_progress", "in_review", "blocked", "done", "cancelled"]);
+    expect([...statusEnum].sort()).toEqual(["backlog", "blocked", "cancelled", "done", "in_progress", "in_review", "todo"]);
   });
 
   it("update_issue replaces the blocker set and other fields, defaulting to the current issue", async () => {
@@ -712,5 +712,257 @@ describe("issue_document", () => {
     const result = await findTool(tools, "issue_document")!.execute({ action: "list" });
     expect(result.isError).toBe(true);
     expect(result.content).toContain("No issue_id supplied");
+  });
+});
+
+describe("update_issue_status dispositions", () => {
+  function recordingApi(respond: (call: { method: string; path: string; body: any }) => Response = () => jsonResponse({ id: "issue-1" })) {
+    const calls: Array<{ method: string; path: string; body: any }> = [];
+    const api = makeApi(async (input: any, init: any) => {
+      const call = {
+        method: (init?.method || "GET").toUpperCase(),
+        path: new URL(typeof input === "string" ? input : input.url).pathname,
+        body: init?.body ? JSON.parse(init.body) : undefined,
+      };
+      calls.push(call);
+      return respond(call);
+    });
+    return { api, calls };
+  }
+
+  function statusTool(api: PaperclipApi) {
+    const tools = buildTools({
+      api,
+      agentId: "agent-1",
+      companyId: "company-1",
+      currentIssueId: "issue-1",
+      currentIssueIdentifier: "DEBA-39",
+      autoApprove: false,
+    });
+    return findTool(tools, "update_issue_status")!;
+  }
+
+  it("rejects a bare 'blocked' locally instead of sending a patch Paperclip will 422", async () => {
+    const { api, calls } = recordingApi();
+    const result = await statusTool(api).execute({ status: "blocked" });
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain("blocked_by_issue_ids");
+    expect(result.content).toContain("ask_user_questions");
+    expect(calls.length).toBe(0);
+  });
+
+  it("turns unblock_action into an unblockDescriptor owned by this agent, and sends comment (not statusReason)", async () => {
+    const { api, calls } = recordingApi();
+    const result = await statusTool(api).execute({
+      status: "blocked",
+      unblock_action: "Retry once GSC access is granted",
+      comment: "GSC returned 403.",
+    });
+    expect(result.isError).toBe(false);
+    expect(calls[0]).toMatchObject({
+      method: "PATCH",
+      path: "/api/issues/issue-1",
+      body: {
+        status: "blocked",
+        comment: "GSC returned 403.",
+        unblockDescriptor: { owner: { agentId: "agent-1" }, action: "Retry once GSC access is granted" },
+      },
+    });
+    expect(calls[0]!.body.statusReason).toBeUndefined();
+  });
+
+  it("sends blocked_by_issue_ids as blockedByIssueIds", async () => {
+    const { api, calls } = recordingApi();
+    await statusTool(api).execute({ status: "blocked", blocked_by_issue_ids: ["issue-2"] });
+    expect(calls[0]!.body).toEqual({ status: "blocked", blockedByIssueIds: ["issue-2"] });
+  });
+
+  it("requires a reviewer for in_review on the current issue and sends it as assigneeUserId", async () => {
+    const { api, calls } = recordingApi();
+    const tool = statusTool(api);
+    const rejected = await tool.execute({ status: "in_review" });
+    expect(rejected.isError).toBe(true);
+    expect(calls.length).toBe(0);
+
+    await tool.execute({ status: "in_review", reviewer_user_id: "user-9" });
+    expect(calls[0]!.body).toEqual({ status: "in_review", assigneeUserId: "user-9" });
+  });
+
+  it("refuses non-disposition statuses on the current issue (by id or identifier) but allows them on other issues", async () => {
+    const { api, calls } = recordingApi();
+    const tool = statusTool(api);
+    for (const issue_id of [undefined, "issue-1", "DEBA-39"]) {
+      const result = await tool.execute({ status: "in_progress", issue_id });
+      expect(result.isError).toBe(true);
+      expect(result.content).toContain("missing");
+    }
+    expect(calls.length).toBe(0);
+
+    const other = await tool.execute({ status: "todo", issue_id: "issue-2" });
+    expect(other.isError).toBe(false);
+    expect(calls[0]).toMatchObject({ path: "/api/issues/issue-2", body: { status: "todo" } });
+  });
+
+  it("adds a how-to-fix hint to a 422 from Paperclip", async () => {
+    const { api } = recordingApi(() =>
+      jsonResponse({ error: "Entering blocked requires unresolved blockers, a pending interaction/approval, or unblockDescriptor" }, 422),
+    );
+    const result = await statusTool(api).execute({ status: "blocked", blocked_by_issue_ids: ["issue-done"] });
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain("Entering blocked requires");
+    expect(result.content).toContain("unblock_action");
+  });
+});
+
+describe("secrets & http_request", () => {
+  const originalFetch = globalThis.fetch;
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  function toolsWith(secrets: Record<string, string>, config: Record<string, unknown> = {}) {
+    const api = makeApi(async () => jsonResponse({}));
+    return buildTools({ api, agentId: "agent-1", companyId: "company-1", currentIssueId: "issue-1", autoApprove: false, secrets, config });
+  }
+
+  it("registers neither tool when no secrets are bound (and http_request only with httpToolEnabled)", () => {
+    expect(findTool(toolsWith({}), "http_request")).toBeNull();
+    expect(findTool(toolsWith({}), "list_secrets")).toBeNull();
+    expect(findTool(toolsWith({}, { httpToolEnabled: true }), "http_request")).not.toBeNull();
+  });
+
+  it("list_secrets returns names only, never values", async () => {
+    const result = await findTool(toolsWith({ UMAMI_API_KEY: "umami-secret-value", B_KEY: "bbbb-value" }), "list_secrets")!.execute({});
+    expect(JSON.parse(result.content)).toEqual({ secrets: ["B_KEY", "UMAMI_API_KEY"] });
+    expect(result.content).not.toContain("secret-value");
+  });
+
+  it("substitutes {{secret:NAME}} into headers/query and redacts the value from the response", async () => {
+    let seen: { url: string; headers: Record<string, string> } | null = null;
+    globalThis.fetch = (async (input: any, init: any) => {
+      seen = { url: String(input), headers: init.headers };
+      // A misbehaving API that echoes the key back.
+      return jsonResponse({ echoed: init.headers["x-umami-api-key"], pageviews: 42 });
+    }) as typeof fetch;
+
+    const result = await findTool(toolsWith({ UMAMI_API_KEY: "umami-secret-value" }), "http_request")!.execute({
+      url: "https://umami.example.com/api/websites/abc/stats",
+      headers: { "x-umami-api-key": "{{secret:UMAMI_API_KEY}}" },
+      query: { startAt: "1", endAt: "2" },
+    });
+
+    expect(seen!.headers["x-umami-api-key"]).toBe("umami-secret-value");
+    expect(seen!.url).toContain("startAt=1");
+    expect(result.isError).toBe(false);
+    const parsed = JSON.parse(result.content);
+    expect(parsed.status).toBe(200);
+    expect(parsed.body).toContain('"pageviews":42');
+    expect(result.content).not.toContain("umami-secret-value");
+  });
+
+  it("redacts secrets from error responses too, and marks non-2xx as an error", async () => {
+    globalThis.fetch = (async () => new Response("bad key: umami-secret-value", { status: 401 })) as typeof fetch;
+    const result = await findTool(toolsWith({ UMAMI_API_KEY: "umami-secret-value" }), "http_request")!.execute({
+      url: "https://umami.example.com/api",
+      headers: { "x-umami-api-key": "{{secret:UMAMI_API_KEY}}" },
+    });
+    expect(result.isError).toBe(true);
+    expect(result.content).not.toContain("umami-secret-value");
+    expect(result.content).toContain("***");
+  });
+
+  it("fails with the list of bound names on an unknown secret, without making a request", async () => {
+    let called = false;
+    globalThis.fetch = (async () => {
+      called = true;
+      return jsonResponse({});
+    }) as typeof fetch;
+    const result = await findTool(toolsWith({ UMAMI_API_KEY: "v-value" }), "http_request")!.execute({
+      url: "https://x.example.com/?k={{secret:NOPE}}",
+    });
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain("Unknown secret 'NOPE'");
+    expect(result.content).toContain("UMAMI_API_KEY");
+    expect(called).toBe(false);
+  });
+
+  it("enforces httpAllowedHosts and rejects non-http schemes", async () => {
+    globalThis.fetch = (async () => jsonResponse({})) as typeof fetch;
+    const tool = findTool(toolsWith({ K: "v-value" }, { httpAllowedHosts: "*.googleapis.com, analytics.example.com" }), "http_request")!;
+    expect((await tool.execute({ url: "https://evil.example.net/" })).content).toContain("not in this agent's httpAllowedHosts");
+    expect((await tool.execute({ url: "https://searchconsole.googleapis.com/x" })).isError).toBe(false);
+    expect((await tool.execute({ url: "https://analytics.example.com/x" })).isError).toBe(false);
+    expect((await tool.execute({ url: "file:///etc/passwd" })).content).toContain("Only http");
+  });
+
+  it("mints a Google access token from a service-account secret, signs a valid RS256 JWT, and redacts the token", async () => {
+    const crypto = await import("node:crypto");
+    const { privateKey, publicKey } = crypto.generateKeyPairSync("rsa", { modulusLength: 2048 });
+    const serviceAccount = JSON.stringify({
+      type: "service_account",
+      client_email: "gsc@proj.iam.gserviceaccount.com",
+      private_key: privateKey.export({ type: "pkcs8", format: "pem" }).toString(),
+      token_uri: "https://oauth2.googleapis.com/token",
+    });
+
+    let tokenRequests = 0;
+    let apiAuth: string | undefined;
+    globalThis.fetch = (async (input: any, init: any) => {
+      const url = String(input);
+      if (url === "https://oauth2.googleapis.com/token") {
+        tokenRequests += 1;
+        const params = new URLSearchParams(String(init.body));
+        expect(params.get("grant_type")).toBe("urn:ietf:params:oauth:grant-type:jwt-bearer");
+        const [h, c, sig] = params.get("assertion")!.split(".");
+        const valid = crypto
+          .createVerify("RSA-SHA256")
+          .update(`${h}.${c}`)
+          .verify(publicKey, Buffer.from(sig!, "base64url"));
+        expect(valid).toBe(true);
+        const claims = JSON.parse(Buffer.from(c!, "base64url").toString());
+        expect(claims).toMatchObject({
+          iss: "gsc@proj.iam.gserviceaccount.com",
+          scope: "https://www.googleapis.com/auth/webmasters.readonly",
+          aud: "https://oauth2.googleapis.com/token",
+        });
+        return jsonResponse({ access_token: "ya29.minted-token", expires_in: 3600 });
+      }
+      apiAuth = init.headers.Authorization;
+      return jsonResponse({ rows: [{ clicks: 10, impressions: 200 }], debug: init.headers.Authorization });
+    }) as typeof fetch;
+
+    const tool = findTool(toolsWith({ GSC_SERVICE_ACCOUNT: serviceAccount }), "http_request")!;
+    const call = () =>
+      tool.execute({
+        method: "POST",
+        url: "https://searchconsole.googleapis.com/webmasters/v3/sites/sc-domain%3Adebtrelief.win/searchAnalytics/query",
+        body: { startDate: "2026-09-23", endDate: "2026-09-29" },
+        auth: {
+          type: "google_service_account",
+          secret: "GSC_SERVICE_ACCOUNT",
+          scopes: ["https://www.googleapis.com/auth/webmasters.readonly"],
+        },
+      });
+
+    const result = await call();
+    expect(result.isError).toBe(false);
+    expect(apiAuth).toBe("Bearer ya29.minted-token");
+    expect(result.content).toContain('\\"clicks\\":10');
+    expect(result.content).not.toContain("ya29.minted-token");
+    expect(result.content).not.toContain("PRIVATE KEY");
+
+    await call();
+    expect(tokenRequests).toBe(1); // cached for the run
+  });
+
+  it("reports a bad service-account secret without leaking it", async () => {
+    globalThis.fetch = (async () => jsonResponse({})) as typeof fetch;
+    const result = await findTool(toolsWith({ GSC: "not-json-at-all" }), "http_request")!.execute({
+      url: "https://searchconsole.googleapis.com/x",
+      auth: { type: "google_service_account", secret: "GSC", scopes: ["s"] },
+    });
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain("not valid JSON");
+    expect(result.content).not.toContain("not-json-at-all");
   });
 });

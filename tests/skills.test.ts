@@ -114,18 +114,19 @@ describe("syncSkills", () => {
 });
 
 describe("reconcilePaperclipSkills", () => {
-  it("always includes a required skill even when not explicitly requested", async () => {
+  it("always includes the operational paperclip skill even when not explicitly requested", async () => {
     const config = makeConfig({
       paperclipRuntimeSkills: [
         { key: "acme/onboarding", runtimeName: "onboarding", source: sourceDir },
-        { key: "acme/required-thing", runtimeName: "required-thing", source: sourceDir, required: true },
+        { key: "paperclipai/paperclip/paperclip", runtimeName: "paperclip", source: sourceDir },
       ],
     });
 
     const desired = await reconcilePaperclipSkills(config, []);
 
-    expect(desired).toContain("acme/required-thing");
-    expect(fs.existsSync(path.join(skillsDir, "required-thing"))).toBe(true);
+    expect(desired).toContain("paperclipai/paperclip/paperclip");
+    expect(desired).not.toContain("acme/onboarding");
+    expect(fs.existsSync(path.join(skillsDir, "paperclip"))).toBe(true);
   });
 
   it("without an explicit request, falls back to config.paperclipSkillSync's persisted preference", async () => {

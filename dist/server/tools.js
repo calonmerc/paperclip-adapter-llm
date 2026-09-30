@@ -13,6 +13,7 @@
  */
 import { PaperclipApiError } from "./paperclip-api.js";
 import { resolveMemoryRoot, readMemoryFile, writeMemoryFile, listMemoryFiles, searchMemoryFiles, } from "./memory-fs.js";
+import { MAX_RESPONSE_CHARS, REQUEST_TIMEOUT_MS, SecretReferenceError, fetchGoogleAccessToken, hostAllowed, parseAllowedHosts, redactSecrets, substituteSecrets, substituteSecretsDeep, } from "./http-request.js";
 // ----- helpers -----
 function ok(content) {
     return {
@@ -70,23 +71,66 @@ function getIssueTool(ctx) {
         },
     };
 }
+/** True when `issueId` (absent, the current issue's id, or its identifier) targets the current issue. */
+export function targetsCurrentIssue(ctx, issueId) {
+    if (typeof issueId !== "string" || issueId.length === 0)
+        return true;
+    return issueId === ctx.currentIssueId || (!!ctx.currentIssueIdentifier && issueId === ctx.currentIssueIdentifier);
+}
+// Statuses that leave the current issue without a disposition Paperclip will
+// accept at the end of a run: a successful run that leaves its issue
+// in_progress triggers Paperclip's missing-disposition recovery, and
+// backlog/todo on your own issue just hands it back to the queue unexplained.
+const NON_DISPOSITION_STATUSES = new Set(["backlog", "todo", "in_progress"]);
+// Appended to 422 errors so the model can fix the call instead of retrying it.
+function statusRejectionHint(status) {
+    if (status === "blocked") {
+        return ("To block, pass blocked_by_issue_ids (unresolved issues this waits on) and/or unblock_action " +
+            "(the concrete next step). If a human must act or answer, call ask_user_questions instead.");
+    }
+    if (status === "in_review") {
+        return "To send for review, pass reviewer_user_id (a human reviewer), or call ask_user_questions instead.";
+    }
+    return null;
+}
 function updateIssueStatusTool(ctx) {
     return {
         schema: {
             type: "function",
             function: {
                 name: "update_issue_status",
-                description: "Move an issue to a new status. Valid statuses: backlog, todo, in_progress, in_review, " +
-                    "blocked, done, cancelled. Defaults to the current issue.",
+                description: "Record an issue's disposition. For the issue you're working on, end every run with one of: " +
+                    "'done' (finished), 'cancelled' (intentionally stopped), 'blocked' (needs blocked_by_issue_ids " +
+                    "and/or unblock_action — Paperclip rejects a bare 'blocked'), or 'in_review' (needs " +
+                    "reviewer_user_id). If a human must answer something, use ask_user_questions instead. " +
+                    "backlog/todo/in_progress are only allowed for OTHER issues (e.g. sub-issues). Put your " +
+                    "explanation in `comment` — it's posted together with the status change. Defaults to the current issue.",
                 parameters: {
                     type: "object",
                     properties: {
                         issue_id: { type: "string", description: "Issue id. Omit to use the current issue." },
                         status: {
                             type: "string",
-                            enum: ["backlog", "todo", "in_progress", "in_review", "blocked", "done", "cancelled"],
+                            enum: ["done", "cancelled", "blocked", "in_review", "backlog", "todo", "in_progress"],
                         },
-                        reason: { type: "string", description: "Optional explanation." },
+                        comment: {
+                            type: "string",
+                            description: "Explanation posted as an issue comment together with the status change.",
+                        },
+                        blocked_by_issue_ids: {
+                            type: "array",
+                            items: { type: "string" },
+                            description: "status='blocked' only: ids of unresolved issues this one waits on.",
+                        },
+                        unblock_action: {
+                            type: "string",
+                            description: "status='blocked' only: the concrete action that unblocks this issue, e.g. 'Retry once the " +
+                                "GSC service account has been granted access'. You are recorded as the unblock owner.",
+                        },
+                        reviewer_user_id: {
+                            type: "string",
+                            description: "status='in_review' only: the human user who should review it.",
+                        },
                     },
                     required: ["status"],
                 },
@@ -99,7 +143,51 @@ function updateIssueStatusTool(ctx) {
             const status = asString(args.status);
             if (!status)
                 return fail("status is required.");
-            return safeCall("update_issue_status", () => ctx.api.updateIssue(id, { status, statusReason: args.reason ?? null }));
+            const isCurrent = targetsCurrentIssue(ctx, args.issue_id);
+            if (isCurrent && NON_DISPOSITION_STATUSES.has(status)) {
+                return fail(`'${status}' is not a valid way to end a run on your own issue — Paperclip treats it as a missing ` +
+                    "disposition. Use done, cancelled, blocked (with blocked_by_issue_ids or unblock_action), " +
+                    "in_review (with reviewer_user_id), or call ask_user_questions if you need a human's input.");
+            }
+            const patch = { status };
+            if (typeof args.comment === "string" && args.comment.trim())
+                patch.comment = args.comment.trim();
+            if (status === "blocked") {
+                const blockerIds = Array.isArray(args.blocked_by_issue_ids)
+                    ? args.blocked_by_issue_ids.filter((v) => typeof v === "string" && v.length > 0)
+                    : [];
+                const unblockAction = asString(args.unblock_action).trim();
+                if (blockerIds.length === 0 && !unblockAction) {
+                    return fail(`status='blocked' needs a real blocker path. ${statusRejectionHint("blocked")}`);
+                }
+                if (blockerIds.length > 0)
+                    patch.blockedByIssueIds = blockerIds;
+                if (unblockAction) {
+                    // Paperclip only lets an agent name itself as the unblock owner.
+                    patch.unblockDescriptor = { owner: { agentId: ctx.agentId }, action: unblockAction.slice(0, 2000) };
+                }
+            }
+            if (status === "in_review") {
+                const reviewer = asString(args.reviewer_user_id).trim();
+                if (!reviewer && isCurrent) {
+                    return fail(`status='in_review' needs a reviewer. ${statusRejectionHint("in_review")}`);
+                }
+                if (reviewer)
+                    patch.assigneeUserId = reviewer;
+            }
+            try {
+                return ok(await ctx.api.updateIssue(id, patch));
+            }
+            catch (err) {
+                if (err instanceof PaperclipApiError) {
+                    const hint = err.status === 422 ? statusRejectionHint(status) : null;
+                    return fail(`update_issue_status failed: ${err.message}${hint ? ` — ${hint}` : ""}`, {
+                        status: err.status,
+                        body: err.body,
+                    });
+                }
+                return fail(`update_issue_status failed: ${err instanceof Error ? err.message : String(err)}`);
+            }
         },
     };
 }
@@ -715,8 +803,182 @@ function issueDocumentTool(ctx) {
         },
     };
 }
+function listSecretsTool(ctx) {
+    return {
+        schema: {
+            type: "function",
+            function: {
+                name: "list_secrets",
+                description: "List the NAMES of the secrets/credentials bound to you (e.g. API keys, service-account keys). " +
+                    "Values are never shown — reference one in http_request as {{secret:NAME}}, or via its `auth` option.",
+                parameters: { type: "object", properties: {} },
+            },
+        },
+        execute: async () => ok({ secrets: Object.keys(ctx.secrets ?? {}).sort() }),
+    };
+}
+const HTTP_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"];
+function httpRequestTool(ctx) {
+    const secrets = ctx.secrets ?? {};
+    const allowedHosts = parseAllowedHosts(ctx.config?.httpAllowedHosts);
+    // Access tokens minted from a secret are as sensitive as the secret itself:
+    // cache them for the run and redact them alongside the raw values.
+    const tokenCache = new Map();
+    const sensitive = () => [...Object.values(secrets), ...tokenCache.values()];
+    return {
+        schema: {
+            type: "function",
+            function: {
+                name: "http_request",
+                description: "Make an HTTP request to an external API. There is no shell or curl — this is the only way to " +
+                    "call an outside service. Reference a bound secret anywhere in url/headers/query/body as " +
+                    "{{secret:NAME}} (see list_secrets); it is substituted server-side and redacted from the " +
+                    "response. For Google APIs authenticated by a service-account key secret, set " +
+                    'auth={"type":"google_service_account","secret":"NAME","scopes":["https://www.googleapis.com/auth/webmasters.readonly"]} ' +
+                    "instead of an Authorization header. Responses are truncated to ~32KB.",
+                parameters: {
+                    type: "object",
+                    properties: {
+                        method: { type: "string", enum: HTTP_METHODS, description: "Default GET." },
+                        url: { type: "string", description: "Absolute http(s) URL." },
+                        headers: {
+                            type: "object",
+                            additionalProperties: { type: "string" },
+                            description: 'e.g. {"x-umami-api-key": "{{secret:UMAMI_API_KEY}}"}',
+                        },
+                        query: {
+                            type: "object",
+                            additionalProperties: { type: "string" },
+                            description: "Query-string parameters appended to the url.",
+                        },
+                        body: {
+                            description: "Request body. An object/array is sent as JSON; a string is sent as-is.",
+                        },
+                        auth: {
+                            type: "object",
+                            properties: {
+                                type: { type: "string", enum: ["google_service_account"] },
+                                secret: { type: "string", description: "Name of the secret holding the service-account JSON key." },
+                                scopes: { type: "array", items: { type: "string" } },
+                            },
+                            required: ["type", "secret", "scopes"],
+                        },
+                    },
+                    required: ["url"],
+                },
+            },
+        },
+        execute: async (args) => {
+            const redact = (text) => redactSecrets(text, sensitive());
+            const method = asString(args.method, "GET").toUpperCase();
+            if (!HTTP_METHODS.includes(method))
+                return fail(`method must be one of: ${HTTP_METHODS.join(", ")}.`);
+            let url;
+            const headers = {};
+            let body;
+            try {
+                const rawUrl = asString(args.url);
+                if (!rawUrl)
+                    return fail("url is required.");
+                url = new URL(substituteSecrets(rawUrl, secrets));
+                if (url.protocol !== "http:" && url.protocol !== "https:") {
+                    return fail("Only http:// and https:// URLs are allowed.");
+                }
+                if (!hostAllowed(url, allowedHosts)) {
+                    return fail(`Host '${url.hostname}' is not in this agent's httpAllowedHosts list.`);
+                }
+                if (args.query && typeof args.query === "object" && !Array.isArray(args.query)) {
+                    for (const [k, v] of Object.entries(args.query)) {
+                        if (v === undefined || v === null)
+                            continue;
+                        url.searchParams.set(k, substituteSecrets(String(v), secrets));
+                    }
+                }
+                if (args.headers && typeof args.headers === "object" && !Array.isArray(args.headers)) {
+                    for (const [k, v] of Object.entries(args.headers)) {
+                        if (v === undefined || v === null)
+                            continue;
+                        headers[k] = substituteSecrets(String(v), secrets);
+                    }
+                }
+                if (args.body !== undefined && args.body !== null && method !== "GET" && method !== "HEAD") {
+                    if (typeof args.body === "string") {
+                        body = substituteSecrets(args.body, secrets);
+                    }
+                    else {
+                        body = JSON.stringify(substituteSecretsDeep(args.body, secrets));
+                        if (!Object.keys(headers).some((h) => h.toLowerCase() === "content-type")) {
+                            headers["Content-Type"] = "application/json";
+                        }
+                    }
+                }
+            }
+            catch (err) {
+                if (err instanceof SecretReferenceError)
+                    return fail(err.message);
+                return fail(`Invalid request: ${redact(err instanceof Error ? err.message : String(err))}`);
+            }
+            const auth = args.auth && typeof args.auth === "object" ? args.auth : null;
+            if (auth) {
+                if (auth.type !== "google_service_account")
+                    return fail("auth.type must be 'google_service_account'.");
+                const secretName = asString(auth.secret);
+                if (!Object.prototype.hasOwnProperty.call(secrets, secretName)) {
+                    const known = Object.keys(secrets);
+                    return fail(`Unknown secret '${secretName}'. Bound secrets: ${known.length > 0 ? known.join(", ") : "(none)"}.`);
+                }
+                const scopes = Array.isArray(auth.scopes)
+                    ? auth.scopes.filter((s) => typeof s === "string" && s.length > 0)
+                    : [];
+                if (scopes.length === 0)
+                    return fail("auth.scopes must list at least one OAuth scope.");
+                const cacheKey = `${secretName}|${[...scopes].sort().join(" ")}`;
+                try {
+                    let token = tokenCache.get(cacheKey);
+                    if (!token) {
+                        token = await fetchGoogleAccessToken(secrets[secretName], scopes);
+                        tokenCache.set(cacheKey, token);
+                    }
+                    headers.Authorization = `Bearer ${token}`;
+                }
+                catch (err) {
+                    return fail(redact(err instanceof Error ? err.message : String(err)));
+                }
+            }
+            let response;
+            try {
+                response = await fetch(url, {
+                    method,
+                    headers,
+                    body,
+                    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+                });
+            }
+            catch (err) {
+                return fail(`Request failed: ${redact(err instanceof Error ? err.message : String(err))}`);
+            }
+            let text = method === "HEAD" ? "" : await response.text().catch(() => "");
+            const truncated = text.length > MAX_RESPONSE_CHARS;
+            if (truncated)
+                text = text.slice(0, MAX_RESPONSE_CHARS);
+            const result = {
+                status: response.status,
+                ok: response.ok,
+                contentType: response.headers.get("content-type"),
+                body: redact(text),
+            };
+            if (truncated)
+                result.truncated = `Response truncated to ${MAX_RESPONSE_CHARS} characters.`;
+            return { content: JSON.stringify(result), isError: !response.ok };
+        },
+    };
+}
 // ----- public API -----
 export function buildTools(ctx) {
+    // http_request is opt-in: agents with no bound secrets keep a no-network
+    // toolset unless an operator explicitly enables it.
+    const hasSecrets = Object.keys(ctx.secrets ?? {}).length > 0;
+    const httpEnabled = hasSecrets || ctx.config?.httpToolEnabled === true;
     return [
         getIssueTool(ctx),
         updateIssueStatusTool(ctx),
@@ -732,6 +994,8 @@ export function buildTools(ctx) {
         listInteractionsTool(ctx),
         memoryFsTool(ctx),
         issueDocumentTool(ctx),
+        ...(hasSecrets ? [listSecretsTool(ctx)] : []),
+        ...(httpEnabled ? [httpRequestTool(ctx)] : []),
     ];
 }
 /** Get the schemas to send to the model. */

@@ -15,7 +15,7 @@
  *   - Track usage and cost via OpenRouter's /generation endpoint (OpenRouter
  *     only — other providers don't have an equivalent, so cost stays null)
  *
- * Aligned with @paperclipai/adapter-utils 2026.428.0 API surface:
+ * Aligned with @paperclipai/adapter-utils 2026.916.1 API surface:
  *   - PaperclipApi exposes updateIssue / addIssueComment (not updateIssueState / addComment)
  *   - UsageSummary has only inputTokens / outputTokens / cachedInputTokens
  *   - AdapterExecutionResult requires exitCode / signal / timedOut; costUsd is top-level
@@ -31,5 +31,15 @@
  *   - Attachment / multimodal handling
  */
 import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
+/**
+ * Paperclip's missing-disposition recovery (a "successful run handoff") puts
+ * its instructions at the top level of the run context — `handoffRequired`
+ * plus a ready-made `instruction` — not in paperclipWake, so the wake
+ * renderer never shows them. Without this, the corrective run looks like an
+ * ordinary wake: the model redoes the whole task (and can fail it again),
+ * spends Paperclip's single corrective attempt, and the issue escalates to
+ * the board with "Missing disposition recovery blocked".
+ */
+export declare function renderDispositionHandoffNote(context: Record<string, unknown>): string;
 export declare function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult>;
 //# sourceMappingURL=execute.d.ts.map

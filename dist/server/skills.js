@@ -20,7 +20,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { buildPersistentSkillSnapshot, ensurePaperclipSkillSymlink, readInstalledSkillTargets, readPaperclipRuntimeSkillEntries, resolvePaperclipDesiredSkillNames, } from "@paperclipai/adapter-utils/server-utils";
+import { buildPersistentSkillSnapshot, ensurePaperclipSkillSymlink, readInstalledSkillTargets, readPaperclipRuntimeSkillEntries, resolveLegacyPaperclipDesiredSkillNames, } from "@paperclipai/adapter-utils/server-utils";
 import { writeRawStderr } from "./transcript.js";
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
 /** Default skills root used when neither config.skillsDir nor PAPERCLIP_SKILLS_DIR is set. */
@@ -120,7 +120,7 @@ export function renderSkillsForPrompt(skills) {
 // ─────────────────────────────────────────────────────────────────
 async function buildLlmSkillSnapshot(config) {
     const availableEntries = await readPaperclipRuntimeSkillEntries(config, __moduleDir);
-    const desiredSkills = resolvePaperclipDesiredSkillNames(config, availableEntries);
+    const desiredSkills = resolveLegacyPaperclipDesiredSkillNames(config, availableEntries);
     const skillsHome = resolveSkillsRoot(config);
     const installed = await readInstalledSkillTargets(skillsHome);
     return buildPersistentSkillSnapshot({
@@ -152,11 +152,14 @@ export async function listSkills(ctx) {
  */
 export async function reconcilePaperclipSkills(config, requestedDesiredSkills) {
     const availableEntries = await readPaperclipRuntimeSkillEntries(config, __moduleDir);
-    // Union with required-skill defaults (resolved against an empty config) so
-    // a required skill can never be dropped by an explicit request that omits it.
+    // Union with the always-mounted defaults (resolved against an empty config)
+    // so the operational `paperclip` skill — the only way this adapter's model
+    // learns the Paperclip workflow — can never be dropped by an explicit
+    // request that omits it. The legacy resolver is the one adapter-utils
+    // prescribes for adapters that aren't the native paperclip_runner.
     const desiredSkills = requestedDesiredSkills
-        ? Array.from(new Set([...resolvePaperclipDesiredSkillNames({}, availableEntries), ...requestedDesiredSkills]))
-        : resolvePaperclipDesiredSkillNames(config, availableEntries);
+        ? Array.from(new Set([...resolveLegacyPaperclipDesiredSkillNames({}, availableEntries), ...requestedDesiredSkills]))
+        : resolveLegacyPaperclipDesiredSkillNames(config, availableEntries);
     const desiredSet = new Set(desiredSkills);
     const skillsHome = resolveSkillsRoot(config);
     await fs.mkdir(skillsHome, { recursive: true });

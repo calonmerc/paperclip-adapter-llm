@@ -15,7 +15,7 @@
  *   - Track usage and cost via OpenRouter's /generation endpoint (OpenRouter
  *     only — other providers don't have an equivalent, so cost stays null)
  *
- * Aligned with @paperclipai/adapter-utils 2026.428.0 API surface:
+ * Aligned with @paperclipai/adapter-utils 2026.916.1 API surface:
  *   - PaperclipApi exposes updateIssue / addIssueComment (not updateIssueState / addComment)
  *   - UsageSummary has only inputTokens / outputTokens / cachedInputTokens
  *   - AdapterExecutionResult requires exitCode / signal / timedOut; costUsd is top-level
@@ -31,10 +31,11 @@
  *   - Attachment / multimodal handling
  */
 import fs from "node:fs/promises";
-import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-utils";
+import { isPaperclipRuntimeEnvKey, joinPromptSections, renderPaperclipWakePrompt, selectPaperclipTaskMarkdown, } from "@paperclipai/adapter-utils/server-utils";
 import { DEFAULT_BASE_URL, resolveEndpoints, isOpenRouter, } from "../index.js";
 import { PaperclipApi } from "./paperclip-api.js";
-import { buildTools, toolSchemas, findTool } from "./tools.js";
+import { buildTools, toolSchemas, findTool, targetsCurrentIssue } from "./tools.js";
+import { collectBoundSecrets } from "./http-request.js";
 import { loadSkills, renderSkillsForPrompt, reconcilePaperclipSkills } from "./skills.js";
 import { emitInit, emitAssistant, emitThinking, emitToolCall, emitToolResult, emitResult, emitSystem, writeRawStderr, } from "./transcript.js";
 // ----- helpers -----
@@ -52,12 +53,18 @@ const DEFAULT_SYSTEM_PROMPT = "You are an AI agent working inside Paperclip, an 
     "multi-part interview), call list_interactions first to see everything already asked and answered " +
     "before asking a new round — get_issue and list_comments do not show interaction history, and you " +
     "have no memory of earlier runs otherwise. " +
-    "Every run must end with an explicit disposition via update_issue_status — there is no default. " +
-    "If the work is complete, call update_issue_status with status='done' and post a summary comment. " +
-    "If you're waiting on another agent, a delegated sub-issue, or anything else before you can continue, " +
-    "call update_issue_status with status='blocked' (or leave it in_progress if you will resume it yourself) " +
-    "and explain what you're waiting on — do not just describe that in a comment or plain text reply and " +
-    "stop, since nothing then marks the issue as unfinished. " +
+    "Every run must end with an explicit disposition on your issue — there is no default, and an issue " +
+    "left in_progress counts as a missing disposition. The only valid endings are: " +
+    "update_issue_status status='done' (finished) or 'cancelled'; status='blocked' WITH blocked_by_issue_ids " +
+    "(e.g. a sub-issue you delegated) and/or unblock_action (the concrete next step) — Paperclip rejects a " +
+    "bare 'blocked'; status='in_review' WITH reviewer_user_id; or ask_user_questions when a human must " +
+    "answer or act. Put your summary or explanation in update_issue_status's `comment`. Describing the " +
+    "state in a comment or a plain-text reply is not a disposition. If a status change is rejected, read " +
+    "the error — it says what's missing — and fix the call rather than giving up. " +
+    "If the wake says this is a disposition recovery, only record the disposition — do not redo the task. " +
+    "You have no shell, no bash, and no curl. To call an external API use http_request; reference bound " +
+    "credentials as {{secret:NAME}} (list_secrets shows the names) and never ask for, print, or store a " +
+    "secret's value. " +
     "For file-based memory skills (e.g. para-memory-files): use the memory_fs tool, not real filesystem " +
     "paths or shell commands — you have neither. Its scope='private' is what such skills call $AGENT_HOME " +
     "(only you can see it); scope='shared' is one directory every agent in this company can read and write " +
@@ -134,6 +141,84 @@ function extractCurrentIssueId(wake, context) {
             return c.trim();
     }
     return null;
+}
+function extractCurrentIssueIdentifier(wake, context) {
+    for (const source of [wake, context.paperclipWake, context]) {
+        if (!source || typeof source !== "object")
+            continue;
+        const issue = source.issue;
+        if (issue && typeof issue === "object") {
+            const identifier = issue.identifier;
+            if (typeof identifier === "string" && identifier.length > 0)
+                return identifier;
+        }
+    }
+    return null;
+}
+/**
+ * Paperclip's missing-disposition recovery (a "successful run handoff") puts
+ * its instructions at the top level of the run context — `handoffRequired`
+ * plus a ready-made `instruction` — not in paperclipWake, so the wake
+ * renderer never shows them. Without this, the corrective run looks like an
+ * ordinary wake: the model redoes the whole task (and can fail it again),
+ * spends Paperclip's single corrective attempt, and the issue escalates to
+ * the board with "Missing disposition recovery blocked".
+ */
+export function renderDispositionHandoffNote(context) {
+    const isHandoff = context.handoffRequired === true ||
+        context.wakeReason === "finish_successful_run_handoff" ||
+        context.handoffReason === "successful_run_missing_state";
+    if (!isHandoff)
+        return "";
+    const instruction = typeof context.instruction === "string" ? context.instruction.trim() : "";
+    return [
+        "# DISPOSITION RECOVERY — record a disposition, do NOT redo the work",
+        "Your previous run on this issue ended without a valid disposition. This run exists only to record one.",
+        "",
+        ...(instruction ? [instruction, ""] : []),
+        "## How to record each option with your tools",
+        "- Finished → update_issue_status status='done' (or 'cancelled'), with a short `comment`.",
+        "- Someone else must review → update_issue_status status='in_review' with reviewer_user_id, or ask_user_questions.",
+        "- Can't continue → update_issue_status status='blocked' with blocked_by_issue_ids and/or unblock_action.",
+        "- A human must answer or act → ask_user_questions.",
+        "- More work remains → create_sub_issue for it, then update_issue_status status='blocked' with blocked_by_issue_ids set to that sub-issue.",
+        "Do not call external APIs or repeat the task in this run.",
+    ].join("\n");
+}
+const SHELL_LIKE_TOOL_NAMES = new Set([
+    "bash", "sh", "shell", "zsh", "exec", "run", "run_command", "execute_command", "terminal",
+    "curl", "wget", "python", "python3", "node",
+]);
+/**
+ * Error body for a call to a tool that doesn't exist. Lists what does exist
+ * so the model can correct itself — a bare "Unknown tool: bash" gave it
+ * nothing to go on, and it retried the identical call until the
+ * repeat-loop breaker killed the run.
+ */
+function unknownToolError(toolName, tools) {
+    const available = tools.map((t) => t.schema.function.name);
+    const hasHttp = available.includes("http_request");
+    const hint = SHELL_LIKE_TOOL_NAMES.has(toolName.toLowerCase())
+        ? hasHttp
+            ? "There is no shell here. To call an external API use http_request, referencing bound credentials as {{secret:NAME}}."
+            : "There is no shell here, and no outbound HTTP tool is enabled for this agent."
+        : "Call one of the available tools instead — do not retry this one.";
+    return { error: `Unknown tool: ${toolName}`, hint, availableTools: available };
+}
+/**
+ * An issue patch for `blocked` that Paperclip will accept from an agent: it
+ * requires a blocker, a pending interaction/approval, or an unblockDescriptor,
+ * and only lets an agent name itself as the unblock owner.
+ */
+function blockedPatch(agentId, reason) {
+    return {
+        status: "blocked",
+        comment: `Run stopped: ${reason}`,
+        unblockDescriptor: {
+            owner: { agentId },
+            action: `Investigate and retry. The previous run stopped because: ${reason}`.slice(0, 2000),
+        },
+    };
 }
 function safeParseToolArgs(raw) {
     if (!raw || typeof raw !== "string")
@@ -227,6 +312,14 @@ export async function execute(ctx) {
     // the issue is now waiting on a human reply, so the post-loop disposition
     // logic below must not mark it "done".
     const interactionCreated = { value: false };
+    const currentIssueIdentifier = extractCurrentIssueIdentifier(wake, context);
+    // Bound secrets arrive already resolved in adapterConfig.env — the same map
+    // built-in adapters inject into their child process environment. This
+    // adapter has no child process, so they're exposed only through
+    // http_request's {{secret:NAME}} substitution. PAPERCLIP_* keys are
+    // Paperclip's own runtime namespace, not agent secrets.
+    const secrets = collectBoundSecrets(config.env, isPaperclipRuntimeEnvKey);
+    const secretNames = Object.keys(secrets).sort();
     if (authToken) {
         api = new PaperclipApi({ authToken });
         tools = buildTools({
@@ -234,9 +327,11 @@ export async function execute(ctx) {
             agentId: agent.id,
             companyId,
             currentIssueId,
+            currentIssueIdentifier,
             autoApprove,
             interactionCreated,
             config: config,
+            secrets,
         });
     }
     else {
@@ -244,6 +339,9 @@ export async function execute(ctx) {
     }
     // Emit init early so the run viewer renders the header.
     await emitInit(onLog, { model, sessionId: ctx.runId });
+    if (secretNames.length > 0 && tools.length > 0) {
+        await emitSystem(onLog, `Bound secrets available via http_request: ${secretNames.join(", ")}`);
+    }
     // ----- build messages -----
     const messages = [];
     // System prompt = base + skills + optional instructions file
@@ -304,9 +402,22 @@ export async function execute(ctx) {
     // so fall back to a concise three-line instruction so the model always has
     // something to act on.
     const resumedSession = !!ctx.runtime.sessionId;
+    // The server's task brief (issue description, acceptance criteria, ...),
+    // when it sends one. The wake prompt then omits its own copy of the
+    // description so the prompt carries it once — same as claude-local.
+    const taskContextNote = selectPaperclipTaskMarkdown(context, { resumedSession });
     let wakePrompt = "";
     try {
-        wakePrompt = renderPaperclipWakePrompt(wake, { resumedSession }) || "";
+        wakePrompt =
+            renderPaperclipWakePrompt(wake, {
+                resumedSession,
+                // Every run of this adapter starts from a fresh message list, so the
+                // disposition contract (what counts as a valid way to end the run)
+                // is always relevant — not only on resumed sessions, which is all
+                // the renderer includes it for by default.
+                includeExecutionContract: true,
+                suppressIssueDescription: taskContextNote.length > 0,
+            }) || "";
     }
     catch (err) {
         // Do not swallow this silently: renderPaperclipWakePrompt is what renders
@@ -321,6 +432,8 @@ export async function execute(ctx) {
         await writeRawStderr(onLog, `[llm] renderPaperclipWakePrompt threw, falling back to a generic prompt: ${reason}`);
         wakePrompt = "";
     }
+    const handoffNote = renderDispositionHandoffNote(context);
+    wakePrompt = joinPromptSections([handoffNote, wakePrompt, taskContextNote]);
     if (wakePrompt.trim().length === 0) {
         const issueLine = currentIssueId ? ` (issue ${currentIssueId})` : "";
         wakePrompt = [
@@ -392,7 +505,7 @@ export async function execute(ctx) {
         await writeRawStderr(onLog, `[llm] ${reason}\n`);
         if (api && currentIssueId) {
             await api
-                .updateIssue(currentIssueId, { status: "blocked", statusReason: reason })
+                .updateIssue(currentIssueId, blockedPatch(agent.id, reason))
                 .catch(() => undefined);
         }
         return {
@@ -414,8 +527,8 @@ export async function execute(ctx) {
     let turn = 0;
     let stoppedReason = "completed";
     let runError = null;
-    // Set when update_issue_status is called successfully — see the
-    // disposition-nudge block below, which exists because of a real,
+    // Set when update_issue_status records a disposition on the CURRENT issue
+    // — see the disposition-nudge block below, which exists because of a real,
     // observed failure mode: models confidently write "Done — closed as
     // done, verified in the API response" without ever having called the
     // tool. Left unfixed, that just re-triggers Paperclip's own
@@ -423,9 +536,28 @@ export async function execute(ctx) {
     // whole extra run and, per production evidence, doesn't reliably fix
     // the underlying habit either — it can recur run after run on the same
     // issue. One in-run corrective nudge is cheaper and more effective than
-    // waiting on the cross-run recovery loop.
-    let statusToolCalled = false;
+    // waiting on the cross-run recovery loop. This is only the fallback: the
+    // nudge decision asks Paperclip for the issue's real status first (see
+    // currentIssueNeedsDisposition), because "some update_issue_status call
+    // succeeded" also covered calls on a sub-issue.
+    let dispositionRecorded = false;
     let dispositionNudgeGiven = false;
+    // Set when the model already put its own words on the current issue, so
+    // the post-loop final-text comment would only be a duplicate.
+    let commentedOnCurrentIssue = false;
+    const currentIssueNeedsDisposition = async () => {
+        if (!api || !currentIssueId || interactionCreated.value)
+            return false;
+        try {
+            const issue = await api.getIssue(currentIssueId);
+            if (typeof issue.status === "string")
+                return issue.status === "in_progress";
+        }
+        catch {
+            // Fall back to what this run's own tool calls recorded.
+        }
+        return !dispositionRecorded;
+    };
     // Repeat-call detection: if the model calls the same tool with the same args
     // three times in a row, break the loop. Prevents 20+ retries when the model
     // misreads an error message and keeps "fixing" it the same wrong way.
@@ -472,16 +604,17 @@ export async function execute(ctx) {
             // give it exactly one chance to actually record a disposition if it
             // hasn't — see the dispositionNudgeGiven comment above.
             if (toolCalls.length === 0) {
-                if (!statusToolCalled && !interactionCreated.value && !dispositionNudgeGiven && turn < maxTurns) {
+                if (!dispositionNudgeGiven && turn < maxTurns && (await currentIssueNeedsDisposition())) {
                     dispositionNudgeGiven = true;
                     messages.push({
                         role: "user",
-                        content: "You did not call update_issue_status (or ask_user_questions) in that reply. Every run must " +
-                            "end with an explicit disposition — Paperclip cannot infer one from this text, no matter how " +
-                            "clearly it states the work is finished. If the work is actually complete, call " +
-                            "update_issue_status now with status='done'. If you're blocked or waiting on something, call " +
-                            "it with status='blocked' and say what you're waiting on. If you need human input, call " +
-                            "ask_user_questions instead. Do not just restate that you're finished — call the tool.",
+                        content: "Your issue is still in_progress: you did not record a disposition for it (a status change on " +
+                            "a different issue doesn't count). Every run must end with one — Paperclip cannot infer it " +
+                            "from text, no matter how clearly it states the work is finished. Call exactly one now: " +
+                            "update_issue_status status='done' (or 'cancelled') if the work is complete; status='blocked' " +
+                            "with blocked_by_issue_ids and/or unblock_action if you can't continue; status='in_review' " +
+                            "with reviewer_user_id if someone must review it; or ask_user_questions if a human must " +
+                            "answer. Do not just restate that you're finished — call the tool.",
                     });
                     continue;
                 }
@@ -507,7 +640,7 @@ export async function execute(ctx) {
                 let resultContent;
                 let isError;
                 if (!tool) {
-                    resultContent = JSON.stringify({ error: `Unknown tool: ${toolName}` });
+                    resultContent = JSON.stringify(unknownToolError(toolName, tools));
                     isError = true;
                 }
                 else {
@@ -529,8 +662,17 @@ export async function execute(ctx) {
                     content: resultContent,
                     isError,
                 });
-                if (toolName === "update_issue_status" && !isError)
-                    statusToolCalled = true;
+                if (!isError && targetsCurrentIssue({ currentIssueId, currentIssueIdentifier }, args.issue_id)) {
+                    // update_issue_status refuses non-disposition statuses on the
+                    // current issue, so any success here is a real disposition.
+                    if (toolName === "update_issue_status") {
+                        dispositionRecorded = true;
+                        if (typeof args.comment === "string" && args.comment.trim())
+                            commentedOnCurrentIssue = true;
+                    }
+                    if (toolName === "add_comment")
+                        commentedOnCurrentIssue = true;
+                }
                 messages.push({
                     role: "tool",
                     tool_call_id: tc.id,
@@ -587,7 +729,10 @@ export async function execute(ctx) {
         }
     }
     // Post the final assistant text as a comment so other agents can see it.
-    if (api && currentIssueId && finalAssistantText.trim().length > 0) {
+    // Skip it when the model already commented on the issue itself: the text
+    // would be a duplicate, and an extra comment also makes an otherwise idle
+    // run look "productive" to Paperclip's missing-disposition check.
+    if (api && currentIssueId && finalAssistantText.trim().length > 0 && !commentedOnCurrentIssue) {
         try {
             await api.addIssueComment(currentIssueId, { body: finalAssistantText });
         }
@@ -597,6 +742,7 @@ export async function execute(ctx) {
         }
     }
     // Update issue status based on outcome.
+    const secondaryErrors = [];
     if (api && currentIssueId) {
         let nextStatus = null;
         let statusReason = null;
@@ -631,9 +777,16 @@ export async function execute(ctx) {
             nextStatus = "blocked";
             statusReason = runError.message;
         }
-        if (nextStatus) {
+        if (nextStatus && statusReason) {
+            // Paperclip rejects entering `blocked` without blockers, a pending
+            // interaction/approval, or an unblockDescriptor — so a bare
+            // {status: "blocked"} (what this used to send) always failed with a
+            // 422. The reason goes in `comment`, written in the same transaction;
+            // `statusReason` isn't part of Paperclip's issue-update schema and
+            // was silently dropped.
+            const patch = blockedPatch(agent.id, statusReason);
             try {
-                await api.updateIssue(currentIssueId, { status: nextStatus, statusReason });
+                await api.updateIssue(currentIssueId, patch);
             }
             catch (firstErr) {
                 // One retry: the most common cause is a transient sameRunLock 409
@@ -641,23 +794,31 @@ export async function execute(ctx) {
                 // own lock, which often clears within a second.
                 await new Promise((r) => setTimeout(r, 750));
                 try {
-                    await api.updateIssue(currentIssueId, { status: nextStatus, statusReason });
+                    await api.updateIssue(currentIssueId, patch);
                 }
                 catch (err) {
                     const reason = err instanceof Error ? err.message : String(err);
                     await writeRawStderr(onLog, `[llm] could not update final status: ${reason}`);
+                    // The comment rode on the failed update — post it on its own so
+                    // the issue still says why the run stopped.
+                    await api
+                        .addIssueComment(currentIssueId, { body: `Run stopped: ${statusReason}` })
+                        .catch(() => undefined);
                     // A run that fails to record its own disposition must not report
                     // success. Paperclip's "successful run, issue still in_progress"
                     // recovery flow (missing_disposition) only fires when the run
                     // itself reports success — swallowing this failure here would
                     // produce exactly that failure mode instead of Paperclip's normal,
-                    // honest run-failure handling.
-                    if (stoppedReason !== "error") {
-                        stoppedReason = "error";
-                        runError = {
-                            message: `Failed to record final issue status (${nextStatus}): ${reason}`,
-                            code: "issue_status_update_failed",
-                        };
+                    // honest run-failure handling. The original failure (e.g. the
+                    // repeat loop) stays the primary error: replacing it with the
+                    // status-write failure hid why the run actually stopped.
+                    const statusFailure = `Failed to record final issue status (${nextStatus}): ${reason}`;
+                    stoppedReason = "error";
+                    if (runError) {
+                        secondaryErrors.push(statusFailure);
+                    }
+                    else {
+                        runError = { message: statusFailure, code: "issue_status_update_failed" };
                     }
                 }
             }
@@ -671,14 +832,14 @@ export async function execute(ctx) {
         costUsd: costUsd ?? 0,
         subtype: stoppedReason,
         isError: stoppedReason === "error",
-        errors: runError ? [runError.message] : [],
+        errors: runError ? [runError.message, ...secondaryErrors] : secondaryErrors,
     });
     if (stoppedReason === "error" && runError) {
         return {
             exitCode: 1,
             signal: null,
             timedOut: false,
-            errorMessage: runError.message,
+            errorMessage: [runError.message, ...secondaryErrors].join(" — also: "),
             errorCode: runError.code,
             usage: totalUsage,
             model,

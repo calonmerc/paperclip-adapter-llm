@@ -81,6 +81,23 @@ export function getConfigSchema(): AdapterConfigSchema {
         hint: "Skip approval gates for hire_agent and similar mutating tools.",
       },
       {
+        key: "httpToolEnabled",
+        label: "Enable outbound HTTP tool",
+        type: "toggle",
+        default: false,
+        hint:
+          "Give the agent the http_request tool even with no bound secrets. It's enabled automatically " +
+          "whenever secrets are bound, so the agent can use them via {{secret:NAME}}.",
+      },
+      {
+        key: "httpAllowedHosts",
+        label: "Allowed HTTP hosts",
+        type: "text",
+        hint:
+          "Comma-separated hosts http_request may call, e.g. searchconsole.googleapis.com, *.umami.is. " +
+          "Leave empty to allow any host. oauth2.googleapis.com is always reachable for service-account auth.",
+      },
+      {
         key: "skillsDir",
         label: "Skills directory",
         type: "text",

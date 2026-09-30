@@ -1,5 +1,79 @@
 # Changelog
 
+## [0.12.0] - 2026-09-30
+
+### Fixed — "missing disposition" errors
+Traced against the Paperclip server source (`@paperclipai/server@2026.916.1`:
+`decideSuccessfulRunHandoff`, the issue-update route) rather than guessed.
+A successful run that leaves its issue `in_progress` gets one corrective
+"handoff" wake. If that run also fails to record a disposition, the issue
+escalates to the board. The adapter was feeding that loop in several ways:
+
+- **A bare `blocked` always failed.** Paperclip 422s entering `blocked`
+  without blockers, a pending interaction/approval, or an
+  `unblockDescriptor`. `update_issue_status` couldn't send any of those, yet
+  the system prompt told the model to use `blocked` when waiting. The model's
+  write failed, the run exited 0, and the issue stayed `in_progress`. The
+  tool now takes `blocked_by_issue_ids` / `unblock_action` (sent as an
+  `unblockDescriptor` owned by the agent itself, the only owner Paperclip
+  allows an agent to name) and refuses a bare `blocked` locally, with the fix
+  in the error. The adapter's own post-loop `blocked` (max_turns, repeat
+  loop, LLM error) now sends a descriptor too. That write is the "Entering
+  blocked requires…" error in DEBA-39's run log.
+- **Every "reason" was silently dropped.** `statusReason` isn't in
+  Paperclip's issue-update schema, and zod strips unknown keys. Explanations
+  now go in `comment`, which Paperclip writes in the same transaction as the
+  status change.
+- **The system prompt said "leave it in_progress if you will resume it
+  yourself"**, which is exactly what counts as a missing disposition.
+  Rewritten to list only the endings Paperclip accepts, with the arguments
+  each one needs.
+- **The in-run nudge could be skipped.** It only fired if no
+  `update_issue_status` call had succeeded at all, so marking a sub-issue
+  done, or setting `in_progress`, suppressed it. It now asks Paperclip for
+  the issue's real status first.
+- **`in_review` without a reviewer failed with 422.** The tool now takes
+  `reviewer_user_id`.
+- **Corrective handoff wakes weren't recognizable.** Paperclip puts the
+  "record a disposition only, don't redo the work" instructions at the top
+  level of the run context, not in the wake payload, so the model treated
+  DEBA-39's corrective run as a fresh task. The adapter now renders those
+  instructions at the top of the prompt, with each option mapped to a tool
+  call.
+- **The final-text comment is skipped when the model already commented** on
+  its issue. It was a duplicate, and it made otherwise idle runs look
+  "productive" to the handoff check.
+- **A status-write failure no longer hides the real error.** When the
+  repeat-loop breaker (or another failure) is followed by a failed `blocked`
+  write, the original failure stays primary and the reason is still posted
+  to the issue as a comment.
+
+### Added
+- **Bound secrets and outbound HTTP.** Paperclip resolves bound secrets into
+  `adapterConfig.env`, and this adapter used to ignore it. So an agent told
+  to use `GSC_SERVICE_ACCOUNT` / `UMAMI_API_KEY` had no way to reach them,
+  and improvised `bash` + `curl` against a made-up endpoint
+  (`/api/agents/me/secrets`). New tools:
+  - `list_secrets` returns names only.
+  - `http_request` supports `{{secret:NAME}}` substitution, Google
+    service-account auth (RS256 JWT → access token, cached per run),
+    redaction of secret values and tokens from all output, a 32 KB response
+    cap, and a 30 s timeout.
+
+  Both tools are registered only when secrets are bound; `httpToolEnabled`
+  and `httpAllowedHosts` are new config fields.
+- Calling an unknown tool now returns the available tool names, plus an
+  `http_request` hint for shell-like names like `bash`/`curl`.
+- The wake prompt now uses adapter-utils' execution contract, and shows the
+  server's task markdown (`paperclipTaskMarkdown`) when present.
+
+### Changed
+- `@paperclipai/adapter-utils` and `@paperclipai/shared` upgraded from
+  2026.428.0 to 2026.916.1. Skill reconciliation now uses
+  `resolveLegacyPaperclipDesiredSkillNames`, which always mounts the
+  operational `paperclip` skill; upstream removed the per-entry `required`
+  flag.
+
 ## [0.11.1] - 2026-09-29
 
 ### Fixed

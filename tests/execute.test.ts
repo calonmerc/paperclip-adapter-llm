@@ -360,7 +360,7 @@ describe("execute()", () => {
     expect(chatCalls.length).toBe(3);
     // The nudge is a plain user-role message, not a tool result — confirm it reached the model.
     const nudgedCallMessages = (chatCalls[1]!.body as any).messages as Array<{ role: string; content: string }>;
-    expect(nudgedCallMessages.some((m) => m.role === "user" && m.content.includes("did not call update_issue_status"))).toBe(true);
+    expect(nudgedCallMessages.some((m) => m.role === "user" && m.content.includes("did not record a disposition"))).toBe(true);
 
     expect(result.exitCode).toBe(0);
     const issuePatchCalls = fetchMock.calls.filter(
@@ -589,7 +589,15 @@ describe("execute()", () => {
         (c.body as any)?.status === "blocked",
     );
     expect(blocked).toBeDefined();
-    expect((blocked!.body as any).statusReason).toContain("stuck in a retry loop");
+    // A bare {status: "blocked"} is rejected by Paperclip (422) — it needs an
+    // unblockDescriptor naming this agent, and the reason goes in `comment`
+    // (statusReason isn't part of the issue-update schema).
+    expect((blocked!.body as any).comment).toContain("stuck in a retry loop");
+    expect((blocked!.body as any).unblockDescriptor).toEqual({
+      owner: { agentId: "agent-1" },
+      action: expect.stringContaining("stuck in a retry loop"),
+    });
+    expect((blocked!.body as any).statusReason).toBeUndefined();
 
     const resultEntry = findTranscriptResultEntry(ctx);
     expect(resultEntry?.subtype).toBe("repeat_loop");
@@ -609,9 +617,172 @@ describe("execute()", () => {
         (c.body as any)?.status === "blocked",
     );
     expect(blocked).toBeDefined();
-    expect((blocked!.body as any).statusReason).toContain("max_turns");
+    expect((blocked!.body as any).comment).toContain("max_turns");
+    expect((blocked!.body as any).unblockDescriptor?.owner).toEqual({ agentId: "agent-1" });
 
     const resultEntry = findTranscriptResultEntry(ctx);
     expect(resultEntry?.subtype).toBe("max_turns");
+  });
+
+  // Wraps the recording mock so GET /api/issues/issue-1 reports a real status.
+  function withIssueStatus(status: string) {
+    const recordingFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: any, init?: any) => {
+      const url = typeof input === "string" ? input : input.url;
+      const method = (init?.method || "GET").toUpperCase();
+      if (method === "GET" && new URL(url).pathname === "/api/issues/issue-1") {
+        return new Response(JSON.stringify({ id: "issue-1", status }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return recordingFetch(input, init);
+    }) as typeof fetch;
+  }
+
+  it("still nudges when the model marked a SUB-issue done but its own issue is still in_progress", async () => {
+    // Regression guard: the nudge used to be skipped after ANY successful
+    // update_issue_status call — including one on a different issue — so the
+    // run ended with its own issue in_progress and Paperclip's
+    // missing-disposition recovery fired.
+    fetchMock = setupFetchMock([
+      toolCallResponse([{ id: "c1", name: "update_issue_status", args: { issue_id: "issue-2", status: "done" } }]),
+      assistantResponse("All wrapped up."),
+      toolCallResponse([{ id: "c2", name: "update_issue_status", args: { status: "done" } }]),
+      assistantResponse("Done."),
+    ]);
+    withIssueStatus("in_progress");
+
+    await execute(makeContext());
+
+    const chatCalls = fetchMock.calls.filter((c) => c.path.endsWith("/chat/completions"));
+    const nudged = (chatCalls[2]!.body as any).messages as Array<{ role: string; content: string }>;
+    expect(nudged.some((m) => m.role === "user" && m.content.includes("did not record a disposition"))).toBe(true);
+  });
+
+  it("does not nudge when Paperclip already reports the issue out of in_progress", async () => {
+    fetchMock = setupFetchMock([assistantResponse("Done.")]);
+    withIssueStatus("done");
+
+    await execute(makeContext());
+
+    expect(fetchMock.calls.filter((c) => c.path.endsWith("/chat/completions")).length).toBe(1);
+  });
+
+  it("renders Paperclip's disposition-recovery instruction on a successful-run handoff wake", async () => {
+    // DEBA-39: the corrective handoff run looked like an ordinary wake, so the
+    // model redid the whole task instead of recording a disposition.
+    fetchMock = setupFetchMock([assistantResponse("ok")]);
+
+    await execute(
+      makeContext({
+        context: {
+          issueId: "issue-1",
+          handoffRequired: true,
+          wakeReason: "finish_successful_run_handoff",
+          instruction: "## What happened\nYour last run on this issue ended successfully, but the issue is still `in_progress`.",
+        },
+      }),
+    );
+
+    const firstChat = fetchMock.calls.find((c) => c.path.endsWith("/chat/completions"))!;
+    const userMsg = ((firstChat.body as any).messages as Array<{ role: string; content: string }>).find((m) => m.role === "user")!;
+    expect(userMsg.content).toContain("DISPOSITION RECOVERY");
+    expect(userMsg.content).toContain("Your last run on this issue ended successfully");
+    expect(userMsg.content).toContain("unblock_action");
+  });
+
+  it("keeps the repeat-loop failure as the primary error when the blocked write also fails", async () => {
+    const repeatedCall = toolCallResponse([{ id: "call-x", name: "list_agents", args: {} }]);
+    fetchMock = setupFetchMock([repeatedCall, repeatedCall, repeatedCall]);
+    const recordingFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: any, init?: any) => {
+      const url = typeof input === "string" ? input : input.url;
+      const method = (init?.method || "GET").toUpperCase();
+      const body = init?.body ? JSON.parse(String(init.body)) : undefined;
+      if (method === "PATCH" && new URL(url).pathname === "/api/issues/issue-1" && body?.status === "blocked") {
+        return new Response(JSON.stringify({ error: "Issue run ownership conflict" }), {
+          status: 409,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return recordingFetch(input, init);
+    }) as typeof fetch;
+
+    const result = await execute(makeContext());
+
+    expect(result.exitCode).toBe(1);
+    expect(result.errorCode).toBe("tool_repeat_loop");
+    expect(result.errorMessage).toMatch(/^Tool "list_agents" was called 3 times/);
+    expect(result.errorMessage).toContain("Failed to record final issue status (blocked)");
+    // The reason still lands on the issue as a standalone comment.
+    const comments = fetchMock.calls.filter((c) => c.method === "POST" && c.path === "/api/issues/issue-1/comments");
+    expect(comments.some((c) => String((c.body as any)?.body).includes("stuck in a retry loop"))).toBe(true);
+  });
+
+  it("skips the final-text comment when the model already commented on its issue", async () => {
+    fetchMock = setupFetchMock([
+      toolCallResponse([
+        { id: "c1", name: "add_comment", args: { body: "Totals: 10 clicks." } },
+        { id: "c2", name: "update_issue_status", args: { status: "done" } },
+      ]),
+      assistantResponse("Posted the totals and closed it."),
+    ]);
+
+    await execute(makeContext());
+
+    const comments = fetchMock.calls.filter((c) => c.method === "POST" && c.path === "/api/issues/issue-1/comments");
+    expect(comments.length).toBe(1);
+    expect((comments[0]!.body as any).body).toBe("Totals: 10 clicks.");
+  });
+
+  it("exposes bound secrets from config.env via list_secrets/http_request, never PAPERCLIP_* keys or values", async () => {
+    fetchMock = setupFetchMock([
+      toolCallResponse([{ id: "c1", name: "list_secrets", args: {} }]),
+      toolCallResponse([{ id: "c2", name: "update_issue_status", args: { status: "done" } }]),
+      assistantResponse("ok"),
+    ]);
+
+    const ctx = makeContext({
+      config: {
+        model: "x",
+        apiKey: "k",
+        env: { UMAMI_API_KEY: "umami-secret-value", PAPERCLIP_API_KEY: "nope", PAPERCLIP_RUN_ID: "r" },
+      } as any,
+    });
+    await execute(ctx);
+
+    const firstChat = fetchMock.calls.find((c) => c.path.endsWith("/chat/completions"))!;
+    const toolNames = ((firstChat.body as any).tools as Array<{ function: { name: string } }>).map((t) => t.function.name);
+    expect(toolNames).toEqual(expect.arrayContaining(["list_secrets", "http_request"]));
+
+    const secondChat = fetchMock.calls.filter((c) => c.path.endsWith("/chat/completions"))[1]!;
+    const toolResult = ((secondChat.body as any).messages as Array<{ role: string; content: string }>).find((m) => m.role === "tool")!;
+    expect(JSON.parse(toolResult.content)).toEqual({ secrets: ["UMAMI_API_KEY"] });
+
+    const logged = (ctx.onLog as any).mock.calls.map((c: [string, string]) => c[1]).join("\n");
+    expect(logged).toContain("UMAMI_API_KEY");
+    expect(logged).not.toContain("umami-secret-value");
+    for (const call of fetchMock.calls.filter((c) => c.path.endsWith("/chat/completions"))) {
+      expect(JSON.stringify(call.body)).not.toContain("umami-secret-value");
+    }
+  });
+
+  it("answers a call to a nonexistent shell tool with the available tools and an http_request hint", async () => {
+    fetchMock = setupFetchMock([
+      toolCallResponse([{ id: "c1", name: "bash", args: { command: "curl https://x" } }]),
+      toolCallResponse([{ id: "c2", name: "update_issue_status", args: { status: "done" } }]),
+      assistantResponse("ok"),
+    ]);
+
+    await execute(makeContext({ config: { model: "x", apiKey: "k", env: { K: "value-1234" } } as any }));
+
+    const secondChat = fetchMock.calls.filter((c) => c.path.endsWith("/chat/completions"))[1]!;
+    const toolResult = JSON.parse(
+      ((secondChat.body as any).messages as Array<{ role: string; content: string }>).find((m) => m.role === "tool")!.content,
+    );
+    expect(toolResult.error).toBe("Unknown tool: bash");
+    expect(toolResult.hint).toContain("http_request");
+    expect(toolResult.availableTools).toEqual(expect.arrayContaining(["update_issue_status", "http_request"]));
   });
 });
