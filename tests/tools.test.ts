@@ -11,6 +11,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { PaperclipApi } from "../src/server/paperclip-api.js";
 import { buildTools, findTool, toolSchemas } from "../src/server/tools.js";
+import { SecretStore } from "../src/server/http-request.js";
 
 function makeApi(fetchImpl: typeof fetch): PaperclipApi {
   return new PaperclipApi({ authToken: "test-token", baseUrl: "http://localhost:9999", fetchImpl });
@@ -964,5 +965,74 @@ describe("secrets & http_request", () => {
     expect(result.isError).toBe(true);
     expect(result.content).toContain("not valid JSON");
     expect(result.content).not.toContain("not-json-at-all");
+  });
+});
+
+describe("API-access secrets (GET /agents/me/secrets, fetched on demand)", () => {
+  const originalFetch = globalThis.fetch;
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  function fakeSecretApi(values: Record<string, string>) {
+    const valueFetches: string[] = [];
+    return {
+      valueFetches,
+      api: {
+        listAgentSecretAccess: async () => ({ secrets: Object.keys(values).map((key) => ({ key })) }),
+        getAgentSecretValue: async (key: string) => {
+          valueFetches.push(key);
+          return { key, value: values[key]! };
+        },
+      },
+    };
+  }
+
+  async function toolsWithStore(env: Record<string, string>, apiValues: Record<string, string>) {
+    const fake = fakeSecretApi(apiValues);
+    const secretStore = new SecretStore(env, fake.api);
+    await secretStore.init();
+    const api = makeApi(async () => jsonResponse({}));
+    const tools = buildTools({ api, agentId: "agent-1", companyId: "company-1", currentIssueId: "issue-1", autoApprove: false, secretStore });
+    return { tools, ...fake };
+  }
+
+  it("lists API-access and env-var secret names together, and registers http_request for API-access-only agents", async () => {
+    const { tools, valueFetches } = await toolsWithStore({ ENV_KEY: "env-value" }, { UMAMI_API_KEY: "umami-value-123" });
+    const result = await findTool(tools, "list_secrets")!.execute({});
+    expect(JSON.parse(result.content)).toEqual({ secrets: ["ENV_KEY", "UMAMI_API_KEY"] });
+    expect(valueFetches).toEqual([]); // listing never fetches values
+    expect(findTool((await toolsWithStore({}, { K: "vvvv" })).tools, "http_request")).not.toBeNull();
+  });
+
+  it("fetches an API-access value only when referenced, caches it, and redacts it", async () => {
+    const { tools, valueFetches } = await toolsWithStore({}, { UMAMI_API_KEY: "umami-value-123", UNUSED: "unused-value" });
+    let sentHeader: string | undefined;
+    globalThis.fetch = (async (_input: any, init: any) => {
+      sentHeader = init.headers["x-umami-api-key"];
+      return jsonResponse({ echoed: sentHeader, pageviews: 7 });
+    }) as typeof fetch;
+
+    const tool = findTool(tools, "http_request")!;
+    const args = { url: "https://umami.example.com/api", headers: { "x-umami-api-key": "{{secret:UMAMI_API_KEY}}" } };
+    const first = await tool.execute(args);
+    await tool.execute(args);
+
+    expect(sentHeader).toBe("umami-value-123");
+    expect(valueFetches).toEqual(["UMAMI_API_KEY"]);
+    expect(first.content).not.toContain("umami-value-123");
+    expect(first.content).toContain('\\"pageviews\\":7');
+  });
+
+  it("resolves a Google service-account key from an API-access binding for auth", async () => {
+    const { tools, valueFetches } = await toolsWithStore({}, { GSC_SERVICE_ACCOUNT: "not-json-key" });
+    globalThis.fetch = (async () => jsonResponse({})) as typeof fetch;
+    const result = await findTool(tools, "http_request")!.execute({
+      url: "https://searchconsole.googleapis.com/x",
+      auth: { type: "google_service_account", secret: "GSC_SERVICE_ACCOUNT", scopes: ["s"] },
+    });
+    expect(valueFetches).toEqual(["GSC_SERVICE_ACCOUNT"]);
+    expect(result.content).toContain("not valid JSON"); // got the value, then parsed it
+    expect(result.content).not.toContain("not-json-key");
   });
 });

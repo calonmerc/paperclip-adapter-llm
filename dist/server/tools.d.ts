@@ -12,6 +12,7 @@
  * normalizes for any provider that supports tools.
  */
 import { PaperclipApi } from "./paperclip-api.js";
+import { SecretStore } from "./http-request.js";
 export interface ToolSchema {
     type: "function";
     function: {
@@ -49,9 +50,12 @@ export interface BuildToolsContext {
     /** Raw adapterConfig, needed by memory_fs to resolve agentHomeDir. */
     config?: Record<string, unknown>;
     /**
-     * Bound secrets (resolved from adapterConfig.env by Paperclip), by name.
-     * Only ever substituted into http_request calls — never returned to the model.
+     * Every secret bound to this agent — env-var bindings and API-access
+     * bindings. Only ever substituted into http_request calls; values are
+     * never returned to the model.
      */
+    secretStore?: SecretStore;
+    /** Shorthand for a store holding only these env-var secrets (tests, direct calls). */
     secrets?: Record<string, string>;
 }
 /** True when `issueId` (absent, the current issue's id, or its identifier) targets the current issue. */

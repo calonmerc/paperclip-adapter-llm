@@ -239,6 +239,18 @@ export class PaperclipApi {
     return this.request("POST", `/api/agents/${encodeURIComponent(agentId)}/wakeup`, body);
   }
 
+  // ----- Secrets (API-access bindings; requires the run-bound agent JWT) -----
+
+  /** Secrets bound to this agent with "API access" — metadata only, never values. */
+  listAgentSecretAccess(): Promise<{ secrets: Array<{ key: string; [k: string]: unknown }> }> {
+    return this.request("GET", "/api/agents/me/secrets");
+  }
+
+  /** Resolve one API-access secret's value by its alias. Paperclip registers it for run-log redaction. */
+  getAgentSecretValue(key: string): Promise<{ key: string; value: string }> {
+    return this.request("POST", `/api/agents/me/secrets/${encodeURIComponent(key)}/value`);
+  }
+
   // ----- Approvals -----
 
   createApproval(companyId: string, approval: Record<string, unknown>): Promise<Record<string, unknown>> {

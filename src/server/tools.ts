@@ -25,10 +25,13 @@ import {
   MAX_RESPONSE_CHARS,
   REQUEST_TIMEOUT_MS,
   SecretReferenceError,
+  SecretStore,
   fetchGoogleAccessToken,
   hostAllowed,
   parseAllowedHosts,
   redactSecrets,
+  referencedSecretNames,
+  resolveSecrets,
   substituteSecrets,
   substituteSecretsDeep,
 } from "./http-request.js";
@@ -71,9 +74,12 @@ export interface BuildToolsContext {
   /** Raw adapterConfig, needed by memory_fs to resolve agentHomeDir. */
   config?: Record<string, unknown>;
   /**
-   * Bound secrets (resolved from adapterConfig.env by Paperclip), by name.
-   * Only ever substituted into http_request calls — never returned to the model.
+   * Every secret bound to this agent — env-var bindings and API-access
+   * bindings. Only ever substituted into http_request calls; values are
+   * never returned to the model.
    */
+  secretStore?: SecretStore;
+  /** Shorthand for a store holding only these env-var secrets (tests, direct calls). */
   secrets?: Record<string, string>;
 }
 
@@ -907,6 +913,17 @@ function issueDocumentTool(ctx: BuildToolsContext): Tool {
   };
 }
 
+const defaultStores = new WeakMap<BuildToolsContext, SecretStore>();
+function secretStoreFor(ctx: BuildToolsContext): SecretStore {
+  if (ctx.secretStore) return ctx.secretStore;
+  let store = defaultStores.get(ctx);
+  if (!store) {
+    store = new SecretStore(ctx.secrets ?? {});
+    defaultStores.set(ctx, store);
+  }
+  return store;
+}
+
 function listSecretsTool(ctx: BuildToolsContext): Tool {
   return {
     schema: {
@@ -919,19 +936,19 @@ function listSecretsTool(ctx: BuildToolsContext): Tool {
         parameters: { type: "object", properties: {} },
       },
     },
-    execute: async () => ok({ secrets: Object.keys(ctx.secrets ?? {}).sort() }),
+    execute: async () => ok({ secrets: secretStoreFor(ctx).names() }),
   };
 }
 
 const HTTP_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"];
 
 function httpRequestTool(ctx: BuildToolsContext): Tool {
-  const secrets = ctx.secrets ?? {};
+  const store = secretStoreFor(ctx);
   const allowedHosts = parseAllowedHosts(ctx.config?.httpAllowedHosts);
   // Access tokens minted from a secret are as sensitive as the secret itself:
   // cache them for the run and redact them alongside the raw values.
   const tokenCache = new Map<string, string>();
-  const sensitive = () => [...Object.values(secrets), ...tokenCache.values()];
+  const sensitive = () => [...store.sensitiveValues(), ...tokenCache.values()];
 
   return {
     schema: {
@@ -985,6 +1002,15 @@ function httpRequestTool(ctx: BuildToolsContext): Tool {
       let url: URL;
       const headers: Record<string, string> = {};
       let body: string | undefined;
+      let secrets: Record<string, string>;
+      try {
+        // API-access secrets are fetched from Paperclip on demand, so resolve
+        // everything this request references before substituting.
+        secrets = await resolveSecrets(referencedSecretNames([args.url, args.headers, args.query, args.body]), store);
+      } catch (err) {
+        if (err instanceof SecretReferenceError) return fail(err.message);
+        return fail(`Could not load secret: ${redact(err instanceof Error ? err.message : String(err))}`);
+      }
       try {
         const rawUrl = asString(args.url);
         if (!rawUrl) return fail("url is required.");
@@ -1026,10 +1052,7 @@ function httpRequestTool(ctx: BuildToolsContext): Tool {
       if (auth) {
         if (auth.type !== "google_service_account") return fail("auth.type must be 'google_service_account'.");
         const secretName = asString(auth.secret);
-        if (!Object.prototype.hasOwnProperty.call(secrets, secretName)) {
-          const known = Object.keys(secrets);
-          return fail(`Unknown secret '${secretName}'. Bound secrets: ${known.length > 0 ? known.join(", ") : "(none)"}.`);
-        }
+        if (!store.has(secretName)) return fail(store.unknownMessage(secretName));
         const scopes = Array.isArray(auth.scopes)
           ? auth.scopes.filter((s): s is string => typeof s === "string" && s.length > 0)
           : [];
@@ -1038,7 +1061,7 @@ function httpRequestTool(ctx: BuildToolsContext): Tool {
         try {
           let token = tokenCache.get(cacheKey);
           if (!token) {
-            token = await fetchGoogleAccessToken(secrets[secretName]!, scopes);
+            token = await fetchGoogleAccessToken(await store.get(secretName), scopes);
             tokenCache.set(cacheKey, token);
           }
           headers.Authorization = `Bearer ${token}`;
@@ -1079,7 +1102,7 @@ function httpRequestTool(ctx: BuildToolsContext): Tool {
 export function buildTools(ctx: BuildToolsContext): Tool[] {
   // http_request is opt-in: agents with no bound secrets keep a no-network
   // toolset unless an operator explicitly enables it.
-  const hasSecrets = Object.keys(ctx.secrets ?? {}).length > 0;
+  const hasSecrets = secretStoreFor(ctx).names().length > 0;
   const httpEnabled = hasSecrets || ctx.config?.httpToolEnabled === true;
   return [
     getIssueTool(ctx),

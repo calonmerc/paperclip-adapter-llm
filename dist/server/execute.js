@@ -35,7 +35,7 @@ import { isPaperclipRuntimeEnvKey, joinPromptSections, renderPaperclipWakePrompt
 import { DEFAULT_BASE_URL, resolveEndpoints, isOpenRouter, } from "../index.js";
 import { PaperclipApi } from "./paperclip-api.js";
 import { buildTools, toolSchemas, findTool, targetsCurrentIssue } from "./tools.js";
-import { collectBoundSecrets } from "./http-request.js";
+import { collectBoundSecrets, SecretStore } from "./http-request.js";
 import { loadSkills, renderSkillsForPrompt, reconcilePaperclipSkills } from "./skills.js";
 import { emitInit, emitAssistant, emitThinking, emitToolCall, emitToolResult, emitResult, emitSystem, writeRawStderr, } from "./transcript.js";
 // ----- helpers -----
@@ -313,15 +313,19 @@ export async function execute(ctx) {
     // logic below must not mark it "done".
     const interactionCreated = { value: false };
     const currentIssueIdentifier = extractCurrentIssueIdentifier(wake, context);
-    // Bound secrets arrive already resolved in adapterConfig.env — the same map
-    // built-in adapters inject into their child process environment. This
-    // adapter has no child process, so they're exposed only through
-    // http_request's {{secret:NAME}} substitution. PAPERCLIP_* keys are
-    // Paperclip's own runtime namespace, not agent secrets.
-    const secrets = collectBoundSecrets(config.env, isPaperclipRuntimeEnvKey);
-    const secretNames = Object.keys(secrets).sort();
+    // Paperclip has two secret binding modes. Env-var bindings arrive already
+    // resolved in adapterConfig.env — the same map built-in adapters inject
+    // into their child process environment (PAPERCLIP_* keys are Paperclip's
+    // own runtime namespace, not agent secrets). API-access bindings never
+    // touch the env: they're listed and fetched on demand through the
+    // run-bound agent API. This adapter has no child process, so both are
+    // exposed only through http_request's {{secret:NAME}} substitution.
+    const envSecrets = collectBoundSecrets(config.env, isPaperclipRuntimeEnvKey);
+    let secretStore = new SecretStore(envSecrets);
     if (authToken) {
         api = new PaperclipApi({ authToken });
+        secretStore = new SecretStore(envSecrets, api);
+        await secretStore.init((reason) => writeRawStderr(onLog, `[llm] could not list API-access secrets (continuing without them): ${reason}`));
         tools = buildTools({
             api,
             agentId: agent.id,
@@ -331,7 +335,7 @@ export async function execute(ctx) {
             autoApprove,
             interactionCreated,
             config: config,
-            secrets,
+            secretStore,
         });
     }
     else {
@@ -339,6 +343,7 @@ export async function execute(ctx) {
     }
     // Emit init early so the run viewer renders the header.
     await emitInit(onLog, { model, sessionId: ctx.runId });
+    const secretNames = secretStore.names();
     if (secretNames.length > 0 && tools.length > 0) {
         await emitSystem(onLog, `Bound secrets available via http_request: ${secretNames.join(", ")}`);
     }

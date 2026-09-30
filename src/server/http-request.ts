@@ -40,6 +40,96 @@ export function collectBoundSecrets(
   return secrets;
 }
 
+/** The slice of PaperclipApi the store needs (kept narrow for tests). */
+export interface AgentSecretAccessApi {
+  listAgentSecretAccess(): Promise<{ secrets: Array<{ key: string }> }>;
+  getAgentSecretValue(key: string): Promise<{ key: string; value: string }>;
+}
+
+/**
+ * Every secret this run can use, from both of Paperclip's binding modes:
+ *   - env-var bindings: resolved into adapterConfig.env before the run
+ *   - API-access bindings: never in the env; listed via GET /agents/me/secrets
+ *     and each value fetched on demand via POST /agents/me/secrets/:key/value
+ * API-access values are fetched only when a request actually references
+ * them, then cached for the run. Every value ever resolved is tracked so it
+ * can be redacted from anything shown to the model.
+ */
+export class SecretStore {
+  private readonly env: Record<string, string>;
+  private readonly api: AgentSecretAccessApi | null;
+  private apiKeys: Set<string> = new Set();
+  private readonly fetched = new Map<string, string>();
+
+  constructor(env: Record<string, string> = {}, api: AgentSecretAccessApi | null = null) {
+    this.env = env;
+    this.api = api;
+  }
+
+  /** Load the API-access binding names. Failure just means none are available. */
+  async init(onError?: (reason: string) => void): Promise<void> {
+    if (!this.api) return;
+    try {
+      const listing = await this.api.listAgentSecretAccess();
+      const keys = Array.isArray(listing?.secrets) ? listing.secrets.map((s) => s?.key) : [];
+      this.apiKeys = new Set(keys.filter((k): k is string => typeof k === "string" && k.length > 0));
+    } catch (err) {
+      onError?.(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  names(): string[] {
+    return [...new Set([...Object.keys(this.env), ...this.apiKeys])].sort();
+  }
+
+  has(name: string): boolean {
+    return Object.prototype.hasOwnProperty.call(this.env, name) || this.apiKeys.has(name);
+  }
+
+  async get(name: string): Promise<string> {
+    if (Object.prototype.hasOwnProperty.call(this.env, name)) return this.env[name]!;
+    if (!this.apiKeys.has(name) || !this.api) throw new SecretReferenceError(this.unknownMessage(name));
+    const cached = this.fetched.get(name);
+    if (cached !== undefined) return cached;
+    const { value } = await this.api.getAgentSecretValue(name);
+    if (typeof value !== "string") throw new Error(`Paperclip returned no value for secret '${name}'.`);
+    this.fetched.set(name, value);
+    return value;
+  }
+
+  /** Values that must never reach the model: all env secrets plus every API value fetched so far. */
+  sensitiveValues(): string[] {
+    return [...Object.values(this.env), ...this.fetched.values()];
+  }
+
+  unknownMessage(name: string): string {
+    const known = this.names();
+    return `Unknown secret '${name}'. Bound secrets: ${known.length > 0 ? known.join(", ") : "(none)"}.`;
+  }
+}
+
+/** Collect every `{{secret:NAME}}` name referenced anywhere inside a JSON-like value. */
+export function referencedSecretNames(value: unknown, out: Set<string> = new Set()): Set<string> {
+  if (typeof value === "string") {
+    for (const m of value.matchAll(SECRET_PLACEHOLDER)) out.add(m[1]!);
+  } else if (Array.isArray(value)) {
+    for (const v of value) referencedSecretNames(v, out);
+  } else if (value && typeof value === "object") {
+    for (const v of Object.values(value as Record<string, unknown>)) referencedSecretNames(v, out);
+  }
+  return out;
+}
+
+/** Resolve the named secrets up front, so substitution itself can stay synchronous. */
+export async function resolveSecrets(names: Iterable<string>, store: SecretStore): Promise<Record<string, string>> {
+  const resolved: Record<string, string> = {};
+  for (const name of names) {
+    if (!store.has(name)) throw new SecretReferenceError(store.unknownMessage(name));
+    resolved[name] = await store.get(name);
+  }
+  return resolved;
+}
+
 /** Replace every `{{secret:NAME}}` in `text`. Throws SecretReferenceError on an unknown name. */
 export function substituteSecrets(text: string, secrets: Record<string, string>): string {
   return text.replace(SECRET_PLACEHOLDER, (_match, name: string) => {

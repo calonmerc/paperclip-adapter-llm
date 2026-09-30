@@ -21,6 +21,46 @@ export declare class SecretReferenceError extends Error {
  * already handles through its own authToken.
  */
 export declare function collectBoundSecrets(env: unknown, isExcludedKey: (key: string) => boolean): Record<string, string>;
+/** The slice of PaperclipApi the store needs (kept narrow for tests). */
+export interface AgentSecretAccessApi {
+    listAgentSecretAccess(): Promise<{
+        secrets: Array<{
+            key: string;
+        }>;
+    }>;
+    getAgentSecretValue(key: string): Promise<{
+        key: string;
+        value: string;
+    }>;
+}
+/**
+ * Every secret this run can use, from both of Paperclip's binding modes:
+ *   - env-var bindings: resolved into adapterConfig.env before the run
+ *   - API-access bindings: never in the env; listed via GET /agents/me/secrets
+ *     and each value fetched on demand via POST /agents/me/secrets/:key/value
+ * API-access values are fetched only when a request actually references
+ * them, then cached for the run. Every value ever resolved is tracked so it
+ * can be redacted from anything shown to the model.
+ */
+export declare class SecretStore {
+    private readonly env;
+    private readonly api;
+    private apiKeys;
+    private readonly fetched;
+    constructor(env?: Record<string, string>, api?: AgentSecretAccessApi | null);
+    /** Load the API-access binding names. Failure just means none are available. */
+    init(onError?: (reason: string) => void): Promise<void>;
+    names(): string[];
+    has(name: string): boolean;
+    get(name: string): Promise<string>;
+    /** Values that must never reach the model: all env secrets plus every API value fetched so far. */
+    sensitiveValues(): string[];
+    unknownMessage(name: string): string;
+}
+/** Collect every `{{secret:NAME}}` name referenced anywhere inside a JSON-like value. */
+export declare function referencedSecretNames(value: unknown, out?: Set<string>): Set<string>;
+/** Resolve the named secrets up front, so substitution itself can stay synchronous. */
+export declare function resolveSecrets(names: Iterable<string>, store: SecretStore): Promise<Record<string, string>>;
 /** Replace every `{{secret:NAME}}` in `text`. Throws SecretReferenceError on an unknown name. */
 export declare function substituteSecrets(text: string, secrets: Record<string, string>): string;
 /** Recursively substitute placeholders in every string inside a JSON-like value. */

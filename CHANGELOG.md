@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.12.1] - 2026-09-30
+
+### Fixed
+- **Secrets bound with "API access" were invisible.** Paperclip has two
+  secret binding modes, and 0.12.0 only read env-var bindings from
+  `adapterConfig.env`. API-access bindings never touch the env. They're
+  listed via `GET /api/agents/me/secrets` and each value is resolved via
+  `POST /api/agents/me/secrets/:key/value` with the run-bound agent token.
+  Oscar's `GSC_SERVICE_ACCOUNT` / `UMAMI_API_KEY` were bound this way, so
+  `http_request` answered "Unknown secret". A new `SecretStore` merges both
+  modes. API-access names are listed at run start, and a value is fetched
+  only when a request references it, then cached for the run and redacted
+  from everything the model sees (Paperclip also registers it for run-log
+  redaction).
+
 ## [0.12.0] - 2026-09-30
 
 ### Fixed — "missing disposition" errors

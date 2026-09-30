@@ -24,9 +24,14 @@ A fork of [`talhamahmood666/paperclip-adapter-openrouter`](https://github.com/ta
 
 ### Secrets and outbound HTTP
 
-Paperclip resolves an agent's bound secrets into `adapterConfig.env` before each run. Built-in adapters put that map in a child process's environment; this adapter has no child process and no shell, so instead:
+Paperclip has two ways to bind a secret to an agent, and both work:
 
-- `list_secrets` returns the bound secret **names** (never values). `PAPERCLIP_*` keys are excluded.
+- **Env-var bindings** are resolved into `adapterConfig.env` before each run (built-in adapters put that map in a child process's environment).
+- **API-access bindings** never touch the environment. They're listed via `GET /api/agents/me/secrets` and each value is fetched on demand via `POST /api/agents/me/secrets/:key/value`, using the run-bound agent token. The adapter fetches a value only when a request references it, then caches it for the run.
+
+This adapter has no child process and no shell, so instead:
+
+- `list_secrets` returns the bound secret **names** from both kinds (never values). `PAPERCLIP_*` keys are excluded.
 - `http_request` makes an HTTP(S) call. The model writes `{{secret:NAME}}` anywhere in the url, headers, query or body, and the value is substituted in-process. For Google APIs, `auth: {type: "google_service_account", secret, scopes}` turns a service-account key secret into an access token (signed RS256 JWT → `oauth2.googleapis.com/token`, cached for the run). Every secret value and minted token is redacted to `***` from responses and errors before the model sees them. Responses are capped at ~32 KB; requests time out after 30 s.
 
 Both tools are registered only when at least one secret is bound; set `httpToolEnabled: true` to get `http_request` without secrets. `httpAllowedHosts` (comma-separated, `*.example.com` wildcards) restricts which hosts it may call.

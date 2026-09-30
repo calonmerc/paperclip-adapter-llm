@@ -97,6 +97,18 @@ export declare class PaperclipApi {
     listCompanyAgents(companyId: string): Promise<Record<string, unknown>[]>;
     hireAgent(companyId: string, hire: Record<string, unknown>): Promise<Record<string, unknown>>;
     wakeAgent(agentId: string, body: Record<string, unknown>): Promise<Record<string, unknown>>;
+    /** Secrets bound to this agent with "API access" — metadata only, never values. */
+    listAgentSecretAccess(): Promise<{
+        secrets: Array<{
+            key: string;
+            [k: string]: unknown;
+        }>;
+    }>;
+    /** Resolve one API-access secret's value by its alias. Paperclip registers it for run-log redaction. */
+    getAgentSecretValue(key: string): Promise<{
+        key: string;
+        value: string;
+    }>;
     createApproval(companyId: string, approval: Record<string, unknown>): Promise<Record<string, unknown>>;
 }
 //# sourceMappingURL=paperclip-api.d.ts.map

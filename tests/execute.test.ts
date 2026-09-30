@@ -785,4 +785,41 @@ describe("execute()", () => {
     expect(toolResult.hint).toContain("http_request");
     expect(toolResult.availableTools).toEqual(expect.arrayContaining(["update_issue_status", "http_request"]));
   });
+
+  it("picks up API-access secret bindings from GET /agents/me/secrets and fetches values on demand", async () => {
+    // Oscar's GSC/Umami credentials are bound with "API access", which never
+    // touches config.env — the adapter used to report them as unknown.
+    fetchMock = setupFetchMock([
+      toolCallResponse([
+        {
+          id: "c1",
+          name: "http_request",
+          args: { url: "https://umami.example.com/api/stats", headers: { "x-umami-api-key": "{{secret:UMAMI_API_KEY}}" } },
+        },
+      ]),
+      toolCallResponse([{ id: "c2", name: "update_issue_status", args: { status: "done" } }]),
+      assistantResponse("ok"),
+    ]);
+    const recordingFetch = globalThis.fetch;
+    let umamiHeader: string | undefined;
+    globalThis.fetch = (async (input: any, init?: any) => {
+      const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
+      const json = (body: unknown) =>
+        new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
+      if (url.pathname === "/api/agents/me/secrets") return json({ secrets: [{ key: "UMAMI_API_KEY" }] });
+      if (url.pathname === "/api/agents/me/secrets/UMAMI_API_KEY/value") return json({ key: "UMAMI_API_KEY", value: "umami-live-value" });
+      if (url.hostname === "umami.example.com") {
+        umamiHeader = init?.headers?.["x-umami-api-key"];
+        return json({ pageviews: 5, echoed: umamiHeader });
+      }
+      return recordingFetch(input, init);
+    }) as typeof fetch;
+
+    await execute(makeContext());
+
+    expect(umamiHeader).toBe("umami-live-value");
+    for (const call of fetchMock.calls.filter((c) => c.path.endsWith("/chat/completions"))) {
+      expect(JSON.stringify(call.body)).not.toContain("umami-live-value");
+    }
+  });
 });
