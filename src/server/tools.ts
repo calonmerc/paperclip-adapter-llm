@@ -1092,6 +1092,18 @@ function httpRequestTool(ctx: BuildToolsContext): Tool {
         body: redact(text),
       };
       if (truncated) result.truncated = `Response truncated to ${MAX_RESPONSE_CHARS} characters.`;
+      if (response.status >= 400 && response.status < 500) {
+        // A 4xx means this exact request is wrong — resending it can't help,
+        // and models otherwise tend to retry it until the repeat-loop breaker
+        // kills the run.
+        const underscored = Object.keys(headers).filter((h) => h.includes("_"));
+        result.hint =
+          "Do not resend this request unchanged — a 4xx means the URL, method, headers, or credentials are wrong. " +
+          (underscored.length > 0
+            ? `Header names normally use hyphens, not underscores (got: ${underscored.join(", ")}). `
+            : "") +
+          "If you don't know the correct endpoint, say so in your disposition or ask via ask_user_questions instead of guessing.";
+      }
       return { content: JSON.stringify(result), isError: !response.ok };
     },
   };

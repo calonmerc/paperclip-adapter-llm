@@ -10,7 +10,12 @@
  * from one) is redacted out of whatever goes back to it.
  */
 import crypto from "node:crypto";
-export const SECRET_PLACEHOLDER = /\{\{\s*secret:([A-Za-z_][A-Za-z0-9_]*)\s*\}\}/g;
+// Secret keys can contain dots and hyphens (e.g. "umami.api-key"), not just env-var characters.
+export const SECRET_PLACEHOLDER = /\{\{\s*secret:([A-Za-z_][A-Za-z0-9_.-]*)\s*\}\}/g;
+// This adapter's own LLM provider key is stored as a Paperclip secret bound to
+// the agent (key "llm.apikey.<id>"), so the listing includes it. It's the
+// adapter's credential, not one the model has any business sending anywhere.
+const OWN_ADAPTER_SECRET_PREFIX = "llm.apikey.";
 export const REDACTED = "***";
 export const MAX_RESPONSE_CHARS = 32_000;
 export const REQUEST_TIMEOUT_MS = 30_000;
@@ -36,13 +41,16 @@ export function collectBoundSecrets(env, isExcludedKey) {
     return secrets;
 }
 /**
- * Every secret this run can use, from both of Paperclip's binding modes:
- *   - env-var bindings: resolved into adapterConfig.env before the run
- *   - API-access bindings: never in the env; listed via GET /agents/me/secrets
- *     and each value fetched on demand via POST /agents/me/secrets/:key/value
- * API-access values are fetched only when a request actually references
- * them, then cached for the run. Every value ever resolved is tracked so it
- * can be redacted from anything shown to the model.
+ * Every secret this run can use. GET /agents/me/secrets lists every secret
+ * bound to the agent — env-var bindings and API-access bindings alike —
+ * under its secret key, and POST /agents/me/secrets/:key/value resolves any
+ * of them, so when that listing is available it is the single source of
+ * names. adapterConfig.env is only the fallback for servers without it: it
+ * also carries plain runtime variables (TEMP, TMPDIR, GH_CONFIG_DIR, ...)
+ * that aren't secrets at all, and nothing there distinguishes the two.
+ * Values are fetched only when a request references them, then cached for
+ * the run. Every value ever resolved is tracked so it can be redacted from
+ * anything shown to the model.
  */
 export class SecretStore {
     env;
@@ -59,8 +67,11 @@ export class SecretStore {
             return;
         try {
             const listing = await this.api.listAgentSecretAccess();
-            const keys = Array.isArray(listing?.secrets) ? listing.secrets.map((s) => s?.key) : [];
-            this.apiKeys = new Set(keys.filter((k) => typeof k === "string" && k.length > 0));
+            if (!Array.isArray(listing?.secrets))
+                return;
+            const keys = listing.secrets.map((s) => s?.key);
+            this.apiKeys = new Set(keys.filter((k) => typeof k === "string" && k.length > 0 && !k.startsWith(OWN_ADAPTER_SECRET_PREFIX)));
+            this.env = {};
         }
         catch (err) {
             onError?.(err instanceof Error ? err.message : String(err));

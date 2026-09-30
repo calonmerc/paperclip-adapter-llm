@@ -31,7 +31,7 @@ Paperclip has two ways to bind a secret to an agent, and both work:
 
 This adapter has no child process and no shell, so instead:
 
-- `list_secrets` returns the bound secret **names** from both kinds (never values). `PAPERCLIP_*` keys are excluded.
+- `list_secrets` returns the bound secret **names** (never values): the secrets' keys as `GET /api/agents/me/secrets` reports them, covering both kinds. `adapterConfig.env` is consulted only when that endpoint is unavailable, since it also carries non-secret runtime variables. The adapter's own `llm.apikey.*` key is always excluded.
 - `http_request` makes an HTTP(S) call. The model writes `{{secret:NAME}}` anywhere in the url, headers, query or body, and the value is substituted in-process. For Google APIs, `auth: {type: "google_service_account", secret, scopes}` turns a service-account key secret into an access token (signed RS256 JWT → `oauth2.googleapis.com/token`, cached for the run). Every secret value and minted token is redacted to `***` from responses and errors before the model sees them. Responses are capped at ~32 KB; requests time out after 30 s.
 
 Both tools are registered only when at least one secret is bound; set `httpToolEnabled: true` to get `http_request` without secrets. `httpAllowedHosts` (comma-separated, `*.example.com` wildcards) restricts which hosts it may call.

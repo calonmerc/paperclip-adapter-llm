@@ -997,12 +997,57 @@ describe("API-access secrets (GET /agents/me/secrets, fetched on demand)", () =>
     return { tools, ...fake };
   }
 
-  it("lists API-access and env-var secret names together, and registers http_request for API-access-only agents", async () => {
-    const { tools, valueFetches } = await toolsWithStore({ ENV_KEY: "env-value" }, { UMAMI_API_KEY: "umami-value-123" });
+  it("uses the API listing as the only source of names, dropping runtime env noise and the adapter's own LLM key", async () => {
+    // Real run: config.env carried TEMP/TMP/TMPDIR/GH_CONFIG_DIR, and the
+    // listing included the adapter's own "llm.apikey.<id>" binding.
+    const { tools, valueFetches } = await toolsWithStore(
+      { TEMP: "/tmp", TMPDIR: "/tmp", GH_CONFIG_DIR: "/x/gh" },
+      { umami_api_key: "umami-value-123", google_search_console_key: "{}", "llm.apikey.c99734b7": "sk-llm" },
+    );
     const result = await findTool(tools, "list_secrets")!.execute({});
-    expect(JSON.parse(result.content)).toEqual({ secrets: ["ENV_KEY", "UMAMI_API_KEY"] });
+    expect(JSON.parse(result.content)).toEqual({ secrets: ["google_search_console_key", "umami_api_key"] });
     expect(valueFetches).toEqual([]); // listing never fetches values
     expect(findTool((await toolsWithStore({}, { K: "vvvv" })).tools, "http_request")).not.toBeNull();
+  });
+
+  it("falls back to config.env names when the listing endpoint fails", async () => {
+    const store = new SecretStore({ ENV_KEY: "env-value" }, {
+      listAgentSecretAccess: async () => {
+        throw new Error("404");
+      },
+      getAgentSecretValue: async () => ({ key: "", value: "" }),
+    });
+    const errors: string[] = [];
+    await store.init((e) => errors.push(e));
+    expect(store.names()).toEqual(["ENV_KEY"]);
+    expect(errors).toEqual(["404"]);
+  });
+
+  it("accepts dotted/hyphenated secret keys in placeholders", async () => {
+    const { tools } = await toolsWithStore({}, { "umami.api-key": "dotted-value" });
+    let sent: string | undefined;
+    globalThis.fetch = (async (_i: any, init: any) => {
+      sent = init.headers["x-umami-api-key"];
+      return jsonResponse({});
+    }) as typeof fetch;
+    await findTool(tools, "http_request")!.execute({
+      url: "https://api.umami.is/v1/me",
+      headers: { "x-umami-api-key": "{{secret:umami.api-key}}" },
+    });
+    expect(sent).toBe("dotted-value");
+  });
+
+  it("tells the model not to resend a request that got a 4xx, and flags underscore header names", async () => {
+    const { tools } = await toolsWithStore({}, { umami_api_key: "umami-value-123" });
+    globalThis.fetch = (async () => new Response("", { status: 404 })) as typeof fetch;
+    const result = await findTool(tools, "http_request")!.execute({
+      url: "https://debtrelief.win/api/stats/summary",
+      headers: { x_umami_api_key: "{{secret:umami_api_key}}" },
+    });
+    const parsed = JSON.parse(result.content);
+    expect(result.isError).toBe(true);
+    expect(parsed.hint).toContain("Do not resend this request unchanged");
+    expect(parsed.hint).toContain("x_umami_api_key");
   });
 
   it("fetches an API-access value only when referenced, caches it, and redacts it", async () => {

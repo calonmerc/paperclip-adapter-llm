@@ -26,6 +26,7 @@ export interface AgentSecretAccessApi {
     listAgentSecretAccess(): Promise<{
         secrets: Array<{
             key: string;
+            delivery?: unknown;
         }>;
     }>;
     getAgentSecretValue(key: string): Promise<{
@@ -34,16 +35,19 @@ export interface AgentSecretAccessApi {
     }>;
 }
 /**
- * Every secret this run can use, from both of Paperclip's binding modes:
- *   - env-var bindings: resolved into adapterConfig.env before the run
- *   - API-access bindings: never in the env; listed via GET /agents/me/secrets
- *     and each value fetched on demand via POST /agents/me/secrets/:key/value
- * API-access values are fetched only when a request actually references
- * them, then cached for the run. Every value ever resolved is tracked so it
- * can be redacted from anything shown to the model.
+ * Every secret this run can use. GET /agents/me/secrets lists every secret
+ * bound to the agent — env-var bindings and API-access bindings alike —
+ * under its secret key, and POST /agents/me/secrets/:key/value resolves any
+ * of them, so when that listing is available it is the single source of
+ * names. adapterConfig.env is only the fallback for servers without it: it
+ * also carries plain runtime variables (TEMP, TMPDIR, GH_CONFIG_DIR, ...)
+ * that aren't secrets at all, and nothing there distinguishes the two.
+ * Values are fetched only when a request references them, then cached for
+ * the run. Every value ever resolved is tracked so it can be redacted from
+ * anything shown to the model.
  */
 export declare class SecretStore {
-    private readonly env;
+    private env;
     private readonly api;
     private apiKeys;
     private readonly fetched;

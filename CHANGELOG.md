@@ -14,6 +14,20 @@
   only when a request references it, then cached for the run and redacted
   from everything the model sees (Paperclip also registers it for run-log
   redaction).
+- **`list_secrets` listed things that aren't secrets.** It showed `TEMP`,
+  `TMP`, `TMPDIR`, `GH_CONFIG_DIR` (plain runtime vars in `config.env`) and
+  the adapter's own `llm.apikey.<id>` LLM key. The `/agents/me/secrets`
+  listing covers every secret bound to the agent, env-var and API-access
+  alike, so when it's available it's now the only source of names.
+  `config.env` is used only as a fallback for servers without the endpoint.
+  The adapter's own LLM key is always excluded. Names are the secrets' keys
+  (e.g. `umami_api_key`), not binding aliases, because that's what the value
+  endpoint resolves.
+- `{{secret:NAME}}` now accepts dots and hyphens in `NAME`.
+- A 4xx from `http_request` now carries a hint: don't resend the request
+  unchanged, and header names use hyphens, not underscores. In a real run
+  the model retried a guessed, 404ing endpoint until the repeat-loop breaker
+  stopped the run.
 
 ## [0.12.0] - 2026-09-30
 
