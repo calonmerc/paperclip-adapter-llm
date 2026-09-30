@@ -1,29 +1,19 @@
 /**
- * Scoped file-based memory for skills like para-memory-files that expect
- * real file read/write (and, in that skill's case, a `qmd` shell command
- * for semantic search — which we do not provide; see search()).
+ * READ-ONLY access to the retired memory_fs storage, used solely by the
+ * one-time migration into Company Library documents (see library.ts).
  *
- * Two isolated roots per company:
- *   - private: one directory per agent, e.g. $AGENT_HOME in the skill's own
- *     terms — only that agent's tool calls can read/write it.
- *   - shared: one directory per company, shared by every llm-adapter agent
- *     in it — for things para-memory-files explicitly wants agents to
- *     share, like plans/.
+ * memory_fs used to be a tool: plain files under a server directory
+ * (private per agent, shared per company) that no human could see in the
+ * Paperclip UI. It was removed so that every piece of agent storage is a
+ * visible, revisioned Paperclip document. Nothing in this adapter writes
+ * here anymore; this module only locates and reads what's left.
  *
- * This is NOT a restoration of the unsandboxed CLI tools removed in the
- * 0.3.0 security fix (arbitrary path read/write/exec, no root). Every
- * operation here is confined to one resolved root directory — private or
- * shared — via resolveSafePath(), which rejects any relative path that
- * would resolve outside that root (../ traversal, absolute-path override,
- * symlink components are not specially followed since we only ever
- * fs.mkdir/writeFile/readFile the resolved path itself). There is no shell
- * execution anywhere in this file.
+ * Every read is confined to one resolved root via resolveSafePath().
  */
 import fs from "node:fs/promises";
 import path from "node:path";
 const MAX_FILE_BYTES = 1_000_000; // 1MB per file — generous for markdown/yaml notes, not a data dump target
 const MAX_LIST_ENTRIES = 500;
-const MAX_SEARCH_MATCHES = 50;
 function sanitizeId(id) {
     // companyId/agentId are UUIDs in practice, but never trust that blindly
     // when building a filesystem path from them.
@@ -76,15 +66,6 @@ export async function readMemoryFile(root, relPath) {
     }
     return fs.readFile(target, "utf8");
 }
-export async function writeMemoryFile(root, relPath, content) {
-    const target = resolveSafePath(root, relPath);
-    const bytes = Buffer.byteLength(content, "utf8");
-    if (bytes > MAX_FILE_BYTES) {
-        throw new Error(`Content too large to write (${bytes} bytes, limit ${MAX_FILE_BYTES}): ${relPath}`);
-    }
-    await fs.mkdir(path.dirname(target), { recursive: true });
-    await fs.writeFile(target, content, "utf8");
-}
 export async function listMemoryFiles(root, relPath) {
     const target = resolveSafePath(root, relPath || ".");
     const results = [];
@@ -120,43 +101,5 @@ export async function listMemoryFiles(root, relPath) {
     }
     await walk(target, relPath === "." || !relPath ? "" : relPath);
     return results;
-}
-/**
- * Plain substring/keyword search across every file in the tree — the
- * closest safe equivalent to para-memory-files' `qmd` recall commands
- * without shelling out to an external binary. Not semantic search: no
- * embeddings, no reranking, just case-insensitive substring matching with
- * line context. Good enough to find "what did I write about X" in a
- * personal notes tree; a real qmd install is still strictly better if the
- * operator has one and wires it in themselves.
- */
-export async function searchMemoryFiles(root, query) {
-    const needle = query.trim().toLowerCase();
-    if (!needle)
-        throw new Error("query is required.");
-    const files = await listMemoryFiles(root, ".");
-    const matches = [];
-    for (const entry of files) {
-        if (entry.type !== "file")
-            continue;
-        if (matches.length >= MAX_SEARCH_MATCHES)
-            break;
-        let content;
-        try {
-            content = await readMemoryFile(root, entry.path);
-        }
-        catch {
-            continue;
-        }
-        const lines = content.split(/\r?\n/);
-        for (let i = 0; i < lines.length; i++) {
-            if (matches.length >= MAX_SEARCH_MATCHES)
-                break;
-            if (lines[i].toLowerCase().includes(needle)) {
-                matches.push({ path: entry.path, line: i + 1, text: lines[i].trim().slice(0, 300) });
-            }
-        }
-    }
-    return matches;
 }
 //# sourceMappingURL=memory-fs.js.map

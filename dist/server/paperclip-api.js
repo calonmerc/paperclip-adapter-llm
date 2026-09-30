@@ -101,6 +101,11 @@ export class PaperclipApi {
     getHeartbeatContext(issueId) {
         return this.request("GET", `/api/issues/${encodeURIComponent(issueId)}/heartbeat-context`);
     }
+    /** The company-wide Artifacts view (issue documents, work products, attachments), searchable. */
+    listCompanyArtifacts(companyId, query) {
+        const qs = new URLSearchParams(query).toString();
+        return this.request("GET", `/api/companies/${encodeURIComponent(companyId)}/artifacts${qs ? `?${qs}` : ""}`);
+    }
     // ----- Documents (viewable in the issue's Documents panel in the web UI) -----
     listIssueDocuments(issueId) {
         return this.request("GET", `/api/issues/${encodeURIComponent(issueId)}/documents`);

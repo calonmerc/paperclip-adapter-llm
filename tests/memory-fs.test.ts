@@ -1,11 +1,8 @@
 /**
- * Unit tests for src/server/memory-fs.ts — scoped file-based memory added so
- * llm-adapter agents can actually use skills like para-memory-files, which
- * expect real file read/write (private "$AGENT_HOME" notes) plus a shared
- * area other agents can read (e.g. its plans/ convention). This is NOT the
- * unsandboxed filesystem access removed in the 0.3.0 security fix — every
- * path is confined to one resolved root via resolveSafePath(), so these
- * tests focus heavily on that boundary actually holding.
+ * Unit tests for src/server/memory-fs.ts — now read-only access to the
+ * retired memory_fs storage, used only to migrate it into Library
+ * documents. Every read is confined to one resolved root via
+ * resolveSafePath(), so these tests still check that boundary holds.
  */
 
 import fs from "node:fs";
@@ -17,9 +14,7 @@ import {
   resolveMemoryRoot,
   resolveSafePath,
   readMemoryFile,
-  writeMemoryFile,
   listMemoryFiles,
-  searchMemoryFiles,
 } from "../src/server/memory-fs.js";
 
 let homesRoot: string;
@@ -31,6 +26,12 @@ beforeEach(() => {
 afterEach(() => {
   fs.rmSync(homesRoot, { recursive: true, force: true });
 });
+
+function seed(rel: string, content: string) {
+  const target = path.join(homesRoot, rel);
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  fs.writeFileSync(target, content);
+}
 
 describe("resolveMemoryRoot", () => {
   it("gives two different agents in the same company different private roots", () => {
@@ -83,31 +84,25 @@ describe("resolveSafePath", () => {
   });
 });
 
-describe("read/writeMemoryFile", () => {
-  it("round-trips content and creates parent directories as needed", async () => {
-    await writeMemoryFile(homesRoot, "life/projects/acme/summary.md", "# Acme\n\nStatus: active");
-    const content = await readMemoryFile(homesRoot, "life/projects/acme/summary.md");
-    expect(content).toBe("# Acme\n\nStatus: active");
+describe("readMemoryFile", () => {
+  it("reads a nested file", async () => {
+    seed("life/projects/acme/summary.md", "# Acme\n\nStatus: active");
+    expect(await readMemoryFile(homesRoot, "life/projects/acme/summary.md")).toBe("# Acme\n\nStatus: active");
   });
 
-  it("rejects writes that would escape the root", async () => {
-    await expect(writeMemoryFile(homesRoot, "../outside.md", "nope")).rejects.toThrow(/outside the allowed directory/);
+  it("rejects reads that would escape the root", async () => {
+    await expect(readMemoryFile(homesRoot, "../outside.md")).rejects.toThrow(/outside the allowed directory/);
   });
 
   it("rejects reading a file that doesn't exist", async () => {
     await expect(readMemoryFile(homesRoot, "missing.md")).rejects.toThrow(/not found/i);
   });
-
-  it("rejects a write over the size cap", async () => {
-    const big = "x".repeat(1_000_001);
-    await expect(writeMemoryFile(homesRoot, "big.md", big)).rejects.toThrow(/too large/i);
-  });
 });
 
 describe("listMemoryFiles", () => {
   it("lists nested files and directories with correct types", async () => {
-    await writeMemoryFile(homesRoot, "memory/2026-09-29.md", "notes");
-    await writeMemoryFile(homesRoot, "life/areas/people/kyle/summary.md", "kyle notes");
+    seed("memory/2026-09-29.md", "notes");
+    seed("life/areas/people/kyle/summary.md", "kyle notes");
 
     const entries = await listMemoryFiles(homesRoot, ".");
     const paths = entries.map((e) => e.path).sort();
@@ -123,24 +118,5 @@ describe("listMemoryFiles", () => {
   it("returns an empty list for a directory that doesn't exist yet", async () => {
     const entries = await listMemoryFiles(homesRoot, "nope");
     expect(entries).toEqual([]);
-  });
-});
-
-describe("searchMemoryFiles", () => {
-  it("finds a case-insensitive keyword match with line context across files", async () => {
-    await writeMemoryFile(homesRoot, "memory/2026-09-29.md", "Talked to Kyle about the Q4 roadmap.");
-    await writeMemoryFile(homesRoot, "life/areas/people/kyle/summary.md", "Kyle prefers async updates.");
-
-    const matches = await searchMemoryFiles(homesRoot, "kyle");
-
-    expect(matches.length).toBe(2);
-    expect(matches.some((m) => m.path === "memory/2026-09-29.md")).toBe(true);
-    expect(matches.some((m) => m.path === "life/areas/people/kyle/summary.md")).toBe(true);
-  });
-
-  it("returns no matches for a keyword that isn't present", async () => {
-    await writeMemoryFile(homesRoot, "memory/2026-09-29.md", "Nothing relevant here.");
-    const matches = await searchMemoryFiles(homesRoot, "unicorn");
-    expect(matches).toEqual([]);
   });
 });

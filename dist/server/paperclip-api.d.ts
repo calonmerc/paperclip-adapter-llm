@@ -32,6 +32,8 @@ export declare class PaperclipApi {
     listCompanyIssues(companyId: string, query?: Record<string, string>): Promise<Record<string, unknown>>;
     createIssue(companyId: string, issue: Record<string, unknown>): Promise<Record<string, unknown>>;
     getHeartbeatContext(issueId: string): Promise<Record<string, unknown>>;
+    /** The company-wide Artifacts view (issue documents, work products, attachments), searchable. */
+    listCompanyArtifacts(companyId: string, query: Record<string, string>): Promise<Record<string, unknown>>;
     listIssueDocuments(issueId: string): Promise<Record<string, unknown>[]>;
     getIssueDocument(issueId: string, key: string): Promise<Record<string, unknown>>;
     /**

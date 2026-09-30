@@ -13,14 +13,7 @@
  */
 
 import { PaperclipApi, PaperclipApiError } from "./paperclip-api.js";
-import {
-  resolveMemoryRoot,
-  readMemoryFile,
-  writeMemoryFile,
-  listMemoryFiles,
-  searchMemoryFiles,
-  type MemoryScope,
-} from "./memory-fs.js";
+import { LIBRARY_ISSUE_TITLE, LibraryResolver, slugifyDocumentKey } from "./library.js";
 import {
   MAX_RESPONSE_CHARS,
   REQUEST_TIMEOUT_MS,
@@ -71,8 +64,10 @@ export interface BuildToolsContext {
    * now waiting on a human reply and must not mark it "done".
    */
   interactionCreated?: { value: boolean };
-  /** Raw adapterConfig, needed by memory_fs to resolve agentHomeDir. */
+  /** Raw adapterConfig (httpAllowedHosts, httpToolEnabled, libraryIssue, ...). */
   config?: Record<string, unknown>;
+  /** Resolves the company Library issue; built from api/companyId/config if omitted. */
+  library?: LibraryResolver;
   /**
    * Every secret bound to this agent — env-var bindings and API-access
    * bindings. Only ever substituted into http_request calls; values are
@@ -738,85 +733,80 @@ function listInteractionsTool(ctx: BuildToolsContext): Tool {
   };
 }
 
-function memoryFsTool(ctx: BuildToolsContext): Tool {
-  return {
-    schema: {
-      type: "function",
-      function: {
-        name: "memory_fs",
-        description:
-          "Read, write, list, or search small text/markdown files for durable memory across runs " +
-          "(e.g. the para-memory-files skill's PARA notes). Two isolated scopes: 'private' is a " +
-          "directory only you can see (this is what that skill calls $AGENT_HOME); 'shared' is one " +
-          "directory every agent in this company can read and write — use it for anything meant to be " +
-          "seen by other agents, such as the skill's plans/ files. There is no shell access and no `qmd` " +
-          "command here — use action='search' instead, which does a plain keyword search across the " +
-          "scope's files (not semantic search, but finds the same notes). Paths are always relative to " +
-          "the chosen scope's root and cannot escape it.",
-        parameters: {
-          type: "object",
-          properties: {
-            action: { type: "string", enum: ["read", "write", "list", "search"] },
-            scope: { type: "string", enum: ["private", "shared"], description: "Default: private." },
-            path: {
-              type: "string",
-              description: "Relative path within the scope. Required for read/write. Optional for list (default: root).",
-            },
-            content: { type: "string", description: "File content. Required for action='write'." },
-            query: { type: "string", description: "Keyword to search for. Required for action='search'." },
-          },
-          required: ["action"],
-        },
-      },
-    },
-    execute: async (args) => {
-      const action = asString(args.action);
-      const scope: MemoryScope = args.scope === "shared" ? "shared" : "private";
-      const root = resolveMemoryRoot(ctx.config ?? {}, scope, { agentId: ctx.agentId, companyId: ctx.companyId });
+const DOCUMENT_ACTION_PROPERTIES = {
+  action: { type: "string", enum: ["read", "write", "list"] },
+  key: {
+    type: "string",
+    description:
+      "Short id for the document, e.g. 'content-log' or 'weekly-report'. Lowercase letters, " +
+      "numbers, - and _ only — anything else is auto-slugified. Required for read/write.",
+  },
+  title: { type: "string", description: "Display title. Optional for write." },
+  body: { type: "string", description: "Full markdown content. Required for write — replace, don't diff." },
+  change_summary: { type: "string", description: "One-line note on what changed this revision. Optional." },
+};
 
-      try {
-        switch (action) {
-          case "read": {
-            const p = asString(args.path);
-            if (!p) return fail("path is required for action='read'.");
-            return ok({ path: p, scope, content: await readMemoryFile(root, p) });
+/** read / write / list documents on one issue — shared by issue_document and library. */
+async function runDocumentAction(
+  ctx: BuildToolsContext,
+  label: string,
+  issueId: string,
+  args: Record<string, unknown>,
+): Promise<ToolExecutionResult> {
+  const action = asString(args.action);
+  switch (action) {
+    case "list":
+      return safeCall(`${label}(list)`, () => ctx.api.listIssueDocuments(issueId));
+    case "read": {
+      const rawKey = asString(args.key);
+      if (!rawKey) return fail("key is required for action='read'.");
+      return safeCall(`${label}(read)`, () => ctx.api.getIssueDocument(issueId, slugifyDocumentKey(rawKey)));
+    }
+    case "write": {
+      const rawKey = asString(args.key);
+      if (!rawKey) return fail("key is required for action='write'.");
+      if (typeof args.body !== "string" || !args.body) return fail("body is required for action='write'.");
+      const key = slugifyDocumentKey(rawKey);
+      const title = typeof args.title === "string" && args.title.trim() ? args.title.trim() : null;
+      const changeSummary =
+        typeof args.change_summary === "string" && args.change_summary.trim() ? args.change_summary.trim() : null;
+      const body = args.body as string;
+
+      return safeCall(`${label}(write)`, async () => {
+        // Paperclip requires baseRevisionId to exactly match the
+        // document's current latestRevisionId on every update to an
+        // existing key (optimistic concurrency) — omitting it always
+        // 409s. Resolve it here instead of pushing revision tracking
+        // onto the model: fetch the current doc (undefined if it
+        // doesn't exist yet, which is correct for a create).
+        const currentDoc = await ctx.api.getIssueDocument(issueId, key).catch(() => null);
+        const baseRevisionId =
+          typeof currentDoc?.latestRevisionId === "string" ? currentDoc.latestRevisionId : undefined;
+        try {
+          return await ctx.api.upsertIssueDocument(issueId, key, { title, format: "markdown", body, changeSummary, baseRevisionId });
+        } catch (err) {
+          // One retry: if baseRevisionId went stale because of a
+          // concurrent write between our read and this write, re-fetch
+          // and try exactly once more before giving up.
+          if (err instanceof PaperclipApiError && err.status === 409) {
+            const retryDoc = await ctx.api.getIssueDocument(issueId, key).catch(() => null);
+            const retryRevisionId =
+              typeof retryDoc?.latestRevisionId === "string" ? retryDoc.latestRevisionId : undefined;
+            return await ctx.api.upsertIssueDocument(issueId, key, {
+              title,
+              format: "markdown",
+              body,
+              changeSummary,
+              baseRevisionId: retryRevisionId,
+            });
           }
-          case "write": {
-            const p = asString(args.path);
-            if (!p) return fail("path is required for action='write'.");
-            if (typeof args.content !== "string") return fail("content is required for action='write'.");
-            await writeMemoryFile(root, p, args.content);
-            return ok({ path: p, scope, written: true });
-          }
-          case "list": {
-            const entries = await listMemoryFiles(root, asString(args.path, "."));
-            return ok({ scope, entries });
-          }
-          case "search": {
-            const query = asString(args.query);
-            if (!query) return fail("query is required for action='search'.");
-            const matches = await searchMemoryFiles(root, query);
-            return ok({ scope, query, matches });
-          }
-          default:
-            return fail("action must be one of: read, write, list, search.");
+          throw err;
         }
-      } catch (err) {
-        return fail(err instanceof Error ? err.message : String(err));
-      }
-    },
-  };
-}
-
-/** Documents require a lowercase [a-z0-9_-] key — slugify whatever the model gives us. */
-function slugifyDocumentKey(raw: string): string {
-  const slug = raw
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9_-]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, 64);
-  return slug || "document";
+      });
+    }
+    default:
+      return fail("action must be one of: read, write, list.");
+  }
 }
 
 function issueDocumentTool(ctx: BuildToolsContext): Tool {
@@ -827,25 +817,15 @@ function issueDocumentTool(ctx: BuildToolsContext): Tool {
         name: "issue_document",
         description:
           "Read, write, or list durable markdown documents attached to an issue — visible in the " +
-          "Documents panel in the Paperclip web UI, with full revision history. Use this for anything " +
-          "you want a human to actually see and review (reports, plans, specs, write-ups) — not " +
-          "add_comment (which is a chat-style timeline entry) and not memory_fs (which is private/shared " +
-          "notes nobody sees in the UI). Writing to an existing key adds a new revision; it does not " +
-          "delete history.",
+          "Documents panel in the Paperclip web UI and the company Artifacts view, with full revision " +
+          "history. Use this for a task's own deliverables (reports, plans, specs, write-ups). For " +
+          "shared material other agents and future runs rely on, use `library`. Writing to an existing " +
+          "key adds a new revision; it does not delete history.",
         parameters: {
           type: "object",
           properties: {
-            action: { type: "string", enum: ["read", "write", "list"] },
-            issue_id: { type: "string", description: "Issue id. Omit to use the current issue." },
-            key: {
-              type: "string",
-              description:
-                "Short id for the document, e.g. 'design-doc' or 'weekly-report'. Lowercase letters, " +
-                "numbers, - and _ only — anything else is auto-slugified. Required for read/write.",
-            },
-            title: { type: "string", description: "Display title. Optional for write." },
-            body: { type: "string", description: "Full markdown content. Required for write — replace, don't diff." },
-            change_summary: { type: "string", description: "One-line note on what changed this revision. Optional." },
+            ...DOCUMENT_ACTION_PROPERTIES,
+            issue_id: { type: "string", description: "Issue id or identifier. Omit to use the current issue." },
           },
           required: ["action"],
         },
@@ -854,61 +834,111 @@ function issueDocumentTool(ctx: BuildToolsContext): Tool {
     execute: async (args) => {
       const id = asString(args.issue_id, ctx.currentIssueId ?? "");
       if (!id) return fail("No issue_id supplied and no current issue.");
-      const action = asString(args.action);
+      return runDocumentAction(ctx, "issue_document", id, args);
+    },
+  };
+}
 
-      switch (action) {
-        case "list":
-          return safeCall("issue_document(list)", () => ctx.api.listIssueDocuments(id));
-        case "read": {
-          const rawKey = asString(args.key);
-          if (!rawKey) return fail("key is required for action='read'.");
-          return safeCall("issue_document(read)", () => ctx.api.getIssueDocument(id, slugifyDocumentKey(rawKey)));
-        }
-        case "write": {
-          const rawKey = asString(args.key);
-          if (!rawKey) return fail("key is required for action='write'.");
-          if (typeof args.body !== "string" || !args.body) return fail("body is required for action='write'.");
-          const key = slugifyDocumentKey(rawKey);
-          const title = typeof args.title === "string" && args.title.trim() ? args.title.trim() : null;
-          const changeSummary =
-            typeof args.change_summary === "string" && args.change_summary.trim() ? args.change_summary.trim() : null;
-          const body = args.body as string;
+const defaultLibraries = new WeakMap<BuildToolsContext, LibraryResolver>();
+export function libraryFor(ctx: BuildToolsContext): LibraryResolver {
+  if (ctx.library) return ctx.library;
+  let library = defaultLibraries.get(ctx);
+  if (!library) {
+    const override = typeof ctx.config?.libraryIssue === "string" && ctx.config.libraryIssue.trim()
+      ? ctx.config.libraryIssue.trim()
+      : null;
+    library = new LibraryResolver(ctx.api, ctx.companyId, override);
+    defaultLibraries.set(ctx, library);
+  }
+  return library;
+}
 
-          return safeCall("issue_document(write)", async () => {
-            // Paperclip requires baseRevisionId to exactly match the
-            // document's current latestRevisionId on every update to an
-            // existing key (optimistic concurrency) — omitting it always
-            // 409s. Resolve it here instead of pushing revision tracking
-            // onto the model: fetch the current doc (undefined if it
-            // doesn't exist yet, which is correct for a create).
-            const currentDoc = await ctx.api.getIssueDocument(id, key).catch(() => null);
-            const baseRevisionId =
-              typeof currentDoc?.latestRevisionId === "string" ? currentDoc.latestRevisionId : undefined;
-            try {
-              return await ctx.api.upsertIssueDocument(id, key, { title, format: "markdown", body, changeSummary, baseRevisionId });
-            } catch (err) {
-              // One retry: if baseRevisionId went stale because of a
-              // concurrent write between our read and this write, re-fetch
-              // and try exactly once more before giving up.
-              if (err instanceof PaperclipApiError && err.status === 409) {
-                const retryDoc = await ctx.api.getIssueDocument(id, key).catch(() => null);
-                const retryRevisionId =
-                  typeof retryDoc?.latestRevisionId === "string" ? retryDoc.latestRevisionId : undefined;
-                return await ctx.api.upsertIssueDocument(id, key, {
-                  title,
-                  format: "markdown",
-                  body,
-                  changeSummary,
-                  baseRevisionId: retryRevisionId,
-                });
-              }
-              throw err;
-            }
-          });
-        }
-        default:
-          return fail("action must be one of: read, write, list.");
+function libraryTool(ctx: BuildToolsContext): Tool {
+  return {
+    schema: {
+      type: "function",
+      function: {
+        name: "library",
+        description:
+          `Read, write, or list the company's shared documents — the '${LIBRARY_ISSUE_TITLE}' issue that every ` +
+          "agent shares and humans can see in the web UI. This is the ONLY place for durable shared " +
+          "material: running logs (e.g. key 'content-log'), brief backlogs, drafts, reference notes, and " +
+          "anything a skill or your instructions call 'org storage', 'shared memory', or a file path like " +
+          "briefs/... — map a path to a key, e.g. 'briefs/2026-09-30-topic.md' → 'briefs-2026-09-30-topic'. " +
+          "Always action='list' first to see existing keys; update an existing key instead of creating a " +
+          "near-duplicate. There is no private or hidden storage.",
+        parameters: {
+          type: "object",
+          properties: DOCUMENT_ACTION_PROPERTIES,
+          required: ["action"],
+        },
+      },
+    },
+    execute: async (args) => {
+      let libraryIssue;
+      try {
+        libraryIssue = await libraryFor(ctx).get();
+      } catch (err) {
+        const reason = err instanceof PaperclipApiError ? `${err.message} (${err.status})` : err instanceof Error ? err.message : String(err);
+        return fail(`Could not open the ${LIBRARY_ISSUE_TITLE}: ${reason}`);
       }
+      const result = await runDocumentAction(ctx, "library", libraryIssue.id, args);
+      if (asString(args.action) === "list" && !result.isError) {
+        // Say where this lives so the model can cite it for humans.
+        return ok({ libraryIssue: libraryIssue.identifier ?? libraryIssue.id, documents: JSON.parse(result.content) });
+      }
+      return result;
+    },
+  };
+}
+
+function findDocumentsTool(ctx: BuildToolsContext): Tool {
+  return {
+    schema: {
+      type: "function",
+      function: {
+        name: "find_documents",
+        description:
+          "Search every document in the company (the web UI's Artifacts view) by keyword in title, body, " +
+          "or issue. Use it to find other agents' work — briefs, drafts, reports — before redoing it. Each " +
+          "result gives the issue and key to open with issue_document (action='read', issue_id, key).",
+        parameters: {
+          type: "object",
+          properties: {
+            query: { type: "string", description: "Keyword(s). Omit to list the most recently updated documents." },
+            limit: { type: "number", description: "Max results, default 20." },
+          },
+        },
+      },
+    },
+    execute: async (args) => {
+      const query: Record<string, string> = {
+        kind: "document",
+        limit: String(typeof args.limit === "number" && args.limit > 0 ? Math.min(args.limit, 50) : 20),
+      };
+      const q = asString(args.query).trim();
+      if (q) query.q = q;
+      return safeCall("find_documents", async () => {
+        const res = await ctx.api.listCompanyArtifacts(ctx.companyId, query);
+        const artifacts = Array.isArray(res.artifacts) ? (res.artifacts as Array<Record<string, unknown>>) : [];
+        return {
+          documents: artifacts.map((a) => {
+            const issue = (a.issue ?? {}) as Record<string, unknown>;
+            const href = typeof a.href === "string" ? a.href : "";
+            const key = href.includes("#document-") ? decodeURIComponent(href.split("#document-")[1]!) : null;
+            return {
+              title: a.title ?? null,
+              key,
+              issueId: issue.id ?? null,
+              issue: issue.identifier ?? null,
+              issueTitle: issue.title ?? null,
+              author: (a.createdByAgent as Record<string, unknown> | null)?.name ?? null,
+              updatedAt: a.updatedAt ?? null,
+              preview: a.previewText ?? null,
+            };
+          }),
+        };
+      });
     },
   };
 }
@@ -1129,8 +1159,9 @@ export function buildTools(ctx: BuildToolsContext): Tool[] {
     requestApprovalTool(ctx),
     askUserQuestionsTool(ctx),
     listInteractionsTool(ctx),
-    memoryFsTool(ctx),
     issueDocumentTool(ctx),
+    libraryTool(ctx),
+    findDocumentsTool(ctx),
     ...(hasSecrets ? [listSecretsTool(ctx)] : []),
     ...(httpEnabled ? [httpRequestTool(ctx)] : []),
   ];

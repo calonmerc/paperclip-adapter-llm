@@ -29,7 +29,7 @@ describe("tools.ts", () => {
     const api = makeApi(async () => jsonResponse({}));
     const tools = buildTools({ api, agentId: "agent-1", companyId: "company-1", currentIssueId: null, autoApprove: false });
 
-    expect(tools.length).toBe(14);
+    expect(tools.length).toBe(15);
     const names = toolSchemas(tools).map((s) => s.function.name);
     expect(names).toEqual([
       "get_issue",
@@ -44,9 +44,12 @@ describe("tools.ts", () => {
       "request_approval",
       "ask_user_questions",
       "list_interactions",
-      "memory_fs",
       "issue_document",
+      "library",
+      "find_documents",
     ]);
+    // Every storage path must be visible in the Paperclip UI — no hidden file storage.
+    expect(names).not.toContain("memory_fs");
   });
 
   it("findTool() finds a tool by name and returns null for unknown names", () => {
@@ -469,119 +472,205 @@ describe("list_interactions", () => {
   });
 });
 
-describe("memory_fs", () => {
-  let agentHomeDir: string;
+/**
+ * In-memory stand-in for the slice of the Paperclip API the Library uses:
+ * issue listing/creation plus issue documents.
+ */
+function fakeLibraryServer(initialIssues: Array<Record<string, unknown>> = []) {
+  const issues = [...initialIssues];
+  const docs = new Map<string, Map<string, { title: string | null; body: string; latestRevisionId: string }>>();
+  const calls: Array<{ method: string; path: string; body: any }> = [];
+  let rev = 0;
+  const fetchImpl = (async (input: any, init: any) => {
+    const url = new URL(typeof input === "string" ? input : input.url);
+    const method = (init?.method || "GET").toUpperCase();
+    const body = init?.body ? JSON.parse(init.body) : undefined;
+    calls.push({ method, path: url.pathname, body });
+    let m;
+    if (url.pathname === "/api/companies/company-1/issues" && method === "GET") {
+      return jsonResponse(issues.filter((i) => i.assigneeAgentId == null));
+    }
+    if (url.pathname === "/api/companies/company-1/issues" && method === "POST") {
+      const issue = { id: `lib-${issues.length + 1}`, identifier: `DEBA-${50 + issues.length}`, issueNumber: 50 + issues.length, assigneeAgentId: null, ...body };
+      issues.push(issue);
+      return jsonResponse(issue);
+    }
+    if ((m = url.pathname.match(/^\/api\/issues\/([^/]+)\/documents$/))) {
+      const byKey = docs.get(m[1]!) ?? new Map();
+      return jsonResponse([...byKey.entries()].map(([key, d]) => ({ key, title: d.title })));
+    }
+    if ((m = url.pathname.match(/^\/api\/issues\/([^/]+)\/documents\/([^/]+)$/))) {
+      const byKey = docs.get(m[1]!) ?? new Map();
+      docs.set(m[1]!, byKey);
+      const key = decodeURIComponent(m[2]!);
+      if (method === "GET") {
+        const d = byKey.get(key);
+        return d ? jsonResponse({ key, ...d }) : jsonResponse({ error: "Document not found" }, 404);
+      }
+      const d = { title: body.title ?? null, body: body.body, latestRevisionId: `rev-${++rev}` };
+      byKey.set(key, d);
+      return jsonResponse({ key, ...d });
+    }
+    if ((m = url.pathname.match(/^\/api\/issues\/([^/]+)$/))) {
+      const issue = issues.find((i) => i.id === m![1] || i.identifier === m![1]);
+      return issue ? jsonResponse(issue) : jsonResponse({ error: "Issue not found" }, 404);
+    }
+    return jsonResponse({ error: "unexpected" }, 500);
+  }) as typeof fetch;
+  return { issues, docs, calls, api: makeApi(fetchImpl) };
+}
 
-  beforeEach(() => {
-    agentHomeDir = fs.mkdtempSync(path.join(os.tmpdir(), "llm-adapter-tool-homes-"));
+describe("library", () => {
+  function libraryTool(api: PaperclipApi, config: Record<string, unknown> = {}) {
+    return findTool(
+      buildTools({ api, agentId: "agent-1", companyId: "company-1", currentIssueId: "issue-1", autoApprove: false, config }),
+      "library",
+    )!;
+  }
+
+  it("creates the unassigned 'Company Library' issue on first use, then writes/reads documents on it", async () => {
+    const server = fakeLibraryServer();
+    const tool = libraryTool(server.api);
+
+    const write = await tool.execute({ action: "write", key: "Content Log", body: "# Log\n| 1 | topic |" });
+    expect(write.isError).toBe(false);
+    expect(server.issues).toHaveLength(1);
+    expect(server.issues[0]).toMatchObject({ title: "Company Library", status: "backlog", assigneeAgentId: null });
+    expect(server.docs.get("lib-1")!.get("content-log")!.body).toContain("| 1 | topic |");
+
+    const read = await tool.execute({ action: "read", key: "content-log" });
+    expect(read.content).toContain("| 1 | topic |");
+
+    const list = JSON.parse((await tool.execute({ action: "list" })).content);
+    expect(list.libraryIssue).toBe("DEBA-50");
+    expect(list.documents).toEqual([{ key: "content-log", title: null }]);
+    // Only one issue creation across all three calls (resolved once per run).
+    expect(server.calls.filter((c) => c.method === "POST").length).toBe(1);
   });
 
+  it("reuses the oldest existing Library issue instead of creating another", async () => {
+    const server = fakeLibraryServer([
+      { id: "newer", identifier: "DEBA-60", issueNumber: 60, title: "Company Library", status: "backlog", assigneeAgentId: null },
+      { id: "older", identifier: "DEBA-51", issueNumber: 51, title: "Company Library", status: "backlog", assigneeAgentId: null },
+      { id: "gone", identifier: "DEBA-40", issueNumber: 40, title: "Company Library", status: "cancelled", assigneeAgentId: null },
+    ]);
+    await libraryTool(server.api).execute({ action: "write", key: "x", body: "y" });
+    expect(server.docs.has("older")).toBe(true);
+    expect(server.calls.some((c) => c.method === "POST")).toBe(false);
+  });
+
+  it("honors config.libraryIssue as an explicit pin", async () => {
+    const server = fakeLibraryServer([
+      { id: "pinned", identifier: "DEBA-7", issueNumber: 7, title: "Shared docs", status: "backlog", assigneeAgentId: null },
+    ]);
+    await libraryTool(server.api, { libraryIssue: "DEBA-7" }).execute({ action: "write", key: "x", body: "y" });
+    expect(server.docs.has("pinned")).toBe(true);
+  });
+});
+
+describe("find_documents", () => {
+  it("searches the company Artifacts view and returns issue + key for each document", async () => {
+    const calls: string[] = [];
+    const api = makeApi(async (input: any) => {
+      calls.push(String(input));
+      return jsonResponse({
+        artifacts: [
+          {
+            title: "Brief 03: FDCPA",
+            href: "/DEBA/issues/DEBA-50#document-briefs-2026-09-30-research-brief-03",
+            issue: { id: "lib-1", identifier: "DEBA-50", title: "Company Library" },
+            createdByAgent: { id: "a", name: "Dwight Schrute" },
+            updatedAt: "2026-09-30T00:00:00.000Z",
+            previewText: "Debt collector conduct rules...",
+          },
+        ],
+        nextCursor: null,
+      });
+    });
+    const tool = findTool(buildTools({ api, agentId: "agent-1", companyId: "company-1", currentIssueId: null, autoApprove: false }), "find_documents")!;
+
+    const result = JSON.parse((await tool.execute({ query: "FDCPA" })).content);
+
+    expect(calls[0]).toContain("/api/companies/company-1/artifacts?");
+    expect(calls[0]).toContain("kind=document");
+    expect(calls[0]).toContain("q=FDCPA");
+    expect(result.documents[0]).toMatchObject({
+      key: "briefs-2026-09-30-research-brief-03",
+      issue: "DEBA-50",
+      issueId: "lib-1",
+      author: "Dwight Schrute",
+    });
+  });
+});
+
+describe("memory_fs → Library migration", () => {
+  let agentHomeDir: string;
+  beforeEach(() => {
+    agentHomeDir = fs.mkdtempSync(path.join(os.tmpdir(), "llm-adapter-migrate-"));
+  });
   afterEach(() => {
     fs.rmSync(agentHomeDir, { recursive: true, force: true });
   });
 
-  function toolsFor(agentId: string) {
-    const api = makeApi(async () => jsonResponse({}));
-    return buildTools({
-      api,
-      agentId,
-      companyId: "company-1",
-      currentIssueId: null,
-      autoApprove: false,
-      config: { agentHomeDir },
-    });
+  function seed(rel: string, content: string) {
+    const target = path.join(agentHomeDir, rel);
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.writeFileSync(target, content);
   }
 
-  it("writes then reads back a private note", async () => {
-    const tools = toolsFor("agent-a");
-    const write = await findTool(tools, "memory_fs")!.execute({
-      action: "write",
-      scope: "private",
-      path: "memory/2026-09-29.md",
-      content: "Talked to Kyle about org storage.",
-    });
-    expect(write.isError).toBe(false);
+  it("copies shared and private files into Library documents once, keeps the source files, and skips existing keys", async () => {
+    const { migrateMemoryToLibrary, LibraryResolver } = await import("../src/server/library.js");
+    seed("company-1/shared/content-log.md", "# Content Log");
+    seed("company-1/shared/briefs/2026-09-30-research-brief-03-fdcpa-collector-rights.md", "brief body");
+    seed("company-1/shared/empty.md", "   ");
+    seed("company-1/agents/agent-1/notes/todo.md", "private note");
+    seed("company-1/agents/agent-2/notes/other.md", "someone else's");
 
-    const read = await findTool(tools, "memory_fs")!.execute({
-      action: "read",
-      scope: "private",
-      path: "memory/2026-09-29.md",
-    });
-    expect(read.isError).toBe(false);
-    expect(JSON.parse(read.content).content).toBe("Talked to Kyle about org storage.");
+    const server = fakeLibraryServer();
+    const run = () =>
+      migrateMemoryToLibrary({
+        api: server.api,
+        library: new LibraryResolver(server.api, "company-1"),
+        config: { agentHomeDir },
+        companyId: "company-1",
+        agentId: "agent-1",
+        agentName: "Oscar Martinez",
+      });
+
+    const first = await run();
+    const lib = server.docs.get("lib-1")!;
+    expect([...lib.keys()].sort()).toEqual([
+      "briefs-2026-09-30-research-brief-03-fdcpa-collector-rights",
+      "content-log",
+      "notes-oscar-martinez-notes-todo",
+    ]);
+    expect(lib.get("content-log")!.title).toBe("content-log.md");
+    expect(lib.get("notes-oscar-martinez-notes-todo")!.title).toBe("Oscar Martinez notes: notes/todo.md");
+    expect(first.migrated).toHaveLength(3);
+    // Another agent's private notes are theirs to migrate, not ours.
+    expect([...lib.values()].some((d) => d.body.includes("someone else's"))).toBe(false);
+    // Source files are never deleted.
+    expect(fs.existsSync(path.join(agentHomeDir, "company-1/shared/content-log.md"))).toBe(true);
+
+    const writesBefore = server.calls.filter((c) => c.method === "PUT").length;
+    const second = await run();
+    expect(second.migrated).toHaveLength(0);
+    expect(server.calls.filter((c) => c.method === "PUT").length).toBe(writesBefore);
   });
 
-  it("keeps private notes isolated between two agents in the same company", async () => {
-    const agentA = toolsFor("agent-a");
-    const agentB = toolsFor("agent-b");
-
-    await findTool(agentA, "memory_fs")!.execute({
-      action: "write",
-      scope: "private",
-      path: "secret.md",
-      content: "agent-a's private note",
+  it("does nothing (and never creates a Library) when there's no memory directory", async () => {
+    const { migrateMemoryToLibrary, LibraryResolver } = await import("../src/server/library.js");
+    const server = fakeLibraryServer();
+    const result = await migrateMemoryToLibrary({
+      api: server.api,
+      library: new LibraryResolver(server.api, "company-1"),
+      config: { agentHomeDir },
+      companyId: "company-1",
+      agentId: "agent-1",
+      agentName: "Oscar",
     });
-
-    const bReadsA = await findTool(agentB, "memory_fs")!.execute({
-      action: "read",
-      scope: "private",
-      path: "secret.md",
-    });
-    expect(bReadsA.isError).toBe(true);
-  });
-
-  it("lets two agents in the same company share notes via scope='shared'", async () => {
-    const agentA = toolsFor("agent-a");
-    const agentB = toolsFor("agent-b");
-
-    await findTool(agentA, "memory_fs")!.execute({
-      action: "write",
-      scope: "shared",
-      path: "plans/2026-09-29-launch.md",
-      content: "Launch plan drafted by agent-a.",
-    });
-
-    const bReadsShared = await findTool(agentB, "memory_fs")!.execute({
-      action: "read",
-      scope: "shared",
-      path: "plans/2026-09-29-launch.md",
-    });
-    expect(bReadsShared.isError).toBe(false);
-    expect(JSON.parse(bReadsShared.content).content).toBe("Launch plan drafted by agent-a.");
-  });
-
-  it("rejects a path that tries to escape the scope root", async () => {
-    const tools = toolsFor("agent-a");
-    const result = await findTool(tools, "memory_fs")!.execute({
-      action: "read",
-      scope: "private",
-      path: "../../../etc/passwd",
-    });
-    expect(result.isError).toBe(true);
-    expect(result.content).toContain("outside the allowed directory");
-  });
-
-  it("search finds a keyword across files in the chosen scope", async () => {
-    const tools = toolsFor("agent-a");
-    await findTool(tools, "memory_fs")!.execute({
-      action: "write",
-      scope: "private",
-      path: "life/areas/people/kyle/summary.md",
-      content: "Kyle prefers async updates.",
-    });
-
-    const result = await findTool(tools, "memory_fs")!.execute({ action: "search", scope: "private", query: "async" });
-    expect(result.isError).toBe(false);
-    const { matches } = JSON.parse(result.content);
-    expect(matches).toHaveLength(1);
-    expect(matches[0].path).toBe("life/areas/people/kyle/summary.md");
-  });
-
-  it("defaults to scope='private' when scope is omitted", async () => {
-    const tools = toolsFor("agent-a");
-    await findTool(tools, "memory_fs")!.execute({ action: "write", path: "note.md", content: "default scope" });
-    const result = await findTool(tools, "memory_fs")!.execute({ action: "read", path: "note.md" });
-    expect(JSON.parse(result.content).scope).toBe("private");
+    expect(result.migrated).toEqual([]);
+    expect(server.calls).toEqual([]);
   });
 });
 

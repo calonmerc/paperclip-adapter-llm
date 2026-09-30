@@ -99,13 +99,18 @@ export function getConfigSchema() {
                 hint: "Override path to the skills directory. Defaults to ~/.paperclip-llm-adapter/skills.",
             },
             {
-                key: "agentHomeDir",
-                label: "Agent memory directory",
+                key: "libraryIssue",
+                label: "Library issue",
                 type: "text",
-                hint: "Override the base directory for the memory_fs tool (file-based memory for skills like " +
-                    "para-memory-files). Defaults to ~/.paperclip-llm-adapter/homes. Private notes live under " +
-                    "<dir>/<companyId>/agents/<agentId>/; notes shared with every agent in the company live under " +
-                    "<dir>/<companyId>/shared/.",
+                hint: "Issue id or identifier (e.g. DEBA-50) holding the company's shared documents. Leave empty to use " +
+                    "the unassigned 'Company Library' issue, created automatically on first use.",
+            },
+            {
+                key: "agentHomeDir",
+                label: "Legacy memory directory",
+                type: "text",
+                hint: "Where the retired memory_fs tool kept hidden files (default ~/.paperclip-llm-adapter/homes). Only " +
+                    "read to migrate leftovers into Library documents; set it only if you had overridden it before.",
             },
             {
                 key: "instructionsFilePath",

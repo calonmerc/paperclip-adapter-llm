@@ -54,6 +54,7 @@ import {
 import { PaperclipApi } from "./paperclip-api.js";
 import { buildTools, toolSchemas, findTool, targetsCurrentIssue, type Tool } from "./tools.js";
 import { collectBoundSecrets, SecretStore } from "./http-request.js";
+import { LibraryResolver, migrateMemoryToLibrary } from "./library.js";
 import { loadSkills, renderSkillsForPrompt, reconcilePaperclipSkills } from "./skills.js";
 import {
   emitInit,
@@ -131,15 +132,15 @@ const DEFAULT_SYSTEM_PROMPT =
   "You have no shell, no bash, and no curl. To call an external API use http_request; reference bound " +
   "credentials as {{secret:NAME}} (list_secrets shows the names) and never ask for, print, or store a " +
   "secret's value. " +
-  "For file-based memory skills (e.g. para-memory-files): use the memory_fs tool, not real filesystem " +
-  "paths or shell commands — you have neither. Its scope='private' is what such skills call $AGENT_HOME " +
-  "(only you can see it); scope='shared' is one directory every agent in this company can read and write " +
-  "(use it for anything a skill says to keep outside personal memory, like plans/). There is no `qmd` " +
-  "command — use memory_fs with action='search' instead, in either scope. " +
-  "When you produce a document a human should actually read and review (a report, plan, spec, or " +
-  "write-up), use the issue_document tool, not add_comment or memory_fs — it's a real document with " +
-  "revision history, visible in the Documents panel in the Paperclip web UI. add_comment is for short " +
-  "chat-style updates; memory_fs is private/shared notes nobody in the UI ever sees. " +
+  "All storage is Paperclip documents that humans can see — there is no hidden, private, or file " +
+  "storage, no filesystem, and no shell. A task's own deliverables (a report, plan, spec, write-up) go " +
+  "on its issue via issue_document. Anything shared across tasks or agents — running logs, brief " +
+  "backlogs, drafts, reference notes, and whatever your instructions or skills call 'org storage', " +
+  "'shared memory', $AGENT_HOME, or a file path like briefs/... — goes in the company Library via the " +
+  "library tool (call action='list' first; a path like 'briefs/2026-09-30-topic.md' becomes key " +
+  "'briefs-2026-09-30-topic'). Use find_documents to search every document in the company. If a list " +
+  "or search comes back empty, it really is empty — do not repeat it with a slightly different path. " +
+  "add_comment is for short chat-style updates only. " +
   "Use update_issue to fix an issue's other fields yourself — title, description, priority, " +
   "assignee, or a stale blocker set (e.g. blockers pointing at an issue that's since been cancelled " +
   "or done) — instead of routing the change through the issue owner. update_issue_status stays the " +
@@ -413,6 +414,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   // exposed only through http_request's {{secret:NAME}} substitution.
   const envSecrets = collectBoundSecrets((config as unknown as Record<string, unknown>).env, isPaperclipRuntimeEnvKey);
   let secretStore = new SecretStore(envSecrets);
+  // Logged right after emitInit so the run viewer's header comes first.
+  const startupNotes: string[] = [];
+  const startupErrors: string[] = [];
 
   if (authToken) {
     api = new PaperclipApi({ authToken });
@@ -420,7 +424,36 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     await secretStore.init((reason) =>
       writeRawStderr(onLog, `[llm] could not list API-access secrets (continuing without them): ${reason}`),
     );
+    const libraryOverride = (config as unknown as Record<string, unknown>).libraryIssue;
+    const library = new LibraryResolver(
+      api,
+      companyId,
+      typeof libraryOverride === "string" && libraryOverride.trim() ? libraryOverride.trim() : null,
+    );
+    // One-time move of anything left in the retired memory_fs storage (plain
+    // files nobody could see in the UI) into Library documents. Idempotent
+    // via a marker file; never deletes the source files; never fails the run.
+    try {
+      const migration = await migrateMemoryToLibrary({
+        api,
+        library,
+        config: config as unknown as Record<string, unknown>,
+        companyId,
+        agentId: agent.id,
+        agentName: agent.name || agent.id,
+      });
+      if (migration.migrated.length > 0 && migration.library) {
+        startupNotes.push(
+          `Migrated ${migration.migrated.length} hidden memory file(s) into ${migration.library.identifier ?? "the Company Library"} documents: ` +
+            migration.migrated.map((m) => `${m.scope}:${m.path} → ${m.key}`).join(", "),
+        );
+      }
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      startupErrors.push(`[llm] memory → Library migration failed (will retry next run): ${reason}`);
+    }
     tools = buildTools({
+      library,
       api,
       agentId: agent.id,
       companyId,
@@ -440,6 +473,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
   // Emit init early so the run viewer renders the header.
   await emitInit(onLog, { model, sessionId: ctx.runId });
+  for (const note of startupNotes) await emitSystem(onLog, note);
+  for (const error of startupErrors) await writeRawStderr(onLog, error);
   const secretNames = secretStore.names();
   if (secretNames.length > 0 && tools.length > 0) {
     await emitSystem(onLog, `Bound secrets available via http_request: ${secretNames.join(", ")}`);

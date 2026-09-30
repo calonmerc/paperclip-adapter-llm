@@ -116,11 +116,12 @@ export const agentConfigurationDoc = `# llm adapter configuration
   runtime and prepended to the system prompt (takes precedence over \`systemPrompt\` if
   both are set). Manageable through Paperclip's own "Instructions" bundle editor in the
   agent UI — this adapter declares \`supportsInstructionsBundle\`.
-- \`agentHomeDir\` (string, optional) — Override base directory for the \`memory_fs\` tool
-  (scoped file-based memory for skills like \`para-memory-files\`). Defaults to
-  \`~/.paperclip-llm-adapter/homes\`. Two isolated scopes per company: \`private\`
-  (one directory per agent) and \`shared\` (one directory every agent in the company
-  can read/write). No shell access; a plain keyword search stands in for \`qmd\`.
+- \`libraryIssue\` (string, optional) — Issue id or identifier (e.g. \`DEBA-50\`) to use as
+  the company Library, where the \`library\` tool keeps shared documents. Defaults to the
+  oldest unassigned issue titled "Company Library", created on first use.
+- \`agentHomeDir\` (string, optional) — Legacy. Where the retired \`memory_fs\` tool kept
+  hidden files (default \`~/.paperclip-llm-adapter/homes\`). Only read, once, to migrate
+  leftover files into Library documents; nothing writes there anymore.
 
 OpenRouter-specific fields (ignored by other providers):
 - \`transforms\` (string[]) — e.g. ["middle-out"]
@@ -229,8 +230,9 @@ export interface LlmConfig {
    * prepended to the system prompt. Takes precedence over systemPrompt
    * if both are set. */
   instructionsFilePath?: string;
-  /** Override base directory for the memory_fs tool. Defaults to
-   * ~/.paperclip-llm-adapter/homes. See memory-fs.ts. */
+  /** Issue id/identifier pinned as the company Library. See library.ts. */
+  libraryIssue?: string;
+  /** Legacy memory_fs location, read only by the one-time migration. See memory-fs.ts. */
   agentHomeDir?: string;
 }
 

@@ -1,5 +1,40 @@
 # Changelog
 
+## [0.13.0] - 2026-09-30
+
+### Removed — hidden storage
+- **The `memory_fs` tool is gone.** It stored plain files in a server
+  directory (`~/.paperclip-llm-adapter/homes`) that no human could see in
+  the Paperclip UI. Agents had come to rely on its `shared` scope as "org
+  storage" for the content log, research briefs, and article drafts. Every
+  kind of agent storage is now a visible Paperclip document. The helper
+  module is read-only and exists only for the migration below.
+
+### Added
+- **`library` tool and the Company Library.** Shared, long-lived documents
+  live on one unassigned issue titled "Company Library". It's created on
+  first use, or pinned with the new `libraryIssue` config field. It's
+  visible on the issue and in the company Artifacts view, with revision
+  history. It stays unassigned because Paperclip lets any agent write
+  documents on an unassigned issue, and because it never triggers
+  heartbeats or disposition recovery. If agents race to create it, everyone
+  converges on the oldest one.
+- **`find_documents` tool.** Keyword search across every document in the
+  company (`GET /api/companies/:id/artifacts?kind=document`), returning
+  issue and key for each hit.
+- **Automatic migration.** At the start of every run, any files left in the
+  old storage (the company's shared scope plus the running agent's private
+  scope) are copied into Library documents. `briefs/x.md` becomes
+  `briefs-x`, and private notes become `notes-<agent>-...`. A marker file
+  makes it one-time per file, source files are never deleted, existing keys
+  aren't overwritten, and a failure never fails the run. The run log says
+  what moved.
+- The system prompt now says all storage is visible documents, maps "org
+  storage" / shared memory / file paths to the Library, and says an empty
+  listing really is empty. In a real run the model listed `shared/...`
+  paths that didn't exist over and over until the repeat-loop breaker
+  stopped it.
+
 ## [0.12.1] - 2026-09-30
 
 ### Fixed

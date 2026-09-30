@@ -12,6 +12,7 @@
  * normalizes for any provider that supports tools.
  */
 import { PaperclipApi } from "./paperclip-api.js";
+import { LibraryResolver } from "./library.js";
 import { SecretStore } from "./http-request.js";
 export interface ToolSchema {
     type: "function";
@@ -47,8 +48,10 @@ export interface BuildToolsContext {
     interactionCreated?: {
         value: boolean;
     };
-    /** Raw adapterConfig, needed by memory_fs to resolve agentHomeDir. */
+    /** Raw adapterConfig (httpAllowedHosts, httpToolEnabled, libraryIssue, ...). */
     config?: Record<string, unknown>;
+    /** Resolves the company Library issue; built from api/companyId/config if omitted. */
+    library?: LibraryResolver;
     /**
      * Every secret bound to this agent — env-var bindings and API-access
      * bindings. Only ever substituted into http_request calls; values are
@@ -60,6 +63,7 @@ export interface BuildToolsContext {
 }
 /** True when `issueId` (absent, the current issue's id, or its identifier) targets the current issue. */
 export declare function targetsCurrentIssue(ctx: Pick<BuildToolsContext, "currentIssueId" | "currentIssueIdentifier">, issueId: unknown): boolean;
+export declare function libraryFor(ctx: BuildToolsContext): LibraryResolver;
 export declare function buildTools(ctx: BuildToolsContext): Tool[];
 /** Get the schemas to send to the model. */
 export declare function toolSchemas(tools: Tool[]): ToolSchema[];
