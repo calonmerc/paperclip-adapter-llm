@@ -260,34 +260,46 @@ export function isDispositionRecoveryWake(context: Record<string, unknown>): boo
  * itself ("this is disposition-only, don't redo the task") and threw the
  * analysis away to self-block instead — "owner: me, action: try again
  * later." The next retry repeated the identical cycle: nothing was actually
- * blocked on anything external, so "blocked" never resolved. Step 1 now
- * lets the model finish a judgment call it already has the inputs for —
- * that's completing the one remaining step, not redoing the task. The ban
- * stays on re-fetching data, repeating multi-step work, and external
- * side effects, which is what this note was actually protecting against.
+ * blocked on anything external, so "blocked" never resolved. Step 1 was
+ * rewritten to let the model finish a judgment call it already has the
+ * inputs for, phrased as "already in hand" / "already see below" — which
+ * then caused a THIRD failure on the very next recovery run: every run of
+ * this adapter starts from a fresh message list (see the comment on that
+ * below in execute()), so nothing is ever literally "already in hand" at
+ * turn 1 of a recovery run, and the model reasoned exactly that: "I don't
+ * have the draft or brief content in context... reading them would be
+ * re-fetching data" — and blocked itself again rather than make the two
+ * cheap reads the task already pointed it to. Step 1 now says explicitly
+ * that reading the small number of documents a task already references is
+ * evidence-gathering, not redoing the task, even though it takes tool calls
+ * in a fresh run. The ban is on regenerating a deliverable or repeating
+ * work with external side effects — not on the reads needed to decide.
  */
 export function renderDispositionHandoffNote(context: Record<string, unknown>): string {
   if (!isDispositionRecoveryWake(context)) return "";
   const instruction = typeof context.instruction === "string" ? context.instruction.trim() : "";
   return [
     "# DISPOSITION RECOVERY — record a disposition this run",
-    "Your previous run on this issue ended without a valid disposition. Do not re-fetch data you can " +
-      "already see below, repeat multi-step work, or call external systems with side effects. But if " +
-      "everything you need for a final verdict is already in hand, finish that one judgment call and " +
-      "record it now — deferring it again is not safer than deciding it.",
+    "Your previous run on this issue ended without a valid disposition. This is a fresh run with an " +
+      "empty context, so nothing from a prior run is visible yet — reading the small number of existing " +
+      "documents or comments this task already points you to (a draft, a brief, a prior sign-off) is " +
+      "evidence-gathering, not redoing the task, even though it takes tool calls here. What's actually " +
+      "banned: regenerating a deliverable from scratch, repeating a multi-step pipeline, or calling an " +
+      "external system with side effects. Once you can see what you need, make the call — deferring again " +
+      "is not safer than deciding.",
     "",
     ...(instruction ? [instruction, ""] : []),
     "## Decide using this order — stop at the first step that applies, do not weigh it against the others",
-    "1. The deliverable is already finished (a comment/document shows it), OR you already have everything " +
-      "you need to make the call yourself — durable evidence fully in hand, nothing left but your own " +
-      "judgment, and finishing means one write with no external side effects → update_issue_status " +
-      "status='done' (or 'cancelled'), citing the evidence in `comment`.",
+    "1. The deliverable is already finished (a comment/document shows it), OR you can make the call " +
+      "yourself after reading what this task already references — that's evidence-gathering, go read it " +
+      "now if you haven't. Once you have it and finishing means one verdict write with no external side " +
+      "effects → update_issue_status status='done' (or 'cancelled'), citing the evidence in `comment`.",
     "2. A human must answer or act before you can continue → ask_user_questions.",
     "3. Someone else must review the result → update_issue_status status='in_review' with reviewer_user_id.",
-    "4. Otherwise — evidence is genuinely missing, or finishing would need external side effects or " +
-      "multi-step work → update_issue_status status='blocked' with unblock_action naming yourself as " +
-      "owner and a concrete next step. This is always valid and is the safe default when you truly can't " +
-      "finish right now.",
+    "4. Otherwise — evidence is genuinely missing even after reading what's referenced, or finishing would " +
+      "need external side effects or regenerating a deliverable → update_issue_status status='blocked' " +
+      "with unblock_action naming yourself as owner and a concrete next step. This is always valid and is " +
+      "the safe default when you truly can't finish right now.",
     "Do not create a sub-issue in this run or call external APIs with side effects.",
   ].join("\n");
 }

@@ -589,9 +589,29 @@ describe("library", () => {
 
     const list = JSON.parse((await tool.execute({ action: "list" })).content);
     expect(list.libraryIssue).toBe("DEBA-50");
-    expect(list.documents).toEqual([{ key: "content-log", title: null }]);
+    expect(list.documents).toEqual([
+      { key: "content-log", title: null, format: null, latestRevisionNumber: null, updatedAt: null, preview: "" },
+    ]);
     // Only one issue creation across all three calls (resolved once per run).
     expect(server.calls.filter((c) => c.method === "POST").length).toBe(1);
+  });
+
+  it("strips full document bodies out of action='list' — a real incident had one list call dump every library document's full text into context", async () => {
+    const server = fakeLibraryServer();
+    const tool = libraryTool(server.api);
+    const longBody = "x".repeat(5000);
+    await tool.execute({ action: "write", key: "big-draft", title: "Big Draft", body: longBody });
+
+    const list = JSON.parse((await tool.execute({ action: "list" })).content);
+    expect(list.documents).toHaveLength(1);
+    const doc = list.documents[0]!;
+    expect(doc.key).toBe("big-draft");
+    expect(doc).not.toHaveProperty("body");
+    expect(doc.preview.length).toBeLessThan(longBody.length);
+
+    // action='read' still returns the full body — only 'list' is trimmed.
+    const read = await tool.execute({ action: "read", key: "big-draft" });
+    expect(read.content).toContain(longBody);
   });
 
   it("reuses the oldest existing Library issue instead of creating another", async () => {

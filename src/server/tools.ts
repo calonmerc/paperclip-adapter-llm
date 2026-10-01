@@ -802,6 +802,32 @@ const DOCUMENT_ACTION_PROPERTIES = {
   change_summary: { type: "string", description: "One-line note on what changed this revision. Optional." },
 };
 
+/**
+ * Paperclip's GET .../documents returns each document's full body (plus
+ * revision/lock/author bookkeeping) — fine for one `read`, but a company
+ * library can hold dozens of multi-KB drafts and briefs, and `list` is the
+ * cheap "see what keys exist" call the tool description tells the model to
+ * reach for first. A real incident: a single `library(action='list')`
+ * dumped every document's full text into context, and that bloat was a
+ * direct contributor to the model running out of its turn's budget before
+ * ever emitting the write it was building toward. `list` now returns only
+ * what's needed to decide what to `read` next.
+ */
+function summarizeDocumentList(docs: Record<string, unknown>[]): Record<string, unknown>[] {
+  return docs.map((d) => {
+    const body = typeof d.body === "string" ? d.body : "";
+    const preview = body.length > 200 ? `${body.slice(0, 200)}…` : body;
+    return {
+      key: d.key ?? null,
+      title: d.title ?? null,
+      format: d.format ?? null,
+      latestRevisionNumber: d.latestRevisionNumber ?? null,
+      updatedAt: d.updatedAt ?? null,
+      preview,
+    };
+  });
+}
+
 /** read / write / list documents on one issue — shared by issue_document and library. */
 async function runDocumentAction(
   ctx: BuildToolsContext,
@@ -812,7 +838,9 @@ async function runDocumentAction(
   const action = asString(args.action);
   switch (action) {
     case "list":
-      return safeCall(`${label}(list)`, () => ctx.api.listIssueDocuments(issueId));
+      return safeCall(`${label}(list)`, async () =>
+        summarizeDocumentList(await ctx.api.listIssueDocuments(issueId)),
+      );
     case "read": {
       const rawKey = asString(args.key);
       if (!rawKey) return fail("key is required for action='read'.");

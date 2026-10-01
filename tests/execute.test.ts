@@ -803,14 +803,14 @@ describe("execute()", () => {
     expect(userMsg.content).not.toContain("create_sub_issue");
   });
 
-  it("lets the recovery note finish a judgment call the model already has the evidence for, instead of flatly banning redo", async () => {
-    // Real incident (DEBA-54): a flat "do NOT redo the work" ban made a
-    // compliance-review agent self-block ("owner: me, action: try again
-    // later") even after it had already read the draft + brief in hand and
-    // was most of the way through a real verdict — nothing was blocked on
-    // anything external, so every retry repeated the identical no-op cycle.
-    // The note must now invite finishing a judgment call when the evidence
-    // is already in hand, not just offer blocked as the only real option.
+  it("lets the recovery note finish a judgment call instead of flatly banning redo", async () => {
+    // Real incident (DEBA-54, 1st recurrence): a flat "do NOT redo the work"
+    // ban made a compliance-review agent self-block ("owner: me, action: try
+    // again later") even after it had already read the draft + brief in
+    // hand and was most of the way through a real verdict — nothing was
+    // blocked on anything external, so every retry repeated the identical
+    // no-op cycle. The note must invite finishing a judgment call, not just
+    // offer blocked as the only real option.
     fetchMock = setupFetchMock([assistantResponse("ok")]);
 
     await execute(
@@ -821,9 +821,32 @@ describe("execute()", () => {
 
     const firstChat = fetchMock.calls.find((c) => c.path.endsWith("/chat/completions"))!;
     const userMsg = ((firstChat.body as any).messages as Array<{ role: string; content: string }>).find((m) => m.role === "user")!;
-    expect(userMsg.content).toContain("you already have everything you need to make the call yourself");
-    expect(userMsg.content).toContain("finish that one judgment call");
     expect(userMsg.content).not.toContain("do NOT redo the work");
+  });
+
+  it("tells the recovery note that reading task-referenced documents is evidence-gathering, not redoing the task", async () => {
+    // Real incident (DEBA-54, 2nd recurrence): phrasing the above fix as
+    // "evidence already in hand" backfired — every run starts from an empty
+    // message list, so nothing is ever literally "in hand" at turn 1, and
+    // the model reasoned exactly that ("I don't have the draft or brief
+    // content in context... reading them would be re-fetching data") and
+    // self-blocked a THIRD time rather than make the two cheap reads the
+    // task already pointed it to. The note must say explicitly that reading
+    // task-referenced documents is allowed and expected, not conditional on
+    // already having them.
+    fetchMock = setupFetchMock([assistantResponse("ok")]);
+
+    await execute(
+      makeContext({
+        context: { issueId: "issue-1", handoffRequired: true },
+      }),
+    );
+
+    const firstChat = fetchMock.calls.find((c) => c.path.endsWith("/chat/completions"))!;
+    const userMsg = ((firstChat.body as any).messages as Array<{ role: string; content: string }>).find((m) => m.role === "user")!;
+    expect(userMsg.content).toContain("evidence-gathering, not redoing the task");
+    expect(userMsg.content).toContain("fresh run with an");
+    expect(userMsg.content).not.toContain("already in hand");
   });
 
   it("keeps the repeat-loop failure as the primary error when the blocked write also fails", async () => {

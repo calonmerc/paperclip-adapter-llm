@@ -64,6 +64,28 @@
   evidence is already fully in hand and finishing means one write with no
   external side effects, record the real verdict now instead of deferring
   it again.
+- **The recovery note's "already in hand" fix (above) caused a third
+  recurrence of the same `DEBA-54` failure** on the very next recovery run.
+  Every run starts from an empty message list, so nothing is ever literally
+  "already in hand" at turn 1 of a fresh run — the model reasoned exactly
+  that ("I don't have the draft or brief content in context... reading them
+  would be re-fetching data") and self-blocked again instead of making the
+  two cheap reads the task already pointed it to. `renderDispositionHandoffNote`
+  now says explicitly that reading the small number of documents a task
+  already references is evidence-gathering, not redoing the task, even
+  though it takes tool calls in a fresh run — the ban is on regenerating a
+  deliverable or causing external side effects, not on the reads needed to
+  decide.
+- **`library`/`issue_document`'s `action='list'` no longer returns full
+  document bodies.** Paperclip's underlying endpoint returns every
+  document's complete text; `list`'s job is just "what keys exist," and
+  contributed directly to the DEBA-54 incidents above — one `library(list)`
+  call in a company library with a dozen multi-KB drafts and briefs put all
+  of them in context (133k input tokens on one run), crowding out the
+  model's budget to actually finish the task it was mid-generating. `list`
+  now returns `key`/`title`/`format`/`latestRevisionNumber`/`updatedAt`/a
+  200-character `preview` per document; `action='read'` is unchanged and
+  still returns the full body.
 
 ## [0.13.0] - 2026-09-30
 
