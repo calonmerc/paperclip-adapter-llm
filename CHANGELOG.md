@@ -14,6 +14,17 @@
 - **`detectModel()` returns `null` unless `LLM_MODEL`/`OPENROUTER_MODEL` is
   set.** It used to report `openrouter/auto` as "detected" for everyone.
 
+### Fixed
+- **`update_issue` with a `status` no longer ends in a repeat loop.** Models
+  confuse it with `update_issue_status`: gpt-oss-120b sent
+  `update_issue({status: "done", comment})` over and over, got back "No
+  fields supplied to update.", and the repeat-loop guard set the finished
+  issue to `blocked`. `update_issue` now accepts a `status` (plus `comment`
+  and the blocker/reviewer fields), checks it the same way
+  `update_issue_status` does, and the call counts as the run's
+  disposition. When nothing usable is passed, the error names the ignored
+  fields and points to `update_issue_status` / `add_comment`.
+
 ## [0.13.0] - 2026-09-30
 
 ### Removed — hidden storage
