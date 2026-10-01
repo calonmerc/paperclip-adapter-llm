@@ -259,6 +259,42 @@ describe("execute()", () => {
     expect((chatCall!.body as any).transforms).toEqual(["middle-out", "foo"]);
   });
 
+  it("defaults reasoning effort to 'medium', not 'high', when reasoning is on", async () => {
+    // Real incident: at the old hardcoded "high", a model on a review task
+    // repeatedly burned its entire turn (90k-175k input tokens, up to 15.5k
+    // output) re-deriving the same conclusion several times within one turn
+    // and never reached a tool call — not even the trivial "blocked"
+    // fallback. "medium" is the new default; "high" is opt-in.
+    fetchMock = setupFetchMock([assistantResponse("done")]);
+
+    await execute(makeContext({ config: { model: "x", apiKey: "k", reasoning: true } as any }));
+
+    const chatCall = fetchMock.calls.find((c) => c.path.endsWith("/chat/completions"));
+    expect((chatCall!.body as any).reasoning).toEqual({ effort: "medium" });
+  });
+
+  it("still honors an explicit reasoningEffort of 'high'", async () => {
+    fetchMock = setupFetchMock([assistantResponse("done")]);
+
+    await execute(
+      makeContext({
+        config: { model: "x", apiKey: "k", reasoning: true, reasoningEffort: "high" } as any,
+      }),
+    );
+
+    const chatCall = fetchMock.calls.find((c) => c.path.endsWith("/chat/completions"));
+    expect((chatCall!.body as any).reasoning).toEqual({ effort: "high" });
+  });
+
+  it("sends no reasoning field at all when reasoning is off", async () => {
+    fetchMock = setupFetchMock([assistantResponse("done")]);
+
+    await execute(makeContext({ config: { model: "x", apiKey: "k" } as any }));
+
+    const chatCall = fetchMock.calls.find((c) => c.path.endsWith("/chat/completions"));
+    expect((chatCall!.body as any).reasoning).toBeUndefined();
+  });
+
   it("returns errorCode missing_api_key when no apiKey/authToken/env var is available", async () => {
     fetchMock = setupFetchMock([assistantResponse("done")]);
 

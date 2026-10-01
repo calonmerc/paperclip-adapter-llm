@@ -85,6 +85,13 @@ export const agentConfigurationDoc = `# llm adapter configuration
 - \`topP\` (number, optional) — Nucleus sampling. Default: 1
 - \`stream\` (boolean, optional) — SSE streaming. Default: true
 - \`reasoning\` (boolean, optional) — Extended thinking for supported models.
+- \`reasoningEffort\` ("low" | "medium" | "high", optional) — Only used when \`reasoning\`
+  is on. Default: "medium". A real incident on a review-type task: at "high", a model
+  burned 90k-175k input tokens and up to 15.5k output tokens per turn ruminating —
+  re-deriving the same conclusion across several restarts within one turn — and
+  repeatedly ran out of its turn's budget before ever emitting a tool call, even the
+  trivial fallback one. Turning this down is the first thing to try when a model stalls
+  out mid-turn with no tool call and no assistant text.
 - \`maxTurns\` (number, optional) — Max tool-loop turns per run. Default: 25
 - \`autoApprove\` (boolean, optional) — Skip approval gates for hire_agent and similar mutating tools.
 - \`skillsDir\` (string, optional) — Override path to the skills directory.
@@ -188,6 +195,8 @@ export interface LlmConfig {
   topP?: number;
   stream?: boolean;
   reasoning?: boolean;
+  /** Only used when reasoning is on. Default "medium" — see getConfigSchema's hint. */
+  reasoningEffort?: "low" | "medium" | "high";
   /** OpenRouter-specific. Comma-separated string when set via the config-schema form field. */
   transforms?: string[] | string;
   /** OpenRouter-specific. */

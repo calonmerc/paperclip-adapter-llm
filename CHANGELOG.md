@@ -108,6 +108,21 @@
   `parentId`/`updatedAt` instead of Paperclip's full issue objects
   (`get_issue` already covers one issue's full detail).
 
+### Changed — reasoning effort
+- **Reasoning effort is now a config field (`reasoningEffort`: low/medium/
+  high, default `medium`) instead of hardcoded `high` whenever `reasoning`
+  was on.** Root cause of the whole `DEBA-53`/`DEBA-54` incident chain,
+  found after the fixes above still didn't land: three more runs on the same
+  task, each with lean tool calls (no bloated `list`/`list_issues` calls),
+  still ended with empty text, no tool call, and no disposition — burning
+  90k-175k input tokens and up to 15.5k output tokens per turn. The model
+  wasn't failing to decide; it was re-deriving the same conclusion multiple
+  times within a single turn and running out of its turn's budget before
+  ever emitting a tool call, including the trivial "blocked" fallback that
+  needs zero further judgment. `high` reasoning effort was hardcoded with no
+  way for an operator to turn it down. This is the first thing to try when
+  an agent's runs keep ending with no tool call and no assistant text.
+
 ## [0.13.0] - 2026-09-30
 
 ### Removed — hidden storage

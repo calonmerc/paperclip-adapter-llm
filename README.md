@@ -73,6 +73,10 @@ Company-managed skills toggled in Paperclip's Skills panel are symlinked into th
 
 ## Configuration
 
+### Reasoning effort
+
+`reasoning` (toggle) turns on extended thinking for models that support it; `reasoningEffort` (`low`/`medium`/`high`, default `medium`) controls how much. The default used to be hardcoded to `high` with no way to turn it down. A real incident: on a review-type task, a model at `high` repeatedly burned its entire turn — 90k-175k input tokens, up to 15.5k output tokens in a single completion — re-deriving the same conclusion multiple times within one turn, and never reached a tool call, not even the trivial "blocked" fallback. If an agent's runs keep ending with no tool call and no assistant text (an empty `result.text` with a large `outputTokens`), turn this down before changing anything else — it's usually cheaper and more effective than a model or prompt change.
+
 ### OpenRouter (default — no `baseUrl` needed)
 
 ```jsonc

@@ -64,6 +64,21 @@ export function getConfigSchema() {
                 hint: "Only works with models that support reasoning (DeepSeek R1, QwQ, etc.)",
             },
             {
+                key: "reasoningEffort",
+                label: "Reasoning effort",
+                type: "select",
+                default: "medium",
+                options: [
+                    { value: "low", label: "Low" },
+                    { value: "medium", label: "Medium" },
+                    { value: "high", label: "High" },
+                ],
+                hint: "Only applies when reasoning is on. A real incident: at 'high', a weaker model " +
+                    "repeatedly burned its entire turn re-deriving the same conclusion multiple times " +
+                    "and never got to call a tool, even the trivial fallback one. Turn this down first " +
+                    "if an agent's runs keep ending with no tool call and no assistant text.",
+            },
+            {
                 key: "maxTurns",
                 label: "Max tool-loop turns",
                 type: "number",

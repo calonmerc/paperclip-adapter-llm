@@ -372,7 +372,13 @@ async function callChatCompletions(
     body.tools = toolSchemas(tools);
     body.tool_choice = "auto";
   }
-  if (config.reasoning) body.reasoning = { effort: "high" };
+  // "high" used to be hardcoded here regardless of the operator's choice. A
+  // real incident: on a review task, a model at "high" effort repeatedly
+  // burned its entire turn (90k-175k input tokens, up to 15.5k output)
+  // re-deriving the same conclusion several times within one turn and never
+  // reached a tool call — not even the trivial "blocked" fallback. "medium"
+  // is the default now; "high" is opt-in for models that actually need it.
+  if (config.reasoning) body.reasoning = { effort: config.reasoningEffort ?? "medium" };
   const transforms = Array.isArray(config.transforms)
     ? config.transforms
     : typeof config.transforms === "string"
