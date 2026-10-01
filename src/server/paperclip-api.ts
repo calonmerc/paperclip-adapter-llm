@@ -17,6 +17,14 @@ export interface PaperclipApiOptions {
   fetchImpl?: typeof fetch;
 }
 
+export interface DocumentUpsertBody {
+  title?: string | null;
+  format: "markdown";
+  body: string;
+  changeSummary?: string | null;
+  baseRevisionId?: string | null;
+}
+
 export class PaperclipApiError extends Error {
   constructor(
     message: string,
@@ -153,11 +161,7 @@ export class PaperclipApi {
    * getIssueDocument() first — see issueDocumentTool in tools.ts, which does
    * this automatically so the model never has to manage revision ids.
    */
-  upsertIssueDocument(
-    issueId: string,
-    key: string,
-    body: { title?: string | null; format: "markdown"; body: string; changeSummary?: string | null; baseRevisionId?: string | null },
-  ): Promise<Record<string, unknown>> {
+  upsertIssueDocument(issueId: string, key: string, body: DocumentUpsertBody): Promise<Record<string, unknown>> {
     return this.request("PUT", `/api/issues/${encodeURIComponent(issueId)}/documents/${encodeURIComponent(key)}`, body);
   }
 
@@ -261,5 +265,89 @@ export class PaperclipApi {
 
   createApproval(companyId: string, approval: Record<string, unknown>): Promise<Record<string, unknown>> {
     return this.request("POST", `/api/companies/${encodeURIComponent(companyId)}/approvals`, approval);
+  }
+
+  // ----- Projects and labels (name → id lookups) -----
+
+  listCompanyProjects(companyId: string): Promise<Record<string, unknown>[]> {
+    return this.request("GET", `/api/companies/${encodeURIComponent(companyId)}/projects`);
+  }
+
+  listCompanyLabels(companyId: string): Promise<Record<string, unknown>[]> {
+    return this.request("GET", `/api/companies/${encodeURIComponent(companyId)}/labels`);
+  }
+
+  // ----- Cases (experimental.enableCases; 403 "Cases are disabled" when off) -----
+
+  listCases(companyId: string, query: Record<string, string> = {}): Promise<Record<string, unknown>[]> {
+    const qs = new URLSearchParams(query).toString();
+    return this.request("GET", `/api/companies/${encodeURIComponent(companyId)}/cases${qs ? `?${qs}` : ""}`);
+  }
+
+  /** Creates the case, or updates the existing one with the same (caseType, key). */
+  upsertCase(companyId: string, body: Record<string, unknown>): Promise<Record<string, unknown>> {
+    return this.request("POST", `/api/companies/${encodeURIComponent(companyId)}/cases`, body);
+  }
+
+  /** Accepts the case UUID or its identifier (e.g. PAP-C42). */
+  getCase(caseId: string): Promise<Record<string, unknown>> {
+    return this.request("GET", `/api/cases/${encodeURIComponent(caseId)}`);
+  }
+
+  patchCase(caseId: string, patch: Record<string, unknown>): Promise<Record<string, unknown>> {
+    return this.request("PATCH", `/api/cases/${encodeURIComponent(caseId)}`, patch);
+  }
+
+  getCaseDocument(caseId: string, key: string): Promise<Record<string, unknown>> {
+    return this.request("GET", `/api/cases/${encodeURIComponent(caseId)}/documents/${encodeURIComponent(key)}`);
+  }
+
+  /** Same baseRevisionId rules as upsertIssueDocument. */
+  upsertCaseDocument(caseId: string, key: string, body: DocumentUpsertBody): Promise<Record<string, unknown>> {
+    return this.request("PUT", `/api/cases/${encodeURIComponent(caseId)}/documents/${encodeURIComponent(key)}`, body);
+  }
+
+  linkCaseIssue(caseId: string, body: { issueId: string; role: string }): Promise<Record<string, unknown>> {
+    return this.request("POST", `/api/cases/${encodeURIComponent(caseId)}/links`, body);
+  }
+
+  // ----- Status cards (experimental.enableStatusCards; 404 when off) -----
+
+  listStatusCards(companyId: string, archived = false): Promise<Record<string, unknown>[]> {
+    return this.request(
+      "GET",
+      `/api/companies/${encodeURIComponent(companyId)}/status-cards${archived ? "?archived=true" : ""}`,
+    );
+  }
+
+  getStatusCard(cardId: string): Promise<Record<string, unknown>> {
+    return this.request("GET", `/api/status-cards/${encodeURIComponent(cardId)}`);
+  }
+
+  createStatusCard(companyId: string, body: Record<string, unknown>): Promise<Record<string, unknown>> {
+    return this.request("POST", `/api/companies/${encodeURIComponent(companyId)}/status-cards`, body);
+  }
+
+  patchStatusCard(cardId: string, patch: Record<string, unknown>): Promise<Record<string, unknown>> {
+    return this.request("PATCH", `/api/status-cards/${encodeURIComponent(cardId)}`, patch);
+  }
+
+  refreshStatusCard(cardId: string, full: boolean): Promise<Record<string, unknown>> {
+    return this.request("POST", `/api/status-cards/${encodeURIComponent(cardId)}/refresh`, { full });
+  }
+
+  /** Runs the card's compiled queries and returns what they match. */
+  dryRunStatusCard(cardId: string): Promise<Record<string, unknown>> {
+    return this.request("GET", `/api/status-cards/${encodeURIComponent(cardId)}/dry-run`);
+  }
+
+  /** Summarizer-only: must come from the run that owns the card's generation issue. */
+  writeStatusCardQuery(cardId: string, body: Record<string, unknown>): Promise<Record<string, unknown>> {
+    return this.request("PUT", `/api/status-cards/${encodeURIComponent(cardId)}/query`, body);
+  }
+
+  /** Summarizer-only: must come from the run that owns the card's generation issue. */
+  writeStatusCardSummary(cardId: string, body: Record<string, unknown>): Promise<Record<string, unknown>> {
+    return this.request("PUT", `/api/status-cards/${encodeURIComponent(cardId)}/summary`, body);
   }
 }

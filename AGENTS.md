@@ -41,7 +41,7 @@ Don't add a `prepare` or `postinstall` script that runs `tsc`, and don't move `d
 | File | Owns |
 | --- | --- |
 | `src/server/execute.ts` | The run loop: wake prompt, `DEFAULT_SYSTEM_PROMPT`, tool dispatch, repeat-loop guard, disposition nudge, post-loop status/comment |
-| `src/server/tools.ts` | Every tool (`xxxTool(ctx)` builders, registered in `buildTools`) and the shared helpers |
+| `src/server/tools.ts` | Every tool (`xxxTool(ctx)` builders, registered in `buildTools`), the shared helpers, and `detectPaperclipFeatures` (the per-run Cases / Status Cards probe) |
 | `src/server/paperclip-api.ts` | The only client for Paperclip's REST API (`PaperclipApi`, `PaperclipApiError`) |
 | `src/server/http-request.ts` | Secrets (`SecretStore`), `{{secret:NAME}}` substitution, redaction, Google service-account tokens, host allowlist |
 | `src/server/library.ts` | Company Library issue resolution and the one-time `memory_fs` migration |
@@ -80,6 +80,8 @@ Users paste the run's JSON-lines transcript. To read one:
 - Tool results: `ok`, `fail`, `safeCall` (wraps an API call and formats `PaperclipApiError`).
   Arguments: `asString`. "Is this the current issue": `targetsCurrentIssue`, which also accepts the
   human identifier (e.g. `DEBA-47`). Status changes: `buildStatusPatch` + `sendStatusPatch`.
+  Documents (issue, library, or case): `writeDocument` / `appendDocument` over a `DocumentStore`,
+  which handle `baseRevisionId` and the 409 retry.
 - Validation that two tools need belongs in one helper they both call. Don't copy it.
 - Tests reuse the existing fakes. In `tests/tools.test.ts`: `makeApi`, `jsonResponse`,
   `fakeLibraryServer`. In `tests/execute.test.ts`: `setupFetchMock`, `toolCallResponse`,

@@ -157,6 +157,15 @@ function updateIssueStatusTool(ctx) {
  */
 function buildStatusPatch(ctx, args, status) {
     const isCurrent = targetsCurrentIssue(ctx, args.issue_id);
+    // Paperclip marks the card failed when its generation task closes without a
+    // summary, so "done" here would report success for a failed card.
+    if (isCurrent && status === "done" && ctx.statusCardTask && !ctx.statusCardTask.summaryWritten) {
+        return {
+            error: fail("This is a status-card task and no summary has been saved yet — closing it now marks the card as " +
+                "failed. Call publish_status_card action='save_summary' first, then mark this issue done. If you " +
+                "can't produce a summary, use status='blocked' with unblock_action instead."),
+        };
+    }
     if (isCurrent && NON_DISPOSITION_STATUSES.has(status)) {
         return {
             error: fail(`'${status}' is not a valid way to end a run on your own issue — Paperclip treats it as a missing ` +
@@ -758,87 +767,82 @@ async function runDocumentAction(ctx, label, issueId, args) {
                 return fail("key is required for action='write'.");
             if (typeof args.body !== "string" || !args.body)
                 return fail("body is required for action='write'.");
-            const key = slugifyDocumentKey(rawKey);
-            const title = typeof args.title === "string" && args.title.trim() ? args.title.trim() : null;
-            const changeSummary = typeof args.change_summary === "string" && args.change_summary.trim() ? args.change_summary.trim() : null;
-            const body = args.body;
-            return safeCall(`${label}(write)`, async () => {
-                // Paperclip requires baseRevisionId to exactly match the
-                // document's current latestRevisionId on every update to an
-                // existing key (optimistic concurrency) — omitting it always
-                // 409s. Resolve it here instead of pushing revision tracking
-                // onto the model: fetch the current doc (undefined if it
-                // doesn't exist yet, which is correct for a create).
-                const currentDoc = await ctx.api.getIssueDocument(issueId, key).catch(() => null);
-                const baseRevisionId = typeof currentDoc?.latestRevisionId === "string" ? currentDoc.latestRevisionId : undefined;
-                return upsertDocumentWithRetry(ctx, issueId, key, { title, body, changeSummary, baseRevisionId });
-            });
+            return safeCall(`${label}(write)`, () => writeDocument(issueDocumentStore(ctx, issueId), slugifyDocumentKey(rawKey), args));
         }
         case "append": {
-            // The most common write by far is "add one more entry to an
-            // existing document" (a review-log line, a sign-off, a log row) —
-            // but action='write' requires resending the ENTIRE document, since
-            // Paperclip has no diff/patch endpoint. A real incident: a model
-            // got all the way through a real compliance review, started
-            // reproducing the multi-KB draft verbatim to add one paragraph to
-            // its review log, and ran out of its turn's token budget before
-            // ever finishing the write — the review was correct, it just never
-            // got recorded. `append` does the read-modify-write here instead
-            // of asking the model to retype content it isn't changing.
             const rawKey = asString(args.key);
             if (!rawKey)
                 return fail("key is required for action='append'.");
             if (typeof args.body !== "string" || !args.body) {
                 return fail("body is required for action='append' — the new text to add, not the whole document.");
             }
-            const key = slugifyDocumentKey(rawKey);
-            const addition = args.body;
-            const changeSummary = typeof args.change_summary === "string" && args.change_summary.trim() ? args.change_summary.trim() : null;
-            return safeCall(`${label}(append)`, async () => {
-                const currentDoc = await ctx.api.getIssueDocument(issueId, key).catch(() => null);
-                if (!currentDoc || typeof currentDoc.body !== "string") {
-                    throw new Error(`No document at key '${key}' to append to — use action='write' to create it first.`);
-                }
-                const title = typeof args.title === "string" && args.title.trim()
-                    ? args.title.trim()
-                    : typeof currentDoc.title === "string"
-                        ? currentDoc.title
-                        : null;
-                const body = `${currentDoc.body.replace(/\s+$/, "")}\n\n${addition}`;
-                const baseRevisionId = typeof currentDoc.latestRevisionId === "string" ? currentDoc.latestRevisionId : undefined;
-                return upsertDocumentWithRetry(ctx, issueId, key, { title, body, changeSummary, baseRevisionId });
-            });
+            return safeCall(`${label}(append)`, () => appendDocument(issueDocumentStore(ctx, issueId), slugifyDocumentKey(rawKey), args, "action='write'"));
         }
         default:
             return fail("action must be one of: read, write, append, list.");
     }
 }
+function issueDocumentStore(ctx, issueId) {
+    return {
+        get: (key) => ctx.api.getIssueDocument(issueId, key),
+        put: (key, body) => ctx.api.upsertIssueDocument(issueId, key, body),
+    };
+}
+function caseDocumentStore(ctx, caseId) {
+    return {
+        get: (key) => ctx.api.getCaseDocument(caseId, key),
+        put: (key, body) => ctx.api.upsertCaseDocument(caseId, key, body),
+    };
+}
+function optionalTrimmed(v) {
+    return typeof v === "string" && v.trim() ? v.trim() : null;
+}
+/** Full replace. args: body (required), title, change_summary. */
+async function writeDocument(store, key, args) {
+    // Paperclip requires baseRevisionId to match the current revision on every
+    // update (and to be absent on create); resolve it here so the model never
+    // has to track revision ids.
+    const currentDoc = await store.get(key).catch(() => null);
+    const baseRevisionId = typeof currentDoc?.latestRevisionId === "string" ? currentDoc.latestRevisionId : undefined;
+    return upsertDocumentWithRetry(store, key, {
+        title: optionalTrimmed(args.title),
+        body: args.body,
+        changeSummary: optionalTrimmed(args.change_summary),
+        baseRevisionId,
+    });
+}
 /**
- * Shared by write and append: Paperclip 409s if baseRevisionId doesn't
- * exactly match the document's current latestRevisionId. One retry covers
- * a concurrent write landing between our read and this write.
+ * Read-modify-write so the model sends only the new text. A real incident:
+ * a model ran out of its turn's token budget retyping a multi-KB draft via
+ * a full write just to add one review-log paragraph, so the review was never
+ * recorded. `writeHint` names the create action in the calling tool.
  */
-async function upsertDocumentWithRetry(ctx, issueId, key, opts) {
+async function appendDocument(store, key, args, writeHint) {
+    const currentDoc = await store.get(key).catch(() => null);
+    if (!currentDoc || typeof currentDoc.body !== "string") {
+        throw new Error(`No document at key '${key}' to append to — use ${writeHint} to create it first.`);
+    }
+    return upsertDocumentWithRetry(store, key, {
+        title: optionalTrimmed(args.title) ?? (typeof currentDoc.title === "string" ? currentDoc.title : null),
+        body: `${currentDoc.body.replace(/\s+$/, "")}\n\n${args.body}`,
+        changeSummary: optionalTrimmed(args.change_summary),
+        baseRevisionId: typeof currentDoc.latestRevisionId === "string" ? currentDoc.latestRevisionId : undefined,
+    });
+}
+/**
+ * Paperclip 409s if baseRevisionId doesn't exactly match the document's
+ * current latestRevisionId. One retry covers a concurrent write landing
+ * between our read and this write.
+ */
+async function upsertDocumentWithRetry(store, key, opts) {
+    const send = (baseRevisionId) => store.put(key, { title: opts.title, format: "markdown", body: opts.body, changeSummary: opts.changeSummary, baseRevisionId });
     try {
-        return await ctx.api.upsertIssueDocument(issueId, key, {
-            title: opts.title,
-            format: "markdown",
-            body: opts.body,
-            changeSummary: opts.changeSummary,
-            baseRevisionId: opts.baseRevisionId,
-        });
+        return await send(opts.baseRevisionId);
     }
     catch (err) {
         if (err instanceof PaperclipApiError && err.status === 409) {
-            const retryDoc = await ctx.api.getIssueDocument(issueId, key).catch(() => null);
-            const retryRevisionId = typeof retryDoc?.latestRevisionId === "string" ? retryDoc.latestRevisionId : undefined;
-            return await ctx.api.upsertIssueDocument(issueId, key, {
-                title: opts.title,
-                format: "markdown",
-                body: opts.body,
-                changeSummary: opts.changeSummary,
-                baseRevisionId: retryRevisionId,
-            });
+            const retryDoc = await store.get(key).catch(() => null);
+            return await send(typeof retryDoc?.latestRevisionId === "string" ? retryDoc.latestRevisionId : undefined);
         }
         throw err;
     }
@@ -1182,6 +1186,623 @@ function httpRequestTool(ctx) {
         },
     };
 }
+// ----- Paperclip experimental features: cases and status cards -----
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+function isUuid(v) {
+    return UUID_RE.test(v);
+}
+function errorReason(err) {
+    if (err instanceof PaperclipApiError)
+        return `${err.status} ${err.message}`;
+    return err instanceof Error ? err.message : String(err);
+}
+/** Status-card generation issues carry their target in a ```json block in the description. */
+export function parseStatusCardTask(issue) {
+    const description = typeof issue.description === "string" ? issue.description : "";
+    const match = description.match(/```json\n([\s\S]*?)\n```/);
+    if (!match)
+        return null;
+    let payload;
+    try {
+        payload = JSON.parse(match[1]);
+    }
+    catch {
+        return null;
+    }
+    const operation = payload.operation;
+    if (operation !== "compile" && operation !== "update")
+        return null;
+    if (typeof payload.statusCardId !== "string" || payload.generationIssueId !== issue.id)
+        return null;
+    return {
+        operation,
+        statusCardId: payload.statusCardId,
+        generationIssueId: payload.generationIssueId,
+        summaryWritten: false,
+    };
+}
+/**
+ * Neither feature is advertised to adapters, so probe each with a cheap read:
+ * disabled cases answer 403 and disabled status cards 404. Any failure leaves
+ * the feature's tools out of this run.
+ */
+export async function detectPaperclipFeatures(api, companyId, currentIssueId) {
+    const errors = [];
+    const probe = (name, fn) => fn().then(() => true, (err) => {
+        const disabled = err instanceof PaperclipApiError && (err.status === 403 || err.status === 404);
+        if (!disabled)
+            errors.push(`${name}: ${errorReason(err)}`);
+        return false;
+    });
+    const [cases, statusCards] = await Promise.all([
+        probe("cases", () => api.listCases(companyId, { limit: "1" })),
+        probe("status cards", () => api.listStatusCards(companyId)),
+    ]);
+    let statusCardTask = null;
+    if (statusCards && currentIssueId) {
+        try {
+            statusCardTask = parseStatusCardTask(await api.getIssue(currentIssueId));
+        }
+        catch (err) {
+            errors.push(`status-card task lookup: ${errorReason(err)}`);
+        }
+    }
+    return { cases, statusCards, statusCardTask, errors };
+}
+/** Accepts an id or a name for a project/label; status-card queries and cases need the id. */
+async function resolveNamedId(ctx, kind, value) {
+    if (isUuid(value))
+        return value;
+    const rows = kind === "project"
+        ? await ctx.api.listCompanyProjects(ctx.companyId)
+        : await ctx.api.listCompanyLabels(ctx.companyId);
+    const list = Array.isArray(rows) ? rows : [];
+    const wanted = value.trim().toLowerCase();
+    const hit = list.find((r) => typeof r.name === "string" && r.name.trim().toLowerCase() === wanted);
+    if (hit && typeof hit.id === "string")
+        return hit.id;
+    const names = list.map((r) => r.name).filter((n) => typeof n === "string");
+    throw new Error(`No ${kind} named '${value}'. Available ${kind}s: ${names.length ? names.join(", ") : "(none)"}. ` +
+        `Use one of these names, or leave ${kind} out.`);
+}
+const CASE_STATUSES = ["draft", "in_progress", "in_review", "approved", "done", "cancelled"];
+const CASE_LINK_ROLES = ["origin", "work", "reference"];
+function caseStatusError(status) {
+    if (CASE_STATUSES.includes(status))
+        return null;
+    return fail(`'${status}' is not a case status. Use one of: ${CASE_STATUSES.join(", ")}. ` +
+        "(todo/backlog/blocked are issue statuses, not case statuses.)");
+}
+function summarizeCaseList(rows) {
+    return rows.map((c) => ({
+        id: c.id ?? null,
+        identifier: c.identifier ?? null,
+        caseType: c.caseType ?? null,
+        key: c.key ?? null,
+        title: c.title ?? null,
+        status: c.status ?? null,
+        parentCaseId: c.parentCaseId ?? null,
+        updatedAt: c.updatedAt ?? null,
+    }));
+}
+/** Case detail embeds every document's full body; keep only what's needed to pick one to read. */
+function summarizeCaseDetail(detail) {
+    const documents = Array.isArray(detail.documents) ? detail.documents : [];
+    return {
+        ...detail,
+        documents: documents.map((d) => {
+            const doc = (d.document ?? {});
+            return {
+                key: d.key ?? null,
+                title: doc.title ?? null,
+                latestRevisionNumber: doc.latestRevisionNumber ?? null,
+                updatedAt: doc.updatedAt ?? null,
+            };
+        }),
+    };
+}
+/** parent_case_id may be an identifier (PAP-C42); the API wants the UUID. */
+async function resolveCaseUuid(ctx, idOrIdentifier) {
+    if (isUuid(idOrIdentifier))
+        return idOrIdentifier;
+    const found = await ctx.api.getCase(idOrIdentifier);
+    if (typeof found.id !== "string")
+        throw new Error(`Case '${idOrIdentifier}' not found.`);
+    return found.id;
+}
+/** title/summary/status/parent/project, shared by save and update. */
+async function buildCaseBody(ctx, args) {
+    const body = {};
+    const title = optionalTrimmed(args.title);
+    if (title)
+        body.title = title;
+    if (typeof args.summary === "string")
+        body.summary = args.summary;
+    const status = asString(args.status);
+    if (status)
+        body.status = status;
+    const parent = asString(args.parent_case_id).trim();
+    if (parent)
+        body.parentCaseId = await resolveCaseUuid(ctx, parent);
+    const project = asString(args.project).trim();
+    if (project)
+        body.projectId = await resolveNamedId(ctx, "project", project);
+    return body;
+}
+function asFields(v) {
+    return v && typeof v === "object" && !Array.isArray(v) ? v : null;
+}
+function caseTool(ctx) {
+    return {
+        schema: {
+            type: "function",
+            function: {
+                name: "case",
+                description: "Paperclip Cases: durable records of what an agent is producing (a blog post, research packet, " +
+                    "release notes, incident, asset set), shown in the Cases tab. Issues coordinate the work; a case " +
+                    "holds the output. Actions: 'list' / 'get' to find cases; 'save' creates a case, or updates the " +
+                    "one with the same case_type + key — always pass a stable key (e.g. a slug) so a retry updates " +
+                    "instead of duplicating; 'update' changes an existing case by case_id; 'write_document' / " +
+                    "'append_document' / 'read_document' manage its markdown documents (key 'body' for the main " +
+                    "draft); 'link_issue' links an issue (the current issue is linked automatically on any write). " +
+                    `Statuses: ${CASE_STATUSES.join(", ")}.`,
+                parameters: {
+                    type: "object",
+                    properties: {
+                        action: {
+                            type: "string",
+                            enum: ["list", "get", "save", "update", "read_document", "write_document", "append_document", "link_issue"],
+                        },
+                        case_id: { type: "string", description: "Case id or identifier, e.g. 'PAP-C42'. Required except for list/save." },
+                        case_type: {
+                            type: "string",
+                            description: "save (required) / list filter: the kind of case, e.g. 'blog_post', 'incident'.",
+                        },
+                        key: {
+                            type: "string",
+                            description: "save: stable unique key within case_type, e.g. 'launch-announcement'. Documents: the " +
+                                "document key, default 'body'.",
+                        },
+                        title: { type: "string", description: "save (required) / update: case title. Documents: document title." },
+                        summary: { type: "string", description: "save/update: one-paragraph summary." },
+                        status: { type: "string", enum: CASE_STATUSES, description: "save/update; list also accepts 'active'." },
+                        fields: {
+                            type: "object",
+                            description: "save/update: small structured data owned by your skill, e.g. {\"slug\": \"...\", " +
+                                "\"publish_url\": null}. On update, these are merged into the existing fields.",
+                        },
+                        replace_fields: {
+                            type: "boolean",
+                            description: "update only: replace all fields instead of merging. Default false.",
+                        },
+                        parent_case_id: { type: "string", description: "save/update: parent case id or identifier, for child cases." },
+                        project: { type: "string", description: "save/update: project name or id." },
+                        body: {
+                            type: "string",
+                            description: "write_document: the full markdown (replaces the document). append_document: only the new text to add.",
+                        },
+                        change_summary: { type: "string", description: "Documents: one-line note on what changed." },
+                        issue_id: { type: "string", description: "link_issue: issue id or identifier. Omit for the current issue." },
+                        role: { type: "string", enum: CASE_LINK_ROLES, description: "link_issue: default 'reference'." },
+                        query: { type: "string", description: "list: search identifier, title, summary, or key." },
+                        limit: { type: "number", description: "list: max results, default 50." },
+                    },
+                    required: ["action"],
+                },
+            },
+        },
+        execute: async (args) => {
+            const action = asString(args.action);
+            const caseId = asString(args.case_id).trim();
+            const needsCase = action !== "list" && action !== "save";
+            if (needsCase && !caseId) {
+                return fail(`case_id is required for action='${action}'. Use action='list' to find it, or 'save' to create a case.`);
+            }
+            const status = asString(args.status);
+            if (status && !(action === "list" && status === "active")) {
+                const err = caseStatusError(status);
+                if (err)
+                    return err;
+            }
+            const docKey = slugifyDocumentKey(asString(args.key, "body"));
+            switch (action) {
+                case "list": {
+                    const query = {
+                        limit: String(typeof args.limit === "number" && args.limit > 0 ? Math.min(args.limit, 200) : 50),
+                    };
+                    if (asString(args.case_type))
+                        query.type = asString(args.case_type);
+                    if (status)
+                        query.status = status;
+                    if (asString(args.query).trim())
+                        query.q = asString(args.query).trim();
+                    return safeCall("case(list)", async () => {
+                        const rows = await ctx.api.listCases(ctx.companyId, query);
+                        return Array.isArray(rows) ? summarizeCaseList(rows) : rows;
+                    });
+                }
+                case "get":
+                    return safeCall("case(get)", async () => summarizeCaseDetail(await ctx.api.getCase(caseId)));
+                case "save": {
+                    const caseType = asString(args.case_type).trim();
+                    if (!caseType)
+                        return fail("case_type is required for action='save', e.g. 'blog_post'.");
+                    if (!optionalTrimmed(args.title))
+                        return fail("title is required for action='save'.");
+                    return safeCall("case(save)", async () => {
+                        const body = await buildCaseBody(ctx, args);
+                        body.caseType = caseType;
+                        const key = asString(args.key).trim();
+                        if (key)
+                            body.key = key;
+                        const fields = asFields(args.fields);
+                        if (fields)
+                            body.fields = fields;
+                        return summarizeCaseDetail(await ctx.api.upsertCase(ctx.companyId, body));
+                    });
+                }
+                case "update":
+                    return safeCall("case(update)", async () => {
+                        const patch = await buildCaseBody(ctx, args);
+                        const fields = asFields(args.fields);
+                        if (fields) {
+                            // Paperclip replaces `fields` wholesale; models send only the
+                            // keys they're changing, which would wipe the rest.
+                            if (args.replace_fields === true) {
+                                patch.fields = fields;
+                            }
+                            else {
+                                const current = await ctx.api.getCase(caseId);
+                                patch.fields = { ...(asFields(current.fields) ?? {}), ...fields };
+                            }
+                        }
+                        if (Object.keys(patch).length === 0) {
+                            throw new Error("Nothing to update. Pass title, summary, status, fields, parent_case_id, or project. " +
+                                "To change a document, use action='write_document' or 'append_document'.");
+                        }
+                        return summarizeCaseDetail(await ctx.api.patchCase(caseId, patch));
+                    });
+                case "read_document":
+                    return safeCall("case(read_document)", () => ctx.api.getCaseDocument(caseId, docKey));
+                case "write_document":
+                    if (typeof args.body !== "string" || !args.body)
+                        return fail("body is required for action='write_document'.");
+                    return safeCall("case(write_document)", () => writeDocument(caseDocumentStore(ctx, caseId), docKey, args));
+                case "append_document":
+                    if (typeof args.body !== "string" || !args.body) {
+                        return fail("body is required for action='append_document' — the new text to add, not the whole document.");
+                    }
+                    return safeCall("case(append_document)", () => appendDocument(caseDocumentStore(ctx, caseId), docKey, args, "action='write_document'"));
+                case "link_issue": {
+                    const role = asString(args.role, "reference");
+                    if (!CASE_LINK_ROLES.includes(role))
+                        return fail(`role must be one of: ${CASE_LINK_ROLES.join(", ")}.`);
+                    const rawIssue = asString(args.issue_id, ctx.currentIssueId ?? "").trim();
+                    if (!rawIssue)
+                        return fail("issue_id is required — there is no current issue.");
+                    return safeCall("case(link_issue)", async () => {
+                        const issueId = isUuid(rawIssue) ? rawIssue : String((await ctx.api.getIssue(rawIssue)).id);
+                        return ctx.api.linkCaseIssue(caseId, { issueId, role });
+                    });
+                }
+                default:
+                    return fail("action must be one of: list, get, save, update, read_document, write_document, append_document, link_issue.");
+            }
+        },
+    };
+}
+const STATUS_CARD_MAX_PROMPT = 4000;
+const REFRESH_MODES = ["manual", "interval", "reactive"];
+/** Builds refreshPolicy, filling the field Paperclip requires for the mode rather than rejecting the call. */
+function buildRefreshPolicy(args) {
+    const mode = asString(args.refresh_mode);
+    if (!mode)
+        return { defaults: [] };
+    if (!REFRESH_MODES.includes(mode))
+        return { error: fail(`refresh_mode must be one of: ${REFRESH_MODES.join(", ")}.`) };
+    const policy = { mode };
+    const defaults = [];
+    const positiveInt = (v) => (typeof v === "number" && v > 0 ? Math.round(v) : undefined);
+    if (mode === "interval") {
+        policy.intervalMinutes = positiveInt(args.interval_minutes);
+        if (!policy.intervalMinutes) {
+            policy.intervalMinutes = 60;
+            defaults.push("interval_minutes=60");
+        }
+    }
+    if (mode === "reactive") {
+        policy.debounceSeconds = positiveInt(args.debounce_seconds);
+        if (!policy.debounceSeconds) {
+            policy.debounceSeconds = 300;
+            defaults.push("debounce_seconds=300");
+        }
+    }
+    return { policy, defaults };
+}
+function summarizeStatusCard(card) {
+    const policy = (card.refreshPolicy ?? {});
+    return {
+        id: card.id ?? null,
+        title: card.title ?? null,
+        state: card.state ?? null,
+        refreshMode: policy.mode ?? null,
+        agentId: card.agentId ?? null,
+        createdByAgentId: card.createdByAgentId ?? null,
+        archived: Boolean(card.archivedAt),
+        updatedAt: card.updatedAt ?? null,
+    };
+}
+/** Paperclip only lets an agent manage cards it created; say so instead of leaving a bare 403. */
+async function manageStatusCard(label, fn) {
+    const result = await safeCall(label, fn);
+    if (result.isError && result.content.includes("only manage status cards they authored")) {
+        return fail(`${label} failed: you can only change status cards you created. Use action='list' to see who created ` +
+            "each card; to get a different card, create your own with action='create'.");
+    }
+    return result;
+}
+function statusCardTool(ctx) {
+    return {
+        schema: {
+            type: "function",
+            function: {
+                name: "status_card",
+                description: "Paperclip Status Cards: live summary tiles on the company's status board. You describe what to " +
+                    "watch in interest_prompt (e.g. 'Launch blockers in the Website project, newest first'); Paperclip " +
+                    "then assigns a hidden task to the card's summarizer agent, which writes and refreshes the summary " +
+                    "— you don't write it yourself. Actions: 'list', 'get' (includes the current summary), 'create', " +
+                    "'update' (only cards you created; archived=true removes it from the board), 'refresh' (ask the " +
+                    "summarizer to update it now).",
+                parameters: {
+                    type: "object",
+                    properties: {
+                        action: { type: "string", enum: ["list", "get", "create", "update", "refresh"] },
+                        card_id: { type: "string", description: "Required for get/update/refresh." },
+                        interest_prompt: {
+                            type: "string",
+                            description: `create (required) / update: what the card watches and how to write it, max ${STATUS_CARD_MAX_PROMPT} characters.`,
+                        },
+                        title: { type: "string", description: "create/update: fixed title. Omit to let the summarizer name it." },
+                        agent_id: {
+                            type: "string",
+                            description: "create/update: agent that writes the summary. Omit for the built-in Summarizer.",
+                        },
+                        refresh_mode: {
+                            type: "string",
+                            enum: REFRESH_MODES,
+                            description: "create/update: 'manual' (default), 'interval', or 'reactive' (when watched issues change).",
+                        },
+                        interval_minutes: { type: "number", description: "refresh_mode='interval': minutes between updates. Default 60." },
+                        debounce_seconds: {
+                            type: "number",
+                            description: "refresh_mode='reactive': wait this long after a change before updating. Default 300.",
+                        },
+                        archived: { type: "boolean", description: "update: true archives the card, false restores it." },
+                        full: { type: "boolean", description: "refresh: rebuild from scratch instead of patching. Default false." },
+                        include_archived: { type: "boolean", description: "list: list archived cards instead. Default false." },
+                    },
+                    required: ["action"],
+                },
+            },
+        },
+        execute: async (args) => {
+            const action = asString(args.action);
+            const cardId = asString(args.card_id).trim();
+            if ((action === "get" || action === "update" || action === "refresh") && !cardId) {
+                return fail(`card_id is required for action='${action}'. Use action='list' to find it.`);
+            }
+            const prompt = typeof args.interest_prompt === "string" ? args.interest_prompt.trim() : "";
+            if (prompt.length > STATUS_CARD_MAX_PROMPT) {
+                return fail(`interest_prompt is ${prompt.length} characters; the limit is ${STATUS_CARD_MAX_PROMPT}. Shorten it.`);
+            }
+            switch (action) {
+                case "list":
+                    return safeCall("status_card(list)", async () => {
+                        const rows = await ctx.api.listStatusCards(ctx.companyId, args.include_archived === true);
+                        return Array.isArray(rows) ? rows.map(summarizeStatusCard) : rows;
+                    });
+                case "get":
+                    return safeCall("status_card(get)", async () => {
+                        // fingerprint is Paperclip's per-issue change-tracking snapshot — large and not useful to the model.
+                        const { fingerprint: _fingerprint, ...card } = await ctx.api.getStatusCard(cardId);
+                        return card;
+                    });
+                case "create":
+                case "update": {
+                    const refresh = buildRefreshPolicy(args);
+                    if ("error" in refresh)
+                        return refresh.error;
+                    const body = {};
+                    if (prompt)
+                        body.interestPrompt = prompt;
+                    const title = optionalTrimmed(args.title);
+                    if (title)
+                        body.title = title;
+                    if (typeof args.agent_id === "string")
+                        body.agentId = args.agent_id.trim() || null;
+                    if (refresh.policy)
+                        body.refreshPolicy = refresh.policy;
+                    const note = refresh.defaults.length ? { defaultsApplied: refresh.defaults.join(", ") } : {};
+                    if (action === "create") {
+                        if (!prompt)
+                            return fail("interest_prompt is required for action='create' — describe what the card should watch.");
+                        return safeCall("status_card(create)", async () => ({
+                            ...summarizeStatusCard(await ctx.api.createStatusCard(ctx.companyId, body)),
+                            ...note,
+                        }));
+                    }
+                    if (typeof args.archived === "boolean")
+                        body.archived = args.archived;
+                    if (Object.keys(body).length === 0) {
+                        return fail("Nothing to update. Pass interest_prompt, title, agent_id, refresh_mode, or archived. " +
+                            "To regenerate the summary, use action='refresh'.");
+                    }
+                    return manageStatusCard("status_card(update)", async () => ({
+                        ...summarizeStatusCard(await ctx.api.patchStatusCard(cardId, body)),
+                        ...note,
+                    }));
+                }
+                case "refresh":
+                    return manageStatusCard("status_card(refresh)", () => ctx.api.refreshStatusCard(cardId, args.full === true));
+                default:
+                    return fail("action must be one of: list, get, create, update, refresh.");
+            }
+        },
+    };
+}
+/** Maps a model-written query to Paperclip's company-search query shape. */
+async function normalizeStatusCardQuery(ctx, raw) {
+    const query = {};
+    const str = (...keys) => {
+        for (const k of keys)
+            if (typeof raw[k] === "string" && raw[k].trim())
+                return raw[k].trim();
+        return "";
+    };
+    const list = (...keys) => {
+        for (const k of keys) {
+            const v = raw[k];
+            if (Array.isArray(v))
+                return v.filter((x) => typeof x === "string");
+            if (typeof v === "string" && v.trim())
+                return v.split(",").map((s) => s.trim()).filter(Boolean);
+        }
+        return [];
+    };
+    if (str("q", "query", "text"))
+        query.q = str("q", "query", "text");
+    if (str("scope"))
+        query.scope = str("scope");
+    if (typeof raw.limit === "number" && raw.limit > 0)
+        query.limit = Math.min(Math.round(raw.limit), 50);
+    const status = list("status", "statuses");
+    if (status.length)
+        query.status = status;
+    const priority = list("priority", "priorities");
+    if (priority.length)
+        query.priority = priority;
+    if (str("assignee_agent_id", "assigneeAgentId"))
+        query.assigneeAgentId = str("assignee_agent_id", "assigneeAgentId");
+    const project = str("project", "project_id", "projectId");
+    if (project)
+        query.projectId = await resolveNamedId(ctx, "project", project);
+    const label = str("label", "label_id", "labelId");
+    if (label)
+        query.labelId = await resolveNamedId(ctx, "label", label);
+    if (str("updated_within", "updatedWithin"))
+        query.updatedWithin = str("updated_within", "updatedWithin");
+    if (str("sort"))
+        query.sort = str("sort");
+    return query;
+}
+function publishStatusCardTool(ctx, task) {
+    const label = (action) => `publish_status_card(${action})`;
+    return {
+        schema: {
+            type: "function",
+            function: {
+                name: "publish_status_card",
+                description: "Your current issue is a status-card task: you are this card's summarizer. The card and task ids are " +
+                    "filled in for you. " +
+                    (task.operation === "compile"
+                        ? "Steps: 1) 'save_query' — turn the interest prompt into search queries plus a short card title; " +
+                            "2) 'preview' — see which issues those queries match; 3) 'save_summary' — write the markdown " +
+                            "summary of those issues the way the interest prompt asks; 4) update_issue_status status='done'."
+                        : "Queries are already compiled. Steps: 1) optionally 'preview' to see the issues the card watches; " +
+                            "2) 'save_summary' — write the updated markdown summary from the previous summary and the changed " +
+                            "issues in your task description; 3) update_issue_status status='done'.") +
+                    " Mentioning an issue by identifier (e.g. ABC-123) in the summary adds it to the card's watched set.",
+                parameters: {
+                    type: "object",
+                    properties: {
+                        action: { type: "string", enum: ["save_query", "preview", "save_summary"] },
+                        queries: {
+                            type: "array",
+                            description: "save_query: one or more searches; the card watches the union. Keep each narrow.",
+                            items: {
+                                type: "object",
+                                properties: {
+                                    q: { type: "string", description: "Search text. Omit to match everything in the filters." },
+                                    scope: { type: "string", enum: ["issues", "all", "comments", "documents", "artifacts", "agents", "projects"] },
+                                    status: {
+                                        type: "array",
+                                        items: { type: "string", enum: ["backlog", "todo", "in_progress", "in_review", "blocked", "done", "cancelled"] },
+                                    },
+                                    priority: { type: "array", items: { type: "string", enum: ["critical", "high", "medium", "low"] } },
+                                    project: { type: "string", description: "Project name or id." },
+                                    label: { type: "string", description: "Label name or id." },
+                                    assignee_agent_id: { type: "string" },
+                                    updated_within: { type: "string", description: "e.g. '24h', '7d', '4w'." },
+                                    sort: { type: "string", enum: ["relevance", "updated", "created", "priority"] },
+                                    limit: { type: "number", description: "Max matches, 1-50. Default 20." },
+                                },
+                            },
+                        },
+                        title: { type: "string", description: "save_query (required): short card title. save_summary: optional new title." },
+                        markdown: { type: "string", description: "save_summary (required): the full summary in markdown." },
+                        change_summary: { type: "string", description: "One line on what changed." },
+                    },
+                    required: ["action"],
+                },
+            },
+        },
+        execute: async (args) => {
+            const action = asString(args.action);
+            switch (action) {
+                case "save_query": {
+                    if (task.operation !== "compile") {
+                        return fail("This is an update task — the card's queries are already compiled. Call action='save_summary'.");
+                    }
+                    const queries = Array.isArray(args.queries) ? args.queries.filter((q) => asFields(q)) : [];
+                    if (queries.length === 0) {
+                        return fail("queries is required: an array of searches, e.g. [{\"q\": \"launch\", \"status\": [\"in_progress\", \"blocked\"]}].");
+                    }
+                    const title = optionalTrimmed(args.title);
+                    if (!title)
+                        return fail("title is required for action='save_query' — a short name for the card.");
+                    return safeCall(label(action), async () => {
+                        const normalized = await Promise.all(queries.map((q) => normalizeStatusCardQuery(ctx, q)));
+                        const card = await ctx.api.writeStatusCardQuery(task.statusCardId, {
+                            queries: normalized,
+                            title,
+                            changeSummary: optionalTrimmed(args.change_summary) ?? "Compiled the interest prompt into queries.",
+                            generationIssueId: task.generationIssueId,
+                        });
+                        return { saved: true, queryVersion: card.queryVersion ?? null, next: "Call action='preview' to see the matching issues." };
+                    });
+                }
+                case "preview":
+                    return safeCall(label(action), () => ctx.api.dryRunStatusCard(task.statusCardId));
+                case "save_summary": {
+                    const markdown = typeof args.markdown === "string" ? args.markdown.trim() : "";
+                    if (!markdown)
+                        return fail("markdown is required for action='save_summary' — the full summary text.");
+                    const result = await safeCall(label(action), async () => {
+                        const body = {
+                            markdown,
+                            changeSummary: optionalTrimmed(args.change_summary) ?? "Updated the summary.",
+                            generationIssueId: task.generationIssueId,
+                        };
+                        const title = optionalTrimmed(args.title);
+                        if (title)
+                            body.title = title;
+                        if (ctx.model)
+                            body.model = ctx.model;
+                        await ctx.api.writeStatusCardSummary(task.statusCardId, body);
+                        task.summaryWritten = true;
+                        return { saved: true, next: "Now call update_issue_status status='done' to finish this task." };
+                    });
+                    if (result.isError && result.content.includes("Compile the status-card query")) {
+                        return fail("The card has no queries yet. Call action='save_query' first, then save_summary.");
+                    }
+                    return result;
+                }
+                default:
+                    return fail("action must be one of: save_query, preview, save_summary.");
+            }
+        },
+    };
+}
 // ----- public API -----
 export function buildTools(ctx) {
     // http_request is opt-in: agents with no bound secrets keep a no-network
@@ -1206,6 +1827,9 @@ export function buildTools(ctx) {
         findDocumentsTool(ctx),
         ...(hasSecrets ? [listSecretsTool(ctx)] : []),
         ...(httpEnabled ? [httpRequestTool(ctx)] : []),
+        ...(ctx.features?.cases ? [caseTool(ctx)] : []),
+        ...(ctx.features?.statusCards ? [statusCardTool(ctx)] : []),
+        ...(ctx.statusCardTask ? [publishStatusCardTool(ctx, ctx.statusCardTask)] : []),
     ];
 }
 /** Get the schemas to send to the model. */

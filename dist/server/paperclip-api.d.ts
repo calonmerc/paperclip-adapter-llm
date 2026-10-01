@@ -15,6 +15,13 @@ export interface PaperclipApiOptions {
     /** Optional fetch impl override for tests. */
     fetchImpl?: typeof fetch;
 }
+export interface DocumentUpsertBody {
+    title?: string | null;
+    format: "markdown";
+    body: string;
+    changeSummary?: string | null;
+    baseRevisionId?: string | null;
+}
 export declare class PaperclipApiError extends Error {
     readonly status: number;
     readonly body: unknown;
@@ -47,13 +54,7 @@ export declare class PaperclipApi {
      * getIssueDocument() first — see issueDocumentTool in tools.ts, which does
      * this automatically so the model never has to manage revision ids.
      */
-    upsertIssueDocument(issueId: string, key: string, body: {
-        title?: string | null;
-        format: "markdown";
-        body: string;
-        changeSummary?: string | null;
-        baseRevisionId?: string | null;
-    }): Promise<Record<string, unknown>>;
+    upsertIssueDocument(issueId: string, key: string, body: DocumentUpsertBody): Promise<Record<string, unknown>>;
     /**
      * Acquire the issue lock for the current run. Required before any
      * write operation (add_comment, update status) on an issue, otherwise
@@ -112,5 +113,31 @@ export declare class PaperclipApi {
         value: string;
     }>;
     createApproval(companyId: string, approval: Record<string, unknown>): Promise<Record<string, unknown>>;
+    listCompanyProjects(companyId: string): Promise<Record<string, unknown>[]>;
+    listCompanyLabels(companyId: string): Promise<Record<string, unknown>[]>;
+    listCases(companyId: string, query?: Record<string, string>): Promise<Record<string, unknown>[]>;
+    /** Creates the case, or updates the existing one with the same (caseType, key). */
+    upsertCase(companyId: string, body: Record<string, unknown>): Promise<Record<string, unknown>>;
+    /** Accepts the case UUID or its identifier (e.g. PAP-C42). */
+    getCase(caseId: string): Promise<Record<string, unknown>>;
+    patchCase(caseId: string, patch: Record<string, unknown>): Promise<Record<string, unknown>>;
+    getCaseDocument(caseId: string, key: string): Promise<Record<string, unknown>>;
+    /** Same baseRevisionId rules as upsertIssueDocument. */
+    upsertCaseDocument(caseId: string, key: string, body: DocumentUpsertBody): Promise<Record<string, unknown>>;
+    linkCaseIssue(caseId: string, body: {
+        issueId: string;
+        role: string;
+    }): Promise<Record<string, unknown>>;
+    listStatusCards(companyId: string, archived?: boolean): Promise<Record<string, unknown>[]>;
+    getStatusCard(cardId: string): Promise<Record<string, unknown>>;
+    createStatusCard(companyId: string, body: Record<string, unknown>): Promise<Record<string, unknown>>;
+    patchStatusCard(cardId: string, patch: Record<string, unknown>): Promise<Record<string, unknown>>;
+    refreshStatusCard(cardId: string, full: boolean): Promise<Record<string, unknown>>;
+    /** Runs the card's compiled queries and returns what they match. */
+    dryRunStatusCard(cardId: string): Promise<Record<string, unknown>>;
+    /** Summarizer-only: must come from the run that owns the card's generation issue. */
+    writeStatusCardQuery(cardId: string, body: Record<string, unknown>): Promise<Record<string, unknown>>;
+    /** Summarizer-only: must come from the run that owns the card's generation issue. */
+    writeStatusCardSummary(cardId: string, body: Record<string, unknown>): Promise<Record<string, unknown>>;
 }
 //# sourceMappingURL=paperclip-api.d.ts.map

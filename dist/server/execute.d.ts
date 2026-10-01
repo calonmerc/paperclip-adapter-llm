@@ -31,6 +31,7 @@
  *   - Attachment / multimodal handling
  */
 import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
+import { type PaperclipFeatures } from "./tools.js";
 /**
  * Paperclip's missing-disposition recovery (a "successful run handoff") puts
  * its instructions at the top level of the run context — `handoffRequired`
@@ -49,6 +50,11 @@ export declare function isDispositionRecoveryWake(context: Record<string, unknow
  * evidence-gathering because every run starts from an empty context — a
  * "use what's already in hand" rule is never satisfied at turn 1.
  */
+/**
+ * The paperclip skill documents cases as HTTP endpoints this adapter can't
+ * call, so map them to the tools. Only for features that are enabled.
+ */
+export declare function renderPaperclipFeatureNote(features: PaperclipFeatures | null): string;
 export declare function renderDispositionHandoffNote(context: Record<string, unknown>): string;
 export declare function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult>;
 //# sourceMappingURL=execute.d.ts.map

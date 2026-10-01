@@ -60,10 +60,40 @@ export interface BuildToolsContext {
     secretStore?: SecretStore;
     /** Shorthand for a store holding only these env-var secrets (tests, direct calls). */
     secrets?: Record<string, string>;
+    /** Experimental Paperclip features found enabled by detectPaperclipFeatures. */
+    features?: {
+        cases: boolean;
+        statusCards: boolean;
+    };
+    /** Set when the current issue is a status card's generation task; mutated by publish_status_card. */
+    statusCardTask?: StatusCardTask | null;
+    /** Model id for this run, recorded on status-card summaries. */
+    model?: string;
+}
+export interface StatusCardTask {
+    operation: "compile" | "update";
+    statusCardId: string;
+    generationIssueId: string;
+    summaryWritten: boolean;
 }
 /** True when `issueId` (absent, the current issue's id, or its identifier) targets the current issue. */
 export declare function targetsCurrentIssue(ctx: Pick<BuildToolsContext, "currentIssueId" | "currentIssueIdentifier">, issueId: unknown): boolean;
 export declare function libraryFor(ctx: BuildToolsContext): LibraryResolver;
+/** Status-card generation issues carry their target in a ```json block in the description. */
+export declare function parseStatusCardTask(issue: Record<string, unknown>): StatusCardTask | null;
+export interface PaperclipFeatures {
+    cases: boolean;
+    statusCards: boolean;
+    statusCardTask: StatusCardTask | null;
+    /** Unexpected probe or generation-task lookup failures, for the run log. */
+    errors: string[];
+}
+/**
+ * Neither feature is advertised to adapters, so probe each with a cheap read:
+ * disabled cases answer 403 and disabled status cards 404. Any failure leaves
+ * the feature's tools out of this run.
+ */
+export declare function detectPaperclipFeatures(api: PaperclipApi, companyId: string, currentIssueId: string | null): Promise<PaperclipFeatures>;
 export declare function buildTools(ctx: BuildToolsContext): Tool[];
 /** Get the schemas to send to the model. */
 export declare function toolSchemas(tools: Tool[]): ToolSchema[];

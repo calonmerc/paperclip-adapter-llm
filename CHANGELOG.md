@@ -2,6 +2,30 @@
 
 ## [Unreleased]
 
+### Added — Cases and Status Cards
+- **`case` tool** for Paperclip's experimental Cases: list, get, save
+  (upsert on `case_type` + `key`), update, read/write/append case
+  documents, and link issues. `update` merges `fields` into the existing
+  ones, because Paperclip replaces the whole object and models send
+  partial ones.
+- **`status_card` tool** to list, get, create, update, and refresh
+  status-board cards. A missing `interval_minutes`/`debounce_seconds` for
+  the chosen refresh mode gets a default instead of an error.
+- **`publish_status_card` tool** for runs on a card's hidden generation
+  issue: `save_query`, `preview`, and `save_summary`, with the card and
+  generation ids read from the issue description. Before this, a card
+  whose summarizer was an LLM-adapter agent could never be written.
+  Marking that issue `done` is refused until the summary is saved,
+  since Paperclip fails the card when its task closes without one.
+- **Feature probe.** Paperclip doesn't advertise experimental features,
+  so each run makes one read per feature and registers its tools only
+  when the read succeeds. The system prompt gets a note pointing the
+  `paperclip` skill's case endpoints at the `case` tool.
+
+### Changed
+- The document write/append/409-retry logic behind `issue_document` and
+  `library` now works on any document store, so case documents share it.
+
 ### Changed — model picker
 - **The Model dropdown now lists real models from the provider.** Paperclip
   calls `listModels()` with no agent config, so it reads the provider from

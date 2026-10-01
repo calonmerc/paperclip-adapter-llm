@@ -10,7 +10,15 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { PaperclipApi } from "../src/server/paperclip-api.js";
-import { buildTools, findTool, toolSchemas } from "../src/server/tools.js";
+import {
+  buildTools,
+  detectPaperclipFeatures,
+  findTool,
+  parseStatusCardTask,
+  toolSchemas,
+  type BuildToolsContext,
+  type StatusCardTask,
+} from "../src/server/tools.js";
 import { SecretStore } from "../src/server/http-request.js";
 
 function makeApi(fetchImpl: typeof fetch): PaperclipApi {
@@ -1310,5 +1318,380 @@ describe("API-access secrets (GET /agents/me/secrets, fetched on demand)", () =>
     expect(valueFetches).toEqual(["GSC_SERVICE_ACCOUNT"]);
     expect(result.content).toContain("not valid JSON"); // got the value, then parsed it
     expect(result.content).not.toContain("not-json-key");
+  });
+});
+
+// ----- Cases and status cards -----
+
+type Route = [method: string, path: RegExp, handler: (body: any, match: RegExpMatchArray) => Response];
+
+/** Routes Paperclip calls by method + path regex; anything unmatched is a 500 so a stray call fails loudly. */
+function routedApi(routes: Route[]) {
+  const calls: Array<{ method: string; path: string; body: any }> = [];
+  const fetchImpl = (async (input: any, init: any) => {
+    const url = new URL(typeof input === "string" ? input : input.url);
+    const method = (init?.method || "GET").toUpperCase();
+    const body = init?.body ? JSON.parse(init.body) : undefined;
+    calls.push({ method, path: `${url.pathname}${url.search}`, body });
+    for (const [m, re, handler] of routes) {
+      const match = url.pathname.match(re);
+      if (m === method && match) return handler(body, match);
+    }
+    return jsonResponse({ error: `unexpected ${method} ${url.pathname}` }, 500);
+  }) as typeof fetch;
+  return { calls, api: makeApi(fetchImpl) };
+}
+
+const CASE_UUID = "11111111-1111-4111-8111-111111111111";
+const PARENT_UUID = "22222222-2222-4222-8222-222222222222";
+const PROJECT_UUID = "33333333-3333-4333-8333-333333333333";
+const LABEL_UUID = "44444444-4444-4444-8444-444444444444";
+const ISSUE_UUID = "55555555-5555-4555-8555-555555555555";
+
+function featureTools(
+  api: PaperclipApi,
+  extra: Partial<BuildToolsContext> = {},
+) {
+  return buildTools({
+    api,
+    agentId: "agent-1",
+    companyId: "company-1",
+    currentIssueId: "issue-1",
+    currentIssueIdentifier: "PAP-1",
+    autoApprove: false,
+    features: { cases: true, statusCards: true },
+    ...extra,
+  });
+}
+
+function generationDescription(payload: Record<string, unknown>): string {
+  return `Compile this status-card interest prompt...\n\n\`\`\`json\n${JSON.stringify(payload, null, 2)}\n\`\`\``;
+}
+
+describe("detectPaperclipFeatures", () => {
+  it("enables both features and finds the status-card task on the current issue", async () => {
+    const { api } = routedApi([
+      ["GET", /\/cases$/, () => jsonResponse([])],
+      ["GET", /\/status-cards$/, () => jsonResponse([])],
+      [
+        "GET",
+        /^\/api\/issues\/issue-1$/,
+        () =>
+          jsonResponse({
+            id: "issue-1",
+            description: generationDescription({
+              operation: "compile",
+              statusCardId: "card-1",
+              companyId: "company-1",
+              generationIssueId: "issue-1",
+            }),
+          }),
+      ],
+    ]);
+    const features = await detectPaperclipFeatures(api, "company-1", "issue-1");
+    expect(features).toEqual({
+      cases: true,
+      statusCards: true,
+      statusCardTask: { operation: "compile", statusCardId: "card-1", generationIssueId: "issue-1", summaryWritten: false },
+      errors: [],
+    });
+  });
+
+  it("treats 403 'Cases are disabled' and 404 'Status cards are not enabled' as off, quietly", async () => {
+    const { api, calls } = routedApi([
+      ["GET", /\/cases$/, () => jsonResponse({ error: "Cases are disabled" }, 403)],
+      ["GET", /\/status-cards$/, () => jsonResponse({ error: "Status cards are not enabled" }, 404)],
+    ]);
+    const features = await detectPaperclipFeatures(api, "company-1", "issue-1");
+    expect(features).toEqual({ cases: false, statusCards: false, statusCardTask: null, errors: [] });
+    // No issue lookup when status cards are off.
+    expect(calls.map((c) => c.path)).not.toContain("/api/issues/issue-1");
+  });
+
+  it("reports unexpected probe failures", async () => {
+    const { api } = routedApi([
+      ["GET", /\/cases$/, () => jsonResponse({ error: "boom" }, 500)],
+      ["GET", /\/status-cards$/, () => jsonResponse({ error: "Status cards are not enabled" }, 404)],
+    ]);
+    const features = await detectPaperclipFeatures(api, "company-1", null);
+    expect(features.cases).toBe(false);
+    expect(features.errors).toEqual(["cases: 500 boom"]);
+  });
+
+  it("parseStatusCardTask ignores ordinary issues and payloads for a different issue", () => {
+    expect(parseStatusCardTask({ id: "issue-1", description: "Write the launch post." })).toBeNull();
+    expect(
+      parseStatusCardTask({
+        id: "issue-1",
+        description: generationDescription({ operation: "update", statusCardId: "card-1", generationIssueId: "issue-9" }),
+      }),
+    ).toBeNull();
+    expect(
+      parseStatusCardTask({
+        id: "issue-1",
+        description: generationDescription({ operation: "update", statusCardId: "card-1", generationIssueId: "issue-1" }),
+      }),
+    ).toMatchObject({ operation: "update", statusCardId: "card-1" });
+  });
+
+  it("buildTools registers the feature tools only when enabled", () => {
+    const api = makeApi(async () => jsonResponse({}));
+    const names = (extra: Partial<BuildToolsContext>) => toolSchemas(featureTools(api, extra)).map((s) => s.function.name);
+    const off = names({ features: { cases: false, statusCards: false } });
+    expect(off).not.toContain("case");
+    expect(off).not.toContain("status_card");
+    expect(names({})).toEqual(expect.arrayContaining(["case", "status_card"]));
+    expect(names({})).not.toContain("publish_status_card");
+    const task: StatusCardTask = { operation: "compile", statusCardId: "card-1", generationIssueId: "issue-1", summaryWritten: false };
+    expect(names({ statusCardTask: task })).toContain("publish_status_card");
+  });
+});
+
+describe("case tool", () => {
+  it("save sends Paperclip's strict body, resolving a parent identifier and a project name", async () => {
+    const { api, calls } = routedApi([
+      ["GET", /^\/api\/cases\/PAP-C1$/, () => jsonResponse({ id: PARENT_UUID })],
+      ["GET", /\/projects$/, () => jsonResponse([{ id: PROJECT_UUID, name: "Website" }])],
+      ["POST", /\/companies\/company-1\/cases$/, (body) => jsonResponse({ id: CASE_UUID, ...body, documents: [] }, 201)],
+    ]);
+    const result = await findTool(featureTools(api), "case")!.execute({
+      action: "save",
+      case_type: "blog_post",
+      key: "launch-announcement",
+      title: "Launch announcement",
+      status: "draft",
+      fields: { slug: "launch-announcement" },
+      parent_case_id: "PAP-C1",
+      project: "website",
+    });
+    expect(result.isError).toBe(false);
+    expect(calls.at(-1)!.body).toEqual({
+      caseType: "blog_post",
+      key: "launch-announcement",
+      title: "Launch announcement",
+      status: "draft",
+      fields: { slug: "launch-announcement" },
+      parentCaseId: PARENT_UUID,
+      projectId: PROJECT_UUID,
+    });
+  });
+
+  it("save names the missing field, and a bad status lists the case statuses", async () => {
+    const { api, calls } = routedApi([]);
+    const tool = findTool(featureTools(api), "case")!;
+    const noType = await tool.execute({ action: "save", title: "X" });
+    expect(noType.content).toContain("case_type is required");
+    const badStatus = await tool.execute({ action: "update", case_id: "PAP-C1", status: "todo" });
+    expect(badStatus.isError).toBe(true);
+    expect(badStatus.content).toContain("draft, in_progress, in_review, approved, done, cancelled");
+    expect(calls).toHaveLength(0);
+  });
+
+  it("update merges fields into the existing ones unless replace_fields is set", async () => {
+    const { api, calls } = routedApi([
+      ["GET", /^\/api\/cases\/PAP-C1$/, () => jsonResponse({ id: CASE_UUID, fields: { slug: "a", publish_url: null } })],
+      ["PATCH", /^\/api\/cases\/PAP-C1$/, (body) => jsonResponse({ id: CASE_UUID, ...body, documents: [] })],
+    ]);
+    const tool = findTool(featureTools(api), "case")!;
+    await tool.execute({ action: "update", case_id: "PAP-C1", status: "in_review", fields: { publish_url: "https://x" } });
+    expect(calls.at(-1)!.body).toEqual({ status: "in_review", fields: { slug: "a", publish_url: "https://x" } });
+
+    await tool.execute({ action: "update", case_id: "PAP-C1", fields: { only: 1 }, replace_fields: true });
+    expect(calls.at(-1)!.body).toEqual({ fields: { only: 1 } });
+  });
+
+  it("list returns only summary fields", async () => {
+    const { api, calls } = routedApi([
+      [
+        "GET",
+        /\/companies\/company-1\/cases$/,
+        () =>
+          jsonResponse([
+            { id: CASE_UUID, identifier: "PAP-C1", caseType: "blog_post", key: "k", title: "T", status: "draft", fields: { big: "x".repeat(5000) } },
+          ]),
+      ],
+    ]);
+    const result = await findTool(featureTools(api), "case")!.execute({ action: "list", case_type: "blog_post", status: "active" });
+    expect(calls[0]!.path).toBe("/api/companies/company-1/cases?limit=50&type=blog_post&status=active");
+    expect(JSON.parse(result.content)).toEqual([
+      { id: CASE_UUID, identifier: "PAP-C1", caseType: "blog_post", key: "k", title: "T", status: "draft", parentCaseId: null, updatedAt: null },
+    ]);
+  });
+
+  it("write_document creates, then updates with the current revision, and append_document keeps the body", async () => {
+    const docs = new Map<string, { title: string | null; body: string; latestRevisionId: string }>();
+    let rev = 0;
+    const { api, calls } = routedApi([
+      [
+        "GET",
+        /^\/api\/cases\/PAP-C1\/documents\/([^/]+)$/,
+        (_b, m) => {
+          const d = docs.get(m[1]!);
+          return d ? jsonResponse({ key: m[1], ...d }) : jsonResponse({ error: "Case document not found" }, 404);
+        },
+      ],
+      [
+        "PUT",
+        /^\/api\/cases\/PAP-C1\/documents\/([^/]+)$/,
+        (body, m) => {
+          const d = { title: body.title ?? null, body: body.body, latestRevisionId: `rev-${++rev}` };
+          docs.set(m[1]!, d);
+          return jsonResponse({ key: m[1], ...d });
+        },
+      ],
+    ]);
+    const tool = findTool(featureTools(api), "case")!;
+    await tool.execute({ action: "write_document", case_id: "PAP-C1", title: "Draft", body: "# Draft" });
+    expect(calls.at(-1)!.body).toEqual({ title: "Draft", body: "# Draft", format: "markdown", changeSummary: null });
+    expect(calls.at(-1)!.path).toBe("/api/cases/PAP-C1/documents/body");
+
+    await tool.execute({ action: "append_document", case_id: "PAP-C1", body: "Reviewed." });
+    expect(calls.at(-1)!.body).toMatchObject({ body: "# Draft\n\nReviewed.", title: "Draft", baseRevisionId: "rev-1" });
+
+    const missing = await tool.execute({ action: "append_document", case_id: "PAP-C1", key: "notes", body: "x" });
+    expect(missing.isError).toBe(true);
+    expect(missing.content).toContain("action='write_document'");
+  });
+
+  it("write_document retries once when the revision went stale", async () => {
+    let puts = 0;
+    const { api, calls } = routedApi([
+      ["GET", /\/documents\/body$/, () => jsonResponse({ key: "body", body: "old", latestRevisionId: `rev-${puts + 1}` })],
+      [
+        "PUT",
+        /\/documents\/body$/,
+        (body) =>
+          ++puts === 1
+            ? jsonResponse({ error: "Case document was updated by someone else" }, 409)
+            : jsonResponse({ key: "body", ...body }),
+      ],
+    ]);
+    const result = await findTool(featureTools(api), "case")!.execute({ action: "write_document", case_id: "PAP-C1", body: "new" });
+    expect(result.isError).toBe(false);
+    expect(calls.filter((c) => c.method === "PUT").map((c) => c.body.baseRevisionId)).toEqual(["rev-1", "rev-2"]);
+  });
+
+  it("link_issue resolves an issue identifier to its UUID", async () => {
+    const { api, calls } = routedApi([
+      ["GET", /^\/api\/issues\/PAP-7$/, () => jsonResponse({ id: ISSUE_UUID })],
+      ["POST", /^\/api\/cases\/PAP-C1\/links$/, (body) => jsonResponse({ id: "link-1", ...body })],
+    ]);
+    await findTool(featureTools(api), "case")!.execute({ action: "link_issue", case_id: "PAP-C1", issue_id: "PAP-7" });
+    expect(calls.at(-1)!.body).toEqual({ issueId: ISSUE_UUID, role: "reference" });
+  });
+});
+
+describe("status_card tool", () => {
+  it("create builds the refresh policy, filling the field the mode requires", async () => {
+    const { api, calls } = routedApi([
+      ["POST", /\/companies\/company-1\/status-cards$/, (body) => jsonResponse({ id: "card-1", state: "compiling", ...body }, 201)],
+    ]);
+    const result = await findTool(featureTools(api), "status_card")!.execute({
+      action: "create",
+      interest_prompt: "Launch blockers in Website",
+      refresh_mode: "reactive",
+    });
+    expect(calls[0]!.body).toEqual({
+      interestPrompt: "Launch blockers in Website",
+      refreshPolicy: { mode: "reactive", debounceSeconds: 300 },
+    });
+    expect(JSON.parse(result.content)).toMatchObject({ id: "card-1", state: "compiling", defaultsApplied: "debounce_seconds=300" });
+  });
+
+  it("rejects an interest_prompt over Paperclip's agent limit without calling the API", async () => {
+    const { api, calls } = routedApi([]);
+    const result = await findTool(featureTools(api), "status_card")!.execute({ action: "create", interest_prompt: "x".repeat(4001) });
+    expect(result.content).toContain("limit is 4000");
+    expect(calls).toHaveLength(0);
+  });
+
+  it("explains the authored-cards-only 403", async () => {
+    const { api } = routedApi([
+      ["PATCH", /^\/api\/status-cards\/card-1$/, () => jsonResponse({ error: "Agents can only manage status cards they authored" }, 403)],
+    ]);
+    const result = await findTool(featureTools(api), "status_card")!.execute({ action: "update", card_id: "card-1", archived: true });
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain("only change status cards you created");
+  });
+});
+
+describe("publish_status_card tool", () => {
+  function task(operation: "compile" | "update"): StatusCardTask {
+    return { operation, statusCardId: "card-1", generationIssueId: "issue-1", summaryWritten: false };
+  }
+
+  it("save_query resolves project and label names and fills the generation ids", async () => {
+    const { api, calls } = routedApi([
+      ["GET", /\/projects$/, () => jsonResponse([{ id: PROJECT_UUID, name: "Website" }])],
+      ["GET", /\/labels$/, () => jsonResponse([{ id: LABEL_UUID, name: "launch" }])],
+      ["PUT", /^\/api\/status-cards\/card-1\/query$/, (body) => jsonResponse({ id: "card-1", queryVersion: 1, ...body })],
+    ]);
+    const tool = findTool(featureTools(api, { statusCardTask: task("compile") }), "publish_status_card")!;
+    const result = await tool.execute({
+      action: "save_query",
+      title: "Launch blockers",
+      queries: [{ q: "launch", status: ["blocked", "in_progress"], project: "Website", label: "launch", updated_within: "7d" }],
+    });
+    expect(result.isError).toBe(false);
+    expect(calls.at(-1)!.body).toEqual({
+      queries: [{ q: "launch", status: ["blocked", "in_progress"], projectId: PROJECT_UUID, labelId: LABEL_UUID, updatedWithin: "7d" }],
+      title: "Launch blockers",
+      changeSummary: "Compiled the interest prompt into queries.",
+      generationIssueId: "issue-1",
+    });
+  });
+
+  it("save_query lists the available projects when the name doesn't match", async () => {
+    const { api } = routedApi([["GET", /\/projects$/, () => jsonResponse([{ id: PROJECT_UUID, name: "Website" }])]]);
+    const tool = findTool(featureTools(api, { statusCardTask: task("compile") }), "publish_status_card")!;
+    const result = await tool.execute({ action: "save_query", title: "T", queries: [{ project: "Mobile" }] });
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain("No project named 'Mobile'. Available projects: Website");
+  });
+
+  it("save_query is refused on an update task", async () => {
+    const { api, calls } = routedApi([]);
+    const tool = findTool(featureTools(api, { statusCardTask: task("update") }), "publish_status_card")!;
+    const result = await tool.execute({ action: "save_query", title: "T", queries: [{ q: "x" }] });
+    expect(result.content).toContain("already compiled");
+    expect(calls).toHaveLength(0);
+  });
+
+  it("save_summary sends the generation id and model, and unlocks marking the task done", async () => {
+    const { api, calls } = routedApi([
+      ["PUT", /^\/api\/status-cards\/card-1\/summary$/, () => jsonResponse({ card: {}, document: { id: "doc-1" } })],
+      ["PATCH", /^\/api\/issues\/issue-1$/, (body) => jsonResponse({ id: "issue-1", ...body })],
+    ]);
+    const statusCardTask = task("compile");
+    const tools = featureTools(api, { statusCardTask, model: "openai/gpt-oss-120b" });
+
+    const early = await findTool(tools, "update_issue_status")!.execute({ status: "done" });
+    expect(early.isError).toBe(true);
+    expect(early.content).toContain("save_summary");
+    const earlyViaUpdateIssue = await findTool(tools, "update_issue")!.execute({ status: "done" });
+    expect(earlyViaUpdateIssue.isError).toBe(true);
+    expect(calls).toHaveLength(0);
+
+    const saved = await findTool(tools, "publish_status_card")!.execute({ action: "save_summary", markdown: "## Launch\n- PAP-3 blocked" });
+    expect(saved.isError).toBe(false);
+    expect(calls[0]!.body).toEqual({
+      markdown: "## Launch\n- PAP-3 blocked",
+      changeSummary: "Updated the summary.",
+      generationIssueId: "issue-1",
+      model: "openai/gpt-oss-120b",
+    });
+    expect(statusCardTask.summaryWritten).toBe(true);
+
+    const done = await findTool(tools, "update_issue_status")!.execute({ status: "done" });
+    expect(done.isError).toBe(false);
+  });
+
+  it("save_summary before the query is compiled points to save_query", async () => {
+    const { api } = routedApi([
+      ["PUT", /\/summary$/, () => jsonResponse({ error: "Compile the status-card query before writing its summary" }, 409)],
+    ]);
+    const tool = findTool(featureTools(api, { statusCardTask: task("compile") }), "publish_status_card")!;
+    const result = await tool.execute({ action: "save_summary", markdown: "x" });
+    expect(result.content).toContain("Call action='save_query' first");
   });
 });

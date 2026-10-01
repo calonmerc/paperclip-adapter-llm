@@ -34,7 +34,7 @@ import fs from "node:fs/promises";
 import { isPaperclipRuntimeEnvKey, joinPromptSections, renderPaperclipWakePrompt, selectPaperclipTaskMarkdown, } from "@paperclipai/adapter-utils/server-utils";
 import { DEFAULT_BASE_URL, resolveEndpoints, isOpenRouter, } from "../index.js";
 import { PaperclipApi } from "./paperclip-api.js";
-import { buildTools, toolSchemas, findTool, targetsCurrentIssue } from "./tools.js";
+import { buildTools, detectPaperclipFeatures, toolSchemas, findTool, targetsCurrentIssue, } from "./tools.js";
 import { collectBoundSecrets, SecretStore } from "./http-request.js";
 import { LibraryResolver, migrateMemoryToLibrary } from "./library.js";
 import { loadSkills, renderSkillsForPrompt, reconcilePaperclipSkills } from "./skills.js";
@@ -179,6 +179,29 @@ export function isDispositionRecoveryWake(context) {
  * evidence-gathering because every run starts from an empty context — a
  * "use what's already in hand" rule is never satisfied at turn 1.
  */
+/**
+ * The paperclip skill documents cases as HTTP endpoints this adapter can't
+ * call, so map them to the tools. Only for features that are enabled.
+ */
+export function renderPaperclipFeatureNote(features) {
+    if (!features)
+        return "";
+    const lines = [];
+    if (features.cases) {
+        lines.push("- Cases: anything your skills describe as the cases API (POST /api/companies/:companyId/cases, " +
+            "PUT /api/cases/.../documents/...) is the `case` tool. Don't use http_request for Paperclip's own API.");
+    }
+    if (features.statusCards) {
+        lines.push("- Status cards: use the `status_card` tool to list, create, update, or refresh status-board cards.");
+    }
+    if (features.statusCardTask) {
+        lines.push("- THIS ISSUE IS A STATUS-CARD TASK: you are the card's summarizer. Ignore the PUT endpoints in the task " +
+            "description and use publish_status_card instead: " +
+            (features.statusCardTask.operation === "compile" ? "save_query, then preview, then " : "optionally preview, then ") +
+            "save_summary, then update_issue_status status='done'.");
+    }
+    return lines.length ? `# Paperclip features\n${lines.join("\n")}` : "";
+}
 export function renderDispositionHandoffNote(context) {
     if (!isDispositionRecoveryWake(context))
         return "";
@@ -378,6 +401,7 @@ export async function execute(ctx) {
     // Logged right after emitInit so the run viewer's header comes first.
     const startupNotes = [];
     const startupErrors = [];
+    let features = null;
     if (authToken) {
         api = new PaperclipApi({ authToken });
         secretStore = new SecretStore(envSecrets, api);
@@ -405,7 +429,21 @@ export async function execute(ctx) {
             const reason = err instanceof Error ? err.message : String(err);
             startupErrors.push(`[llm] memory → Library migration failed (will retry next run): ${reason}`);
         }
+        features = await detectPaperclipFeatures(api, companyId, currentIssueId);
+        for (const error of features.errors) {
+            startupErrors.push(`[llm] could not check Paperclip features (their tools are off this run): ${error}`);
+        }
+        const featureTools = [
+            features.cases && "case",
+            features.statusCards && "status_card",
+            features.statusCardTask && "publish_status_card",
+        ].filter(Boolean);
+        if (featureTools.length > 0)
+            startupNotes.push(`Paperclip feature tools enabled: ${featureTools.join(", ")}`);
         tools = buildTools({
+            features,
+            statusCardTask: features.statusCardTask,
+            model,
             library,
             api,
             agentId: agent.id,
@@ -483,6 +521,10 @@ export async function execute(ctx) {
         const reason = err instanceof Error ? err.message : String(err);
         await writeRawStderr(onLog, `[llm] skill loading error (continuing): ${reason}`);
     }
+    // After the skills, which describe these features as raw HTTP endpoints.
+    const featureNote = tools.length > 0 ? renderPaperclipFeatureNote(features) : "";
+    if (featureNote)
+        systemContent = `${systemContent}\n\n${featureNote}`;
     messages.push({ role: "system", content: systemContent });
     // User prompt = Paperclip wake payload rendered as text. Some heartbeats
     // arrive without a structured wake payload (manual "Run Heartbeat" with no

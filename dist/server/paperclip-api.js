@@ -209,5 +209,66 @@ export class PaperclipApi {
     createApproval(companyId, approval) {
         return this.request("POST", `/api/companies/${encodeURIComponent(companyId)}/approvals`, approval);
     }
+    // ----- Projects and labels (name → id lookups) -----
+    listCompanyProjects(companyId) {
+        return this.request("GET", `/api/companies/${encodeURIComponent(companyId)}/projects`);
+    }
+    listCompanyLabels(companyId) {
+        return this.request("GET", `/api/companies/${encodeURIComponent(companyId)}/labels`);
+    }
+    // ----- Cases (experimental.enableCases; 403 "Cases are disabled" when off) -----
+    listCases(companyId, query = {}) {
+        const qs = new URLSearchParams(query).toString();
+        return this.request("GET", `/api/companies/${encodeURIComponent(companyId)}/cases${qs ? `?${qs}` : ""}`);
+    }
+    /** Creates the case, or updates the existing one with the same (caseType, key). */
+    upsertCase(companyId, body) {
+        return this.request("POST", `/api/companies/${encodeURIComponent(companyId)}/cases`, body);
+    }
+    /** Accepts the case UUID or its identifier (e.g. PAP-C42). */
+    getCase(caseId) {
+        return this.request("GET", `/api/cases/${encodeURIComponent(caseId)}`);
+    }
+    patchCase(caseId, patch) {
+        return this.request("PATCH", `/api/cases/${encodeURIComponent(caseId)}`, patch);
+    }
+    getCaseDocument(caseId, key) {
+        return this.request("GET", `/api/cases/${encodeURIComponent(caseId)}/documents/${encodeURIComponent(key)}`);
+    }
+    /** Same baseRevisionId rules as upsertIssueDocument. */
+    upsertCaseDocument(caseId, key, body) {
+        return this.request("PUT", `/api/cases/${encodeURIComponent(caseId)}/documents/${encodeURIComponent(key)}`, body);
+    }
+    linkCaseIssue(caseId, body) {
+        return this.request("POST", `/api/cases/${encodeURIComponent(caseId)}/links`, body);
+    }
+    // ----- Status cards (experimental.enableStatusCards; 404 when off) -----
+    listStatusCards(companyId, archived = false) {
+        return this.request("GET", `/api/companies/${encodeURIComponent(companyId)}/status-cards${archived ? "?archived=true" : ""}`);
+    }
+    getStatusCard(cardId) {
+        return this.request("GET", `/api/status-cards/${encodeURIComponent(cardId)}`);
+    }
+    createStatusCard(companyId, body) {
+        return this.request("POST", `/api/companies/${encodeURIComponent(companyId)}/status-cards`, body);
+    }
+    patchStatusCard(cardId, patch) {
+        return this.request("PATCH", `/api/status-cards/${encodeURIComponent(cardId)}`, patch);
+    }
+    refreshStatusCard(cardId, full) {
+        return this.request("POST", `/api/status-cards/${encodeURIComponent(cardId)}/refresh`, { full });
+    }
+    /** Runs the card's compiled queries and returns what they match. */
+    dryRunStatusCard(cardId) {
+        return this.request("GET", `/api/status-cards/${encodeURIComponent(cardId)}/dry-run`);
+    }
+    /** Summarizer-only: must come from the run that owns the card's generation issue. */
+    writeStatusCardQuery(cardId, body) {
+        return this.request("PUT", `/api/status-cards/${encodeURIComponent(cardId)}/query`, body);
+    }
+    /** Summarizer-only: must come from the run that owns the card's generation issue. */
+    writeStatusCardSummary(cardId, body) {
+        return this.request("PUT", `/api/status-cards/${encodeURIComponent(cardId)}/summary`, body);
+    }
 }
 //# sourceMappingURL=paperclip-api.js.map

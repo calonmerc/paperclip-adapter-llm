@@ -110,7 +110,11 @@ interface CallLog {
 
 function setupFetchMock(
   chatResponses: unknown[] = [],
-  opts: { chatFailureStatus?: number } = {},
+  opts: {
+    chatFailureStatus?: number;
+    /** Per-route Paperclip API override; return undefined to fall through to the default 200. */
+    api?: (method: string, path: string, body: unknown) => Response | undefined;
+  } = {},
 ): { calls: CallLog[]; restore: () => void } {
   const calls: CallLog[] = [];
   const queue = [...chatResponses];
@@ -141,6 +145,8 @@ function setupFetchMock(
     }
 
     if (reqPath.startsWith("/api/")) {
+      const override = opts.api?.(method, reqPath, body);
+      if (override) return override;
       return new Response(JSON.stringify({ ok: true, id: "issue-1" }), {
         status: 200,
         headers: { "content-type": "application/json" },
@@ -1137,5 +1143,83 @@ describe("execute()", () => {
     for (const call of fetchMock.calls.filter((c) => c.path.endsWith("/chat/completions"))) {
       expect(JSON.stringify(call.body)).not.toContain("umami-live-value");
     }
+  });
+  it("leaves the case and status-card tools out when Paperclip has the features turned off", async () => {
+    fetchMock = setupFetchMock([assistantResponse("done")], {
+      api: (method, reqPath) => {
+        if (method === "GET" && reqPath === "/api/companies/company-1/cases") {
+          return new Response(JSON.stringify({ error: "Cases are disabled" }), { status: 403, headers: { "content-type": "application/json" } });
+        }
+        if (method === "GET" && reqPath === "/api/companies/company-1/status-cards") {
+          return new Response(JSON.stringify({ error: "Status cards are not enabled" }), { status: 404, headers: { "content-type": "application/json" } });
+        }
+        return undefined;
+      },
+    });
+    await execute(makeContext());
+
+    const firstChat = fetchMock.calls.find((c) => c.path.endsWith("/chat/completions"))!;
+    const toolNames = ((firstChat.body as any).tools as Array<{ function: { name: string } }>).map((t) => t.function.name);
+    expect(toolNames).not.toContain("case");
+    expect(toolNames).not.toContain("status_card");
+    const system = ((firstChat.body as any).messages as Array<{ role: string; content: string }>)[0]!.content;
+    expect(system).not.toContain("# Paperclip features");
+  });
+
+  it("runs a status-card compile task end to end: save_query, save_summary, then done", async () => {
+    const description =
+      "Compile this status-card interest prompt...\n\n```json\n" +
+      JSON.stringify({ operation: "compile", statusCardId: "card-1", companyId: "company-1", generationIssueId: "issue-1" }) +
+      "\n```";
+    fetchMock = setupFetchMock(
+      [
+        toolCallResponse([
+          {
+            id: "c1",
+            name: "publish_status_card",
+            args: { action: "save_query", title: "Launch blockers", queries: [{ q: "launch", status: ["blocked"] }] },
+          },
+        ]),
+        toolCallResponse([{ id: "c2", name: "publish_status_card", args: { action: "save_summary", markdown: "- PAP-3 is blocked" } }]),
+        toolCallResponse([{ id: "c3", name: "update_issue_status", args: { status: "done", comment: "Summary saved." } }]),
+        assistantResponse("done"),
+      ],
+      {
+        api: (method, reqPath) =>
+          method === "GET" && reqPath === "/api/issues/issue-1"
+            ? new Response(JSON.stringify({ id: "issue-1", status: "in_progress", description }), {
+                status: 200,
+                headers: { "content-type": "application/json" },
+              })
+            : undefined,
+      },
+    );
+    const ctx = makeContext();
+    const result = await execute(ctx);
+
+    const firstChat = fetchMock.calls.find((c) => c.path.endsWith("/chat/completions"))!;
+    const toolNames = ((firstChat.body as any).tools as Array<{ function: { name: string } }>).map((t) => t.function.name);
+    expect(toolNames).toEqual(expect.arrayContaining(["case", "status_card", "publish_status_card"]));
+    const system = ((firstChat.body as any).messages as Array<{ role: string; content: string }>)[0]!.content;
+    expect(system).toContain("THIS ISSUE IS A STATUS-CARD TASK");
+
+    const queryPut = fetchMock.calls.find((c) => c.method === "PUT" && c.path === "/api/status-cards/card-1/query")!;
+    expect(queryPut.body).toEqual({
+      queries: [{ q: "launch", status: ["blocked"] }],
+      title: "Launch blockers",
+      changeSummary: "Compiled the interest prompt into queries.",
+      generationIssueId: "issue-1",
+    });
+    const summaryPut = fetchMock.calls.find((c) => c.method === "PUT" && c.path === "/api/status-cards/card-1/summary")!;
+    expect(summaryPut.body).toEqual({
+      markdown: "- PAP-3 is blocked",
+      changeSummary: "Updated the summary.",
+      generationIssueId: "issue-1",
+      model: "moonshotai/kimi-k2.6",
+    });
+    const donePatch = fetchMock.calls.find((c) => c.method === "PATCH" && (c.body as any)?.status === "done");
+    expect(donePatch).toBeDefined();
+    expect(findTranscriptResultEntry(ctx)?.subtype).toBe("completed");
+    expect(result.exitCode).toBe(0);
   });
 });
