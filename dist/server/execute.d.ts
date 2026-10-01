@@ -40,6 +40,7 @@ import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclip
  * spends Paperclip's single corrective attempt, and the issue escalates to
  * the board with "Missing disposition recovery blocked".
  */
+export declare function isDispositionRecoveryWake(context: Record<string, unknown>): boolean;
 export declare function renderDispositionHandoffNote(context: Record<string, unknown>): string;
 export declare function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult>;
 //# sourceMappingURL=execute.d.ts.map

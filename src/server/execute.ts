@@ -235,12 +235,16 @@ function extractCurrentIssueIdentifier(wake: unknown, context: Record<string, un
  * spends Paperclip's single corrective attempt, and the issue escalates to
  * the board with "Missing disposition recovery blocked".
  */
-export function renderDispositionHandoffNote(context: Record<string, unknown>): string {
-  const isHandoff =
+export function isDispositionRecoveryWake(context: Record<string, unknown>): boolean {
+  return (
     context.handoffRequired === true ||
     context.wakeReason === "finish_successful_run_handoff" ||
-    context.handoffReason === "successful_run_missing_state";
-  if (!isHandoff) return "";
+    context.handoffReason === "successful_run_missing_state"
+  );
+}
+
+export function renderDispositionHandoffNote(context: Record<string, unknown>): string {
+  if (!isDispositionRecoveryWake(context)) return "";
   const instruction = typeof context.instruction === "string" ? context.instruction.trim() : "";
   return [
     "# DISPOSITION RECOVERY — record a disposition, do NOT redo the work",
@@ -692,8 +696,21 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   // nudge decision asks Paperclip for the issue's real status first (see
   // currentIssueNeedsDisposition), because "some update_issue_status call
   // succeeded" also covered calls on a sub-issue.
+  //
+  // A disposition-recovery wake gets a SECOND nudge instead of the usual
+  // one: a real recovery run (DEBA-53) spent its whole turn deliberating
+  // between several individually-valid disposition paths (sub-issue vs.
+  // self-owned blocker vs. more evidence-gathering), burned ~9.5k reasoning
+  // tokens, and ended with no tool call at all — on what was already
+  // Paperclip's one corrective handoff wake, so the silent "still
+  // in_progress" result had no further automatic recovery and escalated
+  // straight to a board decision. The second nudge is worded more bluntly
+  // (stop weighing alternatives, call the one always-valid option) because
+  // a generic repeat of the first nudge is what this model had already
+  // ignored.
   let dispositionRecorded = false;
-  let dispositionNudgeGiven = false;
+  let dispositionNudgesGiven = 0;
+  const maxDispositionNudges = isDispositionRecoveryWake(context) ? 2 : 1;
   // Set when the model already put its own words on the current issue, so
   // the post-loop final-text comment would only be a duplicate.
   let commentedOnCurrentIssue = false;
@@ -756,22 +773,27 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       }
 
       // No tool calls => model believes it's done. Before accepting that,
-      // give it exactly one chance to actually record a disposition if it
-      // hasn't — see the dispositionNudgeGiven comment above.
+      // give it a chance (two on a disposition-recovery wake) to actually
+      // record a disposition if it hasn't — see the maxDispositionNudges
+      // comment above.
       if (toolCalls.length === 0) {
-        if (!dispositionNudgeGiven && turn < maxTurns && (await currentIssueNeedsDisposition())) {
-          dispositionNudgeGiven = true;
-          messages.push({
-            role: "user",
-            content:
-              "Your issue is still in_progress: you did not record a disposition for it (a status change on " +
-              "a different issue doesn't count). Every run must end with one — Paperclip cannot infer it " +
-              "from text, no matter how clearly it states the work is finished. Call exactly one now: " +
-              "update_issue_status status='done' (or 'cancelled') if the work is complete; status='blocked' " +
-              "with blocked_by_issue_ids and/or unblock_action if you can't continue; status='in_review' " +
-              "with reviewer_user_id if someone must review it; or ask_user_questions if a human must " +
-              "answer. Do not just restate that you're finished — call the tool.",
-          });
+        if (dispositionNudgesGiven < maxDispositionNudges && turn < maxTurns && (await currentIssueNeedsDisposition())) {
+          dispositionNudgesGiven += 1;
+          const nudgeContent =
+            dispositionNudgesGiven === 1
+              ? "Your issue is still in_progress: you did not record a disposition for it (a status change on " +
+                "a different issue doesn't count). Every run must end with one — Paperclip cannot infer it " +
+                "from text, no matter how clearly it states the work is finished. Call exactly one now: " +
+                "update_issue_status status='done' (or 'cancelled') if the work is complete; status='blocked' " +
+                "with blocked_by_issue_ids and/or unblock_action if you can't continue; status='in_review' " +
+                "with reviewer_user_id if someone must review it; or ask_user_questions if a human must " +
+                "answer. Do not just restate that you're finished — call the tool."
+              : "This is a disposition-recovery run and a second attempt: still no disposition was recorded. " +
+                "Stop weighing which path is 'more correct' — call update_issue_status right now with " +
+                "status='blocked', blocked_by_issue_ids and/or unblock_action naming yourself as the owner. " +
+                "That option is always valid here. Do not keep analyzing tool semantics or alternate paths " +
+                "this turn — just call the tool.";
+          messages.push({ role: "user", content: nudgeContent });
           continue;
         }
         stoppedReason = "completed";

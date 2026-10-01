@@ -24,6 +24,19 @@
   `update_issue_status` does, and the call counts as the run's
   disposition. When nothing usable is passed, the error names the ignored
   fields and points to `update_issue_status` / `add_comment`.
+- **A disposition-recovery wake now gets a second, firmer nudge.** Real
+  incident (`DEBA-53`): a `missing_disposition` recovery run deliberated
+  across several individually-valid disposition paths (create a sub-issue
+  vs. a self-owned blocker vs. more evidence-gathering), burned ~9.5k
+  reasoning tokens, and ended a turn with no tool call at all. Since that
+  run was already Paperclip's one corrective handoff wake, the old one-shot
+  nudge left no further automatic recovery and the issue escalated straight
+  to "Missing disposition recovery blocked" on the board. An ordinary run
+  still gets one nudge; a disposition-recovery wake now gets two, and the
+  second tells the model to stop weighing alternatives and call
+  `update_issue_status` with `blocked`/`unblock_action` naming itself as
+  owner — the option that's always valid regardless of which path is "more
+  correct."
 
 ## [0.13.0] - 2026-09-30
 

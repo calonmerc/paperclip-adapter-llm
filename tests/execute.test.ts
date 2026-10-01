@@ -390,6 +390,75 @@ describe("execute()", () => {
     expect(issuePatchCalls.some((c) => (c.body as any)?.status === "done")).toBe(true);
   });
 
+  it("gives a disposition-recovery wake a second, firmer nudge when the first one also goes unanswered", async () => {
+    // Real incident (DEBA-53): a disposition-recovery run deliberated across
+    // several individually-valid disposition paths (sub-issue vs. self-owned
+    // blocker vs. more evidence-gathering), burned ~9.5k reasoning tokens,
+    // and ended a turn with no tool call at all. Since this was already
+    // Paperclip's one corrective handoff wake, the ordinary one-shot nudge
+    // left no further automatic recovery and the issue escalated straight to
+    // "Missing disposition recovery blocked" on the board. A recovery wake
+    // now gets a second, more directive nudge before the run gives up.
+    fetchMock = setupFetchMock([
+      assistantResponse("Weighing whether to create a sub-issue or record a blocker..."), // no tool call: nudge 1
+      assistantResponse("Still weighing the options here..."), // no tool call again: nudge 2 (recovery-only)
+      toolCallResponse([{ id: "call-1", name: "update_issue_status", args: { status: "blocked", unblock_action: "Retry the review." } }]),
+      assistantResponse("Recorded a blocker."),
+    ]);
+
+    const result = await execute(
+      makeContext({
+        context: {
+          issueId: "issue-1",
+          handoffRequired: true,
+          wakeReason: "finish_successful_run_handoff",
+          instruction: "Your last run on this issue ended successfully, but the issue is still `in_progress`.",
+        },
+      }),
+    );
+
+    const chatCalls = fetchMock.calls.filter((c) => c.path.endsWith("/chat/completions"));
+    expect(chatCalls.length).toBe(4);
+
+    const firstNudge = (chatCalls[1]!.body as any).messages as Array<{ role: string; content: string }>;
+    expect(firstNudge.some((m) => m.role === "user" && m.content.includes("did not record a disposition"))).toBe(true);
+
+    const secondNudge = (chatCalls[2]!.body as any).messages as Array<{ role: string; content: string }>;
+    expect(
+      secondNudge.some(
+        (m) => m.role === "user" && m.content.includes("second attempt") && m.content.includes("Stop weighing"),
+      ),
+    ).toBe(true);
+
+    expect(result.exitCode).toBe(0);
+    const issuePatchCalls = fetchMock.calls.filter(
+      (c) => c.method === "PATCH" && c.path === "/api/issues/issue-1",
+    );
+    expect(issuePatchCalls.some((c) => (c.body as any)?.status === "blocked")).toBe(true);
+  });
+
+  it("still caps an ordinary (non-recovery) wake at one nudge, even if the model stops twice without calling a tool", async () => {
+    // Guards against accidentally widening the two-nudge allowance to every
+    // run — only a disposition-recovery wake is Paperclip's last automated
+    // chance, so only it gets the second nudge.
+    fetchMock = setupFetchMock([
+      assistantResponse("Closed out — everything's filed and done."), // no tool call: nudge 1
+      assistantResponse("Still done, nothing more to do."), // no tool call again: no second nudge here
+    ]);
+
+    await execute(makeContext());
+
+    const chatCalls = fetchMock.calls.filter((c) => c.path.endsWith("/chat/completions"));
+    expect(chatCalls.length).toBe(2);
+
+    const issuePatchCalls = fetchMock.calls.filter(
+      (c) => c.method === "PATCH" && c.path === "/api/issues/issue-1",
+    );
+    // Only the initial "in_progress" checkout patch — the run must not guess a status.
+    expect(issuePatchCalls.length).toBe(1);
+    expect(issuePatchCalls[0]!.body).toMatchObject({ status: "in_progress" });
+  });
+
   it("fails the run (does not silently report success) when the final disposition write can't be recorded, after one retry", async () => {
     // Regression guard for Paperclip's "missing_disposition" recovery flow:
     // it fires whenever a run reports success (exitCode 0 / run.status
