@@ -124,8 +124,8 @@ Get a key at https://platform.deepseek.com.
 | Variable | Purpose |
 | --- | --- |
 | `LLM_API_KEY` | Primary auth env var, used as a fallback when `adapterConfig.apiKey` is unset. |
-| `LLM_BASE_URL` | Optional override for `baseUrl`. |
-| `LLM_MODEL` | Default model when no adapter config supplies one. |
+| `LLM_BASE_URL` | Provider whose `/models` fills the agent Model dropdown (default OpenRouter). Paperclip gives the picker no agent config, so set this to match the `baseUrl` your agents use. It doesn't change where runs go. |
+| `LLM_MODEL` | Default model when no adapter config supplies one; also shown as the "detected" model in the picker. |
 | `OPENROUTER_API_KEY` | Backwards-compat alias for `LLM_API_KEY`. |
 | `OPENROUTER_MODEL` | Backwards-compat alias for `LLM_MODEL`. |
 | `PAPERCLIP_SKILLS_DIR` | Override the skills root (default `~/.paperclip-llm-adapter/skills`). |

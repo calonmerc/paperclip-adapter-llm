@@ -1,5 +1,19 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed — model picker
+- **The Model dropdown now lists real models from the provider.** Paperclip
+  calls `listModels()` with no agent config, so it reads the provider from
+  `LLM_BASE_URL` in the server env (default OpenRouter) and fetches
+  `GET <base>/models`. `LLM_API_KEY` is sent when it's set, but no longer
+  required: before, a missing key meant an empty result, and the picker
+  fell back to the static list. Non-OpenRouter providers sort by id.
+- **The hardcoded `models` list is gone** (now `[]`). It was stale and
+  OpenRouter-centric.
+- **`detectModel()` returns `null` unless `LLM_MODEL`/`OPENROUTER_MODEL` is
+  set.** It used to report `openrouter/auto` as "detected" for everyone.
+
 ## [0.13.0] - 2026-09-30
 
 ### Removed — hidden storage
