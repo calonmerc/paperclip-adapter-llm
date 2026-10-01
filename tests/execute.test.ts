@@ -52,6 +52,34 @@ function assistantResponse(text: string, opts: { id?: string } = {}) {
   };
 }
 
+/** A response the provider cut off at max_tokens (finish_reason "length"). */
+function truncatedResponse(
+  opts: { reasoning?: string; text?: string; rawToolCall?: { id: string; name: string; arguments: string } } = {},
+) {
+  return {
+    id: "gen-1",
+    choices: [
+      {
+        finish_reason: "length",
+        message: {
+          role: "assistant",
+          content: opts.text ?? null,
+          reasoning: opts.reasoning,
+          tool_calls: opts.rawToolCall
+            ? [
+                {
+                  id: opts.rawToolCall.id,
+                  type: "function",
+                  function: { name: opts.rawToolCall.name, arguments: opts.rawToolCall.arguments },
+                },
+              ]
+            : undefined,
+        },
+      },
+    ],
+  };
+}
+
 function toolCallResponse(calls: ToolCallSpec[], opts: { id?: string } = {}) {
   return {
     id: opts.id ?? "gen-1",
@@ -286,6 +314,82 @@ describe("execute()", () => {
     expect((chatCall!.body as any).reasoning).toEqual({ effort: "high" });
   });
 
+  it("doesn't send max_tokens unless it's configured, so the model's own maximum applies", async () => {
+    // Real incident (DEBA-53/54): the old 4096 default cut a reasoning model
+    // off mid-thought on every turn, before it ever reached a tool call.
+    fetchMock = setupFetchMock([assistantResponse("done")]);
+    await execute(makeContext({ config: { model: "x", apiKey: "k" } as any }));
+    const unset = fetchMock.calls.find((c) => c.path.endsWith("/chat/completions"))!;
+    expect((unset.body as any).max_tokens).toBeUndefined();
+
+    fetchMock = setupFetchMock([assistantResponse("done")]);
+    await execute(makeContext({ config: { model: "x", apiKey: "k", maxTokens: 8000 } as any }));
+    const set = fetchMock.calls.find((c) => c.path.endsWith("/chat/completions"))!;
+    expect((set.body as any).max_tokens).toBe(8000);
+  });
+
+  it("retries a turn cut off by a configured max_tokens once at double, before anything is appended", async () => {
+    fetchMock = setupFetchMock([
+      truncatedResponse({ reasoning: "Checking the draft against the brief..." }),
+      toolCallResponse([{ id: "c1", name: "update_issue_status", args: { status: "done" } }]),
+      assistantResponse("Done."),
+    ]);
+
+    await execute(makeContext({ config: { model: "x", apiKey: "k", maxTokens: 1000 } as any }));
+
+    const chatCalls = fetchMock.calls.filter((c) => c.path.endsWith("/chat/completions"));
+    expect((chatCalls[0]!.body as any).max_tokens).toBe(1000);
+    expect((chatCalls[1]!.body as any).max_tokens).toBe(2000);
+    expect((chatCalls[1]!.body as any).messages).toHaveLength((chatCalls[0]!.body as any).messages.length);
+    const patches = fetchMock.calls.filter((c) => c.method === "PATCH" && c.path === "/api/issues/issue-1");
+    expect(patches.some((c) => (c.body as any)?.status === "done")).toBe(true);
+  });
+
+  it("continues a truncated turn from the model's own notes instead of discarding them or spending a nudge", async () => {
+    // Real incident (DEBA-54): a cut-off turn was treated as "the model
+    // stopped". Its analysis was dropped from the conversation, so the next
+    // turn re-derived it from scratch and got cut off again in the same place.
+    fetchMock = setupFetchMock([
+      truncatedResponse({ reasoning: "All seven compliance checks pass. Recording APPROVED next" }),
+      toolCallResponse([{ id: "c1", name: "update_issue_status", args: { status: "done", comment: "Approved." } }]),
+      assistantResponse("Approved."),
+    ]);
+
+    await execute(makeContext());
+
+    const chatCalls = fetchMock.calls.filter((c) => c.path.endsWith("/chat/completions"));
+    const second = (chatCalls[1]!.body as any).messages as Array<{ role: string; content: string }>;
+    expect(second.some((m) => m.role === "assistant" && m.content.includes("All seven compliance checks pass"))).toBe(true);
+    const lastUser = second.filter((m) => m.role === "user").at(-1)!.content;
+    expect(lastUser).toContain("cut off at the output limit");
+    expect(lastUser).not.toContain("did not record a disposition");
+    const patches = fetchMock.calls.filter((c) => c.method === "PATCH" && c.path === "/api/issues/issue-1");
+    expect(patches.some((c) => (c.body as any)?.status === "done")).toBe(true);
+  });
+
+  it("doesn't run a tool call whose arguments were cut off mid-JSON, and says why", async () => {
+    // Real incident (DEBA-54): a library write truncated mid-body used to run
+    // as library({}) and return "action must be one of…", which told the
+    // model nothing about what had actually gone wrong.
+    fetchMock = setupFetchMock([
+      truncatedResponse({
+        rawToolCall: { id: "c1", name: "library", arguments: '{"action":"write","key":"draft","body":"# Title\\n\\nLong bo' },
+      }),
+      assistantResponse("ok"),
+    ]);
+
+    await execute(makeContext());
+
+    expect(fetchMock.calls.some((c) => c.method === "PUT")).toBe(false);
+    const chatCalls = fetchMock.calls.filter((c) => c.path.endsWith("/chat/completions"));
+    const second = (chatCalls[1]!.body as any).messages as Array<any>;
+    const toolMsg = second.find((m) => m.role === "tool" && m.tool_call_id === "c1")!;
+    expect(toolMsg.content).toContain("weren't valid JSON");
+    expect(toolMsg.content).toContain("cut off");
+    const assistantMsg = second.find((m) => m.role === "assistant" && m.tool_calls)!;
+    expect(assistantMsg.tool_calls[0].function.arguments).toBe("{}");
+  });
+
   it("sends no reasoning field at all when reasoning is off", async () => {
     fetchMock = setupFetchMock([assistantResponse("done")]);
 
@@ -426,15 +530,11 @@ describe("execute()", () => {
     expect(issuePatchCalls.some((c) => (c.body as any)?.status === "done")).toBe(true);
   });
 
-  it("gives a disposition-recovery wake a second, firmer nudge when the first one also goes unanswered", async () => {
-    // Real incident (DEBA-53): a disposition-recovery run deliberated across
-    // several individually-valid disposition paths (sub-issue vs. self-owned
-    // blocker vs. more evidence-gathering), burned ~9.5k reasoning tokens,
-    // and ended a turn with no tool call at all. Since this was already
-    // Paperclip's one corrective handoff wake, the ordinary one-shot nudge
-    // left no further automatic recovery and the issue escalated straight to
-    // "Missing disposition recovery blocked" on the board. A recovery wake
-    // now gets a second, more directive nudge before the run gives up.
+  it("gives a disposition-recovery wake a second nudge when the first one also goes unanswered", async () => {
+    // A recovery wake is Paperclip's one corrective attempt before a board
+    // escalation, so it gets one more turn. The second nudge pushes toward the
+    // decision the model has reached — not toward 'blocked', which made a
+    // model that had finished its review defer it again (DEBA-54).
     fetchMock = setupFetchMock([
       assistantResponse("Weighing whether to create a sub-issue or record a blocker..."), // no tool call: nudge 1
       assistantResponse("Still weighing the options here..."), // no tool call again: nudge 2 (recovery-only)
@@ -460,11 +560,11 @@ describe("execute()", () => {
     expect(firstNudge.some((m) => m.role === "user" && m.content.includes("did not record a disposition"))).toBe(true);
 
     const secondNudge = (chatCalls[2]!.body as any).messages as Array<{ role: string; content: string }>;
-    expect(
-      secondNudge.some(
-        (m) => m.role === "user" && m.content.includes("second attempt") && m.content.includes("Stop weighing"),
-      ),
-    ).toBe(true);
+    const secondNudgeText = secondNudge.filter((m) => m.role === "user").at(-1)!.content;
+    expect(secondNudgeText).toContain("Stop re-analyzing");
+    expect(secondNudgeText).toContain("status='done' with your verdict");
+    // The model's own text from the unanswered turns stays in the conversation.
+    expect(secondNudge.some((m) => m.role === "assistant" && m.content.includes("Weighing whether"))).toBe(true);
 
     expect(result.exitCode).toBe(0);
     const issuePatchCalls = fetchMock.calls.filter(
@@ -816,6 +916,29 @@ describe("execute()", () => {
     expect(userMsg.content).toContain("DISPOSITION RECOVERY");
     expect(userMsg.content).toContain("Your last run on this issue ended successfully");
     expect(userMsg.content).toContain("unblock_action");
+  });
+
+  it("resolves the recovery note's conflicts with Paperclip's text, the agent's own handoff steps, and a human's request", async () => {
+    // Real incident (DEBA-54): every recovery run spent thousands of tokens
+    // arbitrating "do not create a sub-issue" against its own instruction to
+    // create the SEO handoff task, and Paperclip's "don't repeat the task"
+    // against a human comment asking for the verdict.
+    fetchMock = setupFetchMock([assistantResponse("ok")]);
+
+    await execute(
+      makeContext({
+        context: { issueId: "issue-1", handoffRequired: true, instruction: "Do not repeat the original task." },
+      }),
+    );
+
+    const firstChat = fetchMock.calls.find((c) => c.path.endsWith("/chat/completions"))!;
+    const userMsg = ((firstChat.body as any).messages as Array<{ role: string; content: string }>).find((m) => m.role === "user")!;
+    expect(userMsg.content).not.toContain("Do not create a sub-issue");
+    expect(userMsg.content).toContain("are part of finishing — create them");
+    expect(userMsg.content).toContain("If a human's latest comment asks you to finish the task, finish it.");
+    expect(userMsg.content.indexOf("Paperclip's generic text below")).toBeLessThan(
+      userMsg.content.indexOf("Do not repeat the original task."),
+    );
   });
 
   it("gives the recovery note a stop-at-first-match checklist with blocked as the safe default, not a list of options to weigh", async () => {

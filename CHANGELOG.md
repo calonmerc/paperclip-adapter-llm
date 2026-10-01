@@ -110,18 +110,41 @@
 
 ### Changed — reasoning effort
 - **Reasoning effort is now a config field (`reasoningEffort`: low/medium/
-  high, default `medium`) instead of hardcoded `high` whenever `reasoning`
-  was on.** Root cause of the whole `DEBA-53`/`DEBA-54` incident chain,
-  found after the fixes above still didn't land: three more runs on the same
-  task, each with lean tool calls (no bloated `list`/`list_issues` calls),
-  still ended with empty text, no tool call, and no disposition — burning
-  90k-175k input tokens and up to 15.5k output tokens per turn. The model
-  wasn't failing to decide; it was re-deriving the same conclusion multiple
-  times within a single turn and running out of its turn's budget before
-  ever emitting a tool call, including the trivial "blocked" fallback that
-  needs zero further judgment. `high` reasoning effort was hardcoded with no
-  way for an operator to turn it down. This is the first thing to try when
-  an agent's runs keep ending with no tool call and no assistant text.
+  high, default `medium`)** instead of hardcoded `high` whenever `reasoning`
+  was on. (An earlier version of this entry called this the root cause of
+  the `DEBA-53`/`DEBA-54` incidents. It wasn't — see the truncation entry
+  below. The per-run token totals cited there were sums across turns, not
+  single responses.)
+
+### Fixed — responses cut off at max_tokens (root cause of DEBA-53/DEBA-54)
+- **`max_tokens` is no longer sent unless configured** (it defaulted to
+  4096), and **the loop now handles `finish_reason: "length"`**. Every
+  failed run in the `DEBA-53`/`DEBA-54` chain had thinking that stopped
+  mid-sentence, and its run total was a multiple of roughly 4096 output
+  tokens. The model wrote about 4K tokens of analysis, got cut off before it
+  reached a tool call, and the loop read that as "the model chose to stop."
+  It then threw away the partial output and nudged, so the next turn redid
+  the same analysis from scratch and got cut off at the same point. That is
+  where the "indecision" and "rumination" came from. The prompt fixes above
+  addressed real problems, but not this one. Now:
+  - A cut-off turn with a configured `maxTokens` is retried once at double
+    the value.
+  - Otherwise the partial output stays in the conversation and the model is
+    told to continue from it. This doesn't spend a disposition nudge.
+  - The run log shows a `Response cut off…` line whenever this happens.
+- **Tool calls with unparseable arguments are no longer run as `{}`.** One
+  `DEBA-54` run reached its `library` write, but the full-document body was
+  cut off mid-JSON. It ran as `library({})` and came back with "action must
+  be one of: read, write, append, list". It's now skipped, with an error
+  that names the cut-off and points to `action='append'`.
+- **The model's own text and reasoning are kept when it's nudged.** Before,
+  a no-tool-call turn was dropped from the conversation before the nudge.
+- **Recovery-note conflicts removed.** "Do not create a sub-issue in this
+  run" collided with agents' own handoff steps (Toby's SEO task for Ryan).
+  The note now says those follow-ups are part of finishing. It also says how
+  to read Paperclip's generic "don't repeat the task" text, and that a
+  human's request to finish wins. The second recovery nudge no longer pushes
+  `blocked`; it pushes recording the decision the model has reached.
 
 ## [0.13.0] - 2026-09-30
 

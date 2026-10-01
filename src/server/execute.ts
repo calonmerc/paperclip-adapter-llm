@@ -245,36 +245,12 @@ export function isDispositionRecoveryWake(context: Record<string, unknown>): boo
 }
 
 /**
- * This used to list 5 "valid" options for the model to weigh against each
- * other (done / in_review / blocked / ask_user_questions / create a
- * sub-issue). Two real recovery runs (DEBA-53, DEBA-54) got stuck comparing
- * them — tens of thousands of reasoning tokens spent on "which path is more
- * correct" with no tool call to show for it. An ordered checklist with a
- * named safe default removes the comparison itself instead of just capping
- * how long the model gets to make it (see the two-nudge fallback below,
- * which still exists for when a model ignores even this).
- *
- * Step 1 used to flatly forbid finishing the task ("do NOT redo the work").
- * On DEBA-54 that produced a worse failure: a human retry woke the agent on
- * an ordinary heartbeat, it read the draft + brief (already fully in hand)
- * and got most of the way through a real compliance verdict, then caught
- * itself ("this is disposition-only, don't redo the task") and threw the
- * analysis away to self-block instead — "owner: me, action: try again
- * later." The next retry repeated the identical cycle: nothing was actually
- * blocked on anything external, so "blocked" never resolved. Step 1 was
- * rewritten to let the model finish a judgment call it already has the
- * inputs for, phrased as "already in hand" / "already see below" — which
- * then caused a THIRD failure on the very next recovery run: every run of
- * this adapter starts from a fresh message list (see the comment on that
- * below in execute()), so nothing is ever literally "already in hand" at
- * turn 1 of a recovery run, and the model reasoned exactly that: "I don't
- * have the draft or brief content in context... reading them would be
- * re-fetching data" — and blocked itself again rather than make the two
- * cheap reads the task already pointed it to. Step 1 now says explicitly
- * that reading the small number of documents a task already references is
- * evidence-gathering, not redoing the task, even though it takes tool calls
- * in a fresh run. The ban is on regenerating a deliverable or repeating
- * work with external side effects — not on the reads needed to decide.
+ * Every rule here is resolved against the others explicitly: the model will
+ * otherwise spend its turn arbitrating between Paperclip's generic "don't
+ * repeat the task" text, its own role instructions (e.g. a handoff task after
+ * sign-off), and a human comment asking it to finish. Reads are framed as
+ * evidence-gathering because every run starts from an empty context — a
+ * "use what's already in hand" rule is never satisfied at turn 1.
  */
 export function renderDispositionHandoffNote(context: Record<string, unknown>): string {
   if (!isDispositionRecoveryWake(context)) return "";
@@ -289,7 +265,17 @@ export function renderDispositionHandoffNote(context: Record<string, unknown>): 
       "external system with side effects. Once you can see what you need, make the call — deferring again " +
       "is not safer than deciding.",
     "",
-    ...(instruction ? [instruction, ""] : []),
+    ...(instruction
+      ? [
+          "Paperclip's generic text below may say not to inspect the workspace or repeat the task. Read it as " +
+            "only: don't regenerate a deliverable and don't cause external side effects. Reading the referenced " +
+            "documents and recording your verdict are both allowed. If a human's latest comment asks you to " +
+            "finish the task, finish it.",
+          "",
+          instruction,
+          "",
+        ]
+      : []),
     "## Decide using this order — stop at the first step that applies, do not weigh it against the others",
     "1. The deliverable is already finished (a comment/document shows it), OR you can make the call " +
       "yourself after reading what this task already references — that's evidence-gathering, go read it " +
@@ -301,7 +287,9 @@ export function renderDispositionHandoffNote(context: Record<string, unknown>): 
       "need external side effects or regenerating a deliverable → update_issue_status status='blocked' " +
       "with unblock_action naming yourself as owner and a concrete next step. This is always valid and is " +
       "the safe default when you truly can't finish right now.",
-    "Do not create a sub-issue in this run or call external APIs with side effects.",
+    "Follow-up tasks your own instructions require once the work is finished (e.g. a handoff task to the " +
+      "next agent) are part of finishing — create them. Don't create sub-issues instead of deciding, and " +
+      "don't call external APIs with side effects.",
   ].join("\n");
 }
 
@@ -343,14 +331,27 @@ function blockedPatch(agentId: string, reason: string): Record<string, unknown> 
   };
 }
 
-function safeParseToolArgs(raw: string): Record<string, unknown> {
-  if (!raw || typeof raw !== "string") return {};
+/**
+ * Empty arguments are a valid call ({}); unparseable ones are not. A
+ * response cut off at max_tokens mid-call leaves truncated JSON, and this
+ * used to return {} for it — so a half-written library write ran as
+ * library({}) and came back "action must be one of…", which told the model
+ * nothing about what actually went wrong.
+ */
+function parseToolArgs(raw: unknown): { ok: true; args: Record<string, unknown> } | { ok: false } {
+  if (raw == null || (typeof raw === "string" && raw.trim() === "")) return { ok: true, args: {} };
+  if (typeof raw !== "string") return { ok: false };
   try {
     const parsed = JSON.parse(raw);
-    return parsed && typeof parsed === "object" ? parsed : {};
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? { ok: true, args: parsed } : { ok: false };
   } catch {
-    return {};
+    return { ok: false };
   }
+}
+
+function configuredMaxTokens(config: LlmConfig): number | undefined {
+  const n = Number(config.maxTokens);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : undefined;
 }
 
 async function callChatCompletions(
@@ -359,25 +360,24 @@ async function callChatCompletions(
   endpoints: ResolvedEndpoints,
   messages: ChatMessage[],
   tools: Tool[],
+  maxTokensOverride?: number,
 ): Promise<ChatCompletionResponse> {
   const body: Record<string, unknown> = {
     model: config.model || "openrouter/auto",
     messages,
-    max_tokens: config.maxTokens ?? 4096,
     temperature: config.temperature ?? 0.7,
     top_p: config.topP ?? 1,
     stream: false,
   };
+  // Not sent unless configured, so the provider uses the model's own output
+  // maximum. A hardcoded 4096 default cut reasoning models off mid-thought
+  // before they ever reached a tool call (reasoning counts against it).
+  const maxTokens = maxTokensOverride ?? configuredMaxTokens(config);
+  if (maxTokens) body.max_tokens = maxTokens;
   if (tools.length > 0) {
     body.tools = toolSchemas(tools);
     body.tool_choice = "auto";
   }
-  // "high" used to be hardcoded here regardless of the operator's choice. A
-  // real incident: on a review task, a model at "high" effort repeatedly
-  // burned its entire turn (90k-175k input tokens, up to 15.5k output)
-  // re-deriving the same conclusion several times within one turn and never
-  // reached a tool call — not even the trivial "blocked" fallback. "medium"
-  // is the default now; "high" is opt-in for models that actually need it.
   if (config.reasoning) body.reasoning = { effort: config.reasoningEffort ?? "medium" };
   const transforms = Array.isArray(config.transforms)
     ? config.transforms
@@ -729,6 +729,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
   let lastGenerationId: string | undefined;
   let totalUsage: UsageSummary = { inputTokens: 0, outputTokens: 0 };
+  const addUsage = (response: ChatCompletionResponse): void => {
+    lastGenerationId = response.id || lastGenerationId;
+    if (!response.usage) return;
+    totalUsage = {
+      inputTokens: totalUsage.inputTokens + (response.usage.prompt_tokens ?? 0),
+      outputTokens: totalUsage.outputTokens + (response.usage.completion_tokens ?? 0),
+    };
+  };
   let finalAssistantText = "";
   let turn = 0;
   let stoppedReason: "completed" | "max_turns" | "error" | "repeat_loop" = "completed";
@@ -747,17 +755,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   // currentIssueNeedsDisposition), because "some update_issue_status call
   // succeeded" also covered calls on a sub-issue.
   //
-  // A disposition-recovery wake gets a SECOND nudge instead of the usual
-  // one: a real recovery run (DEBA-53) spent its whole turn deliberating
-  // between several individually-valid disposition paths (sub-issue vs.
-  // self-owned blocker vs. more evidence-gathering), burned ~9.5k reasoning
-  // tokens, and ended with no tool call at all — on what was already
-  // Paperclip's one corrective handoff wake, so the silent "still
-  // in_progress" result had no further automatic recovery and escalated
-  // straight to a board decision. The second nudge is worded more bluntly
-  // (stop weighing alternatives, call the one always-valid option) because
-  // a generic repeat of the first nudge is what this model had already
-  // ignored.
+  // A disposition-recovery wake gets a second nudge: it's Paperclip's one
+  // corrective attempt before a board escalation, so it's worth one more turn.
   let dispositionRecorded = false;
   let dispositionNudgesGiven = 0;
   const maxDispositionNudges = isDispositionRecoveryWake(context) ? 2 : 1;
@@ -787,19 +786,20 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       let response: ChatCompletionResponse;
       try {
         response = await callChatCompletions(apiKey, config, endpoints, messages, tools);
+        addUsage(response);
+        // An operator-set cap that cuts the turn off gets one retry at double
+        // before we fall back to continuing from the partial output.
+        const capped = configuredMaxTokens(config);
+        if (capped && response.choices?.[0]?.finish_reason === "length") {
+          await emitSystem(onLog, `Response cut off at max_tokens (${capped}); retrying this turn with ${capped * 2}.`);
+          response = await callChatCompletions(apiKey, config, endpoints, messages, tools, capped * 2);
+          addUsage(response);
+        }
       } catch (err) {
         const reason = err instanceof Error ? err.message : String(err);
         runError = { message: reason, code: "llm_request_failed" };
         stoppedReason = "error";
         break;
-      }
-
-      lastGenerationId = response.id || lastGenerationId;
-      if (response.usage) {
-        totalUsage = {
-          inputTokens: totalUsage.inputTokens + (response.usage.prompt_tokens ?? 0),
-          outputTokens: totalUsage.outputTokens + (response.usage.completion_tokens ?? 0),
-        };
       }
 
       const choice = response.choices?.[0];
@@ -813,6 +813,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       const reasoning = typeof msg.reasoning === "string" ? msg.reasoning : "";
       const text = typeof msg.content === "string" ? msg.content : "";
       const toolCalls = msg.tool_calls ?? [];
+      const truncated = choice.finish_reason === "length";
 
       if (reasoning) {
         await emitThinking(onLog, reasoning);
@@ -821,12 +822,33 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         await emitAssistant(onLog, text);
         finalAssistantText = text;
       }
+      if (truncated) {
+        await emitSystem(onLog, "Response cut off at the output token limit — continuing from where it stopped.");
+      }
 
-      // No tool calls => model believes it's done. Before accepting that,
-      // give it a chance (two on a disposition-recovery wake) to actually
-      // record a disposition if it hasn't — see the maxDispositionNudges
-      // comment above.
       if (toolCalls.length === 0) {
+        // Keep the model's own output in the conversation. Without this, the
+        // next turn starts from scratch and re-derives the same analysis —
+        // and, if that's what got cut off, gets cut off again in the same place.
+        const ownOutput = text || (reasoning ? `(My working notes so far:)\n${reasoning}` : "");
+        if (ownOutput) messages.push({ role: "assistant", content: ownOutput });
+
+        // A truncated turn didn't choose to stop, so it isn't a missed
+        // disposition and doesn't spend a nudge.
+        if (truncated && turn < maxTurns) {
+          messages.push({
+            role: "user",
+            content:
+              "Your last response was cut off at the output limit before you called a tool. Your analysis " +
+              "is above — don't redo it. Make the tool call it leads to now. To add to an existing document, " +
+              "use action='append' with only the new text rather than resending the whole document.",
+          });
+          continue;
+        }
+
+        // No tool calls => model believes it's done. Before accepting that,
+        // give it a chance (two on a disposition-recovery wake) to actually
+        // record a disposition if it hasn't.
         if (dispositionNudgesGiven < maxDispositionNudges && turn < maxTurns && (await currentIssueNeedsDisposition())) {
           dispositionNudgesGiven += 1;
           const nudgeContent =
@@ -838,11 +860,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
                 "with blocked_by_issue_ids and/or unblock_action if you can't continue; status='in_review' " +
                 "with reviewer_user_id if someone must review it; or ask_user_questions if a human must " +
                 "answer. Do not just restate that you're finished — call the tool."
-              : "This is a disposition-recovery run and a second attempt: still no disposition was recorded. " +
-                "Stop weighing which path is 'more correct' — call update_issue_status right now with " +
-                "status='blocked', blocked_by_issue_ids and/or unblock_action naming yourself as the owner. " +
-                "That option is always valid here. Do not keep analyzing tool semantics or alternate paths " +
-                "this turn — just call the tool.";
+              : "Still no disposition recorded. Stop re-analyzing — you already have what you need. Record " +
+                "the decision you've reached now: write any record your instructions require, then " +
+                "update_issue_status status='done' with your verdict in `comment`. Only if you truly can't " +
+                "decide: status='blocked' with unblock_action.";
           messages.push({ role: "user", content: nudgeContent });
           continue;
         }
@@ -850,27 +871,44 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         break;
       }
 
-      // Add the assistant message (with tool_calls) so the model sees its own request.
+      const parsedCalls = toolCalls.map((tc) => ({ tc, parsed: parseToolArgs(tc.function.arguments) }));
+
+      // Add the assistant message (with tool_calls) so the model sees its own
+      // request. Unparseable arguments are replaced with {} so the next request
+      // doesn't carry invalid JSON; the tool result explains what happened.
       messages.push({
         role: "assistant",
         content: text,
-        tool_calls: toolCalls.map((tc) => ({
+        tool_calls: parsedCalls.map(({ tc, parsed }) => ({
           id: tc.id,
           type: "function",
-          function: { name: tc.function.name, arguments: tc.function.arguments },
+          function: { name: tc.function.name, arguments: parsed.ok ? tc.function.arguments || "{}" : "{}" },
         })),
       });
 
       // Execute each tool call and append the results.
-      for (const tc of toolCalls) {
+      for (const { tc, parsed } of parsedCalls) {
         const toolName = tc.function.name;
-        const args = safeParseToolArgs(tc.function.arguments);
-        await emitToolCall(onLog, { name: toolName, input: args, toolUseId: tc.id });
+        const args = parsed.ok ? parsed.args : {};
+        const rawLength = typeof tc.function.arguments === "string" ? tc.function.arguments.length : 0;
+        await emitToolCall(onLog, {
+          name: toolName,
+          input: parsed.ok ? args : { unparseableArguments: `${rawLength} chars of invalid JSON` },
+          toolUseId: tc.id,
+        });
 
         const tool = findTool(tools, toolName);
         let resultContent: string;
         let isError: boolean;
-        if (!tool) {
+        if (!parsed.ok) {
+          resultContent = JSON.stringify({
+            error:
+              `Your arguments for ${toolName} weren't valid JSON${truncated ? " — your response was cut off at the output limit mid-call" : ""}. ` +
+              "Nothing was run. Resend the call. To add to an existing document, use action='append' with just " +
+              "the new text instead of resending the whole document.",
+          });
+          isError = true;
+        } else if (!tool) {
           resultContent = JSON.stringify(unknownToolError(toolName, tools));
           isError = true;
         } else {

@@ -67,17 +67,15 @@ export const agentConfigurationDoc = `# llm adapter configuration
   \`baseUrl\` doesn't change the picker; type a model id to use one not listed.
 - \`systemPrompt\` (string, optional) — System prompt prepended to all messages.
 - \`temperature\` (number, optional) — 0–2. Default: 0.7
-- \`maxTokens\` (number, optional) — Max completion tokens. Default: 4096
+- \`maxTokens\` (number, optional) — Cap on everything the model generates in one response
+  (reasoning, text, tool-call arguments). Default: not sent, so the model's own maximum
+  applies. A low value cuts responses off mid-thought; if that happens with a configured
+  cap, the turn is retried once at double, then continued from the partial output.
 - \`topP\` (number, optional) — Nucleus sampling. Default: 1
 - \`stream\` (boolean, optional) — SSE streaming. Default: true
 - \`reasoning\` (boolean, optional) — Extended thinking for supported models.
 - \`reasoningEffort\` ("low" | "medium" | "high", optional) — Only used when \`reasoning\`
-  is on. Default: "medium". A real incident on a review-type task: at "high", a model
-  burned 90k-175k input tokens and up to 15.5k output tokens per turn ruminating —
-  re-deriving the same conclusion across several restarts within one turn — and
-  repeatedly ran out of its turn's budget before ever emitting a tool call, even the
-  trivial fallback one. Turning this down is the first thing to try when a model stalls
-  out mid-turn with no tool call and no assistant text.
+  is on. Default: "medium".
 - \`maxTurns\` (number, optional) — Max tool-loop turns per run. Default: 25
 - \`autoApprove\` (boolean, optional) — Skip approval gates for hire_agent and similar mutating tools.
 - \`skillsDir\` (string, optional) — Override path to the skills directory.

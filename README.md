@@ -49,7 +49,7 @@ The adapter never guesses an issue's final disposition: a run only changes issue
 
 When Paperclip wakes the agent for that recovery (a "successful run handoff"), its instructions arrive at the top level of the run context rather than in the wake payload, so the adapter renders them itself at the top of the prompt. Otherwise the corrective run looks like an ordinary wake, the model redoes the task, and Paperclip's single corrective attempt is spent.
 
-That note is an ordered checklist, not a list of options to weigh: stop at the first step that applies (done, then ask_user_questions, then in_review), with `blocked` + a self-owned `unblock_action` named explicitly as the safe default and `create_sub_issue` left off the list entirely. Two real recovery runs (DEBA-53, DEBA-54) spent tens of thousands of reasoning tokens comparing those options against each other without ever calling a tool — handing back an ordered procedure with a named default removes the comparison itself, instead of only capping how long the model gets to make it (see the two-nudge fallback below, which still exists for when a model ignores even this).
+That note is an ordered checklist, not a list of options to weigh: stop at the first step that applies (done, then ask_user_questions, then in_review), with `blocked` + a self-owned `unblock_action` as the fallback when the model truly can't finish. It also settles the conflicts a model would otherwise argue over: Paperclip's generic "don't repeat the task" text means only "don't regenerate a deliverable or cause external side effects"; follow-up tasks the agent's own instructions require (like a handoff to the next agent) are part of finishing; and a human's latest request to finish wins.
 
 The note bans regenerating a deliverable, repeating a multi-step pipeline, and calling external systems with side effects — but it does **not** ban finishing a judgment call. A flat "do NOT redo the work" rule caused a failure on `DEBA-54`: a human retry woke the agent on an ordinary heartbeat, it read the review's draft and brief and got most of the way to a real verdict, then caught itself mid-review ("this is disposition-only, don't redo the task") and threw the analysis away to self-block instead — "owner: me, action: try again later." Nothing was actually blocked on anything external, so every subsequent retry repeated the identical no-op cycle.
 
@@ -61,7 +61,7 @@ A fourth pass on the same `DEBA-54` incident traced into the tools themselves, n
 
 Before accepting a plain-text "I'm done" as the end of a run, `execute()` asks Paperclip for the issue's current status and gives the model an in-run nudge if it's still `in_progress` (and no `ask_user_questions` interaction is pending): a corrective message pointing out that no disposition was recorded and asking it to call the tool now. This exists because of a real, observed failure mode — a model confidently writing "closed done, verified in the API response" without ever having called the tool — that kept re-triggering Paperclip's cross-run `missing_disposition` recovery run after run on the same issue without fixing the underlying habit. One in-run nudge is cheaper and more effective than waiting on that slower loop.
 
-An ordinary run gets exactly one nudge. A disposition-recovery wake (the "successful run handoff" above) gets **two**, and the second is worded more bluntly — telling the model to stop weighing which disposition path is "more correct" and just call `update_issue_status` with `blocked`/`unblock_action` naming itself as owner. A recovery wake is already Paperclip's one corrective handoff before it escalates to a board decision, so a model that burns the turn deliberating between several valid-looking options (seen in production: ~9.5k reasoning tokens spent weighing a sub-issue vs. a self-owned blocker vs. more evidence-gathering, with no tool call at all) gets a second, more directive chance instead of going straight to a human. If the model still doesn't comply after its nudges, status is left untouched as before.
+An ordinary run gets exactly one nudge. A disposition-recovery wake (the "successful run handoff" above) gets **two**, since it's Paperclip's one corrective attempt before a board escalation. The second tells the model to stop re-analyzing and record the decision it has reached (`done` with its verdict), with `blocked` only if it truly can't decide. The model's own text and reasoning from the unanswered turn stay in the conversation, so a nudge never wipes out work it already did. A response cut off at the token limit isn't treated as the model stopping at all and doesn't spend a nudge (see "Max tokens and truncated responses"). If the model still doesn't comply after its nudges, status is left untouched as before.
 
 ### Capability flags
 
@@ -73,9 +73,20 @@ Company-managed skills toggled in Paperclip's Skills panel are symlinked into th
 
 ## Configuration
 
+### Max tokens and truncated responses
+
+`maxTokens` caps everything the model generates in one response — reasoning, visible text, and tool-call arguments together. It isn't sent unless you set it, so the model's own maximum applies. It used to default to 4096, which cut reasoning models off mid-thought before they reached a tool call.
+
+When a response is cut off anyway (`finish_reason: "length"`), the run log shows a `Response cut off…` line, and:
+- With a configured `maxTokens`, the turn is retried once at double the value.
+- Otherwise the model's partial output is kept in the conversation and it's told to continue from it with the tool call it was building toward. This doesn't count as a missed disposition.
+- Tool calls whose arguments were cut off mid-JSON are never run. The model gets an error saying so, and suggesting `action='append'` instead of resending a whole document.
+
+If an agent's runs end with empty text, no tool call, and thinking that stops mid-sentence, look for that `Response cut off` line first.
+
 ### Reasoning effort
 
-`reasoning` (toggle) turns on extended thinking for models that support it; `reasoningEffort` (`low`/`medium`/`high`, default `medium`) controls how much. The default used to be hardcoded to `high` with no way to turn it down. A real incident: on a review-type task, a model at `high` repeatedly burned its entire turn — 90k-175k input tokens, up to 15.5k output tokens in a single completion — re-deriving the same conclusion multiple times within one turn, and never reached a tool call, not even the trivial "blocked" fallback. If an agent's runs keep ending with no tool call and no assistant text (an empty `result.text` with a large `outputTokens`), turn this down before changing anything else — it's usually cheaper and more effective than a model or prompt change.
+`reasoning` (toggle) turns on extended thinking for models that support it; `reasoningEffort` (`low`/`medium`/`high`, default `medium`) controls how much. It used to be hardcoded to `high`.
 
 ### OpenRouter (default — no `baseUrl` needed)
 

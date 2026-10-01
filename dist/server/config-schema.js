@@ -41,8 +41,8 @@ export function getConfigSchema() {
                 key: "maxTokens",
                 label: "Max tokens",
                 type: "number",
-                default: 4096,
-                hint: "Max completion tokens.",
+                hint: "Leave empty to use the model's maximum. Caps everything the model generates in one response — " +
+                    "reasoning, text and tool-call arguments — so a low value cuts responses off mid-thought.",
             },
             {
                 key: "topP",
@@ -73,10 +73,7 @@ export function getConfigSchema() {
                     { value: "medium", label: "Medium" },
                     { value: "high", label: "High" },
                 ],
-                hint: "Only applies when reasoning is on. A real incident: at 'high', a weaker model " +
-                    "repeatedly burned its entire turn re-deriving the same conclusion multiple times " +
-                    "and never got to call a tool, even the trivial fallback one. Turn this down first " +
-                    "if an agent's runs keep ending with no tool call and no assistant text.",
+                hint: "Only applies when reasoning is on. Higher effort spends more of each response thinking.",
             },
             {
                 key: "maxTurns",
