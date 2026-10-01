@@ -49,6 +49,21 @@
   `unblock_action` as the explicit safe default for unclear evidence, and
   drops `create_sub_issue` from the offered paths entirely — it was the
   biggest fork in the observed deliberation.
+- **The recovery note no longer flatly bans finishing the task — only
+  re-fetching data, multi-step work, and external side effects.** A later
+  run on the same `DEBA-54` issue hit a worse failure than the deliberation
+  above: a human retry woke the agent on an ordinary heartbeat, it read the
+  review's draft and brief (already fully in hand) and got most of the way
+  through a real compliance verdict, then caught itself — "this is
+  disposition-only, don't redo the task" — and threw the analysis away to
+  self-block on itself instead ("owner: me, action: try again later").
+  Nothing was actually blocked on anything external, so every following
+  "try again" repeated the identical no-op cycle: ordinary wake fails to
+  finish → `missing_disposition` fires → recovery run self-blocks again.
+  Step 1 of the checklist now explicitly covers this case: if durable
+  evidence is already fully in hand and finishing means one write with no
+  external side effects, record the real verdict now instead of deferring
+  it again.
 
 ## [0.13.0] - 2026-09-30
 

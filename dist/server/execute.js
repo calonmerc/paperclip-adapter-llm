@@ -179,26 +179,44 @@ export function isDispositionRecoveryWake(context) {
  * named safe default removes the comparison itself instead of just capping
  * how long the model gets to make it (see the two-nudge fallback below,
  * which still exists for when a model ignores even this).
+ *
+ * Step 1 used to flatly forbid finishing the task ("do NOT redo the work").
+ * On DEBA-54 that produced a worse failure: a human retry woke the agent on
+ * an ordinary heartbeat, it read the draft + brief (already fully in hand)
+ * and got most of the way through a real compliance verdict, then caught
+ * itself ("this is disposition-only, don't redo the task") and threw the
+ * analysis away to self-block instead — "owner: me, action: try again
+ * later." The next retry repeated the identical cycle: nothing was actually
+ * blocked on anything external, so "blocked" never resolved. Step 1 now
+ * lets the model finish a judgment call it already has the inputs for —
+ * that's completing the one remaining step, not redoing the task. The ban
+ * stays on re-fetching data, repeating multi-step work, and external
+ * side effects, which is what this note was actually protecting against.
  */
 export function renderDispositionHandoffNote(context) {
     if (!isDispositionRecoveryWake(context))
         return "";
     const instruction = typeof context.instruction === "string" ? context.instruction.trim() : "";
     return [
-        "# DISPOSITION RECOVERY — record a disposition, do NOT redo the work",
-        "Your previous run on this issue ended without a valid disposition. This run exists only to record one.",
+        "# DISPOSITION RECOVERY — record a disposition this run",
+        "Your previous run on this issue ended without a valid disposition. Do not re-fetch data you can " +
+            "already see below, repeat multi-step work, or call external systems with side effects. But if " +
+            "everything you need for a final verdict is already in hand, finish that one judgment call and " +
+            "record it now — deferring it again is not safer than deciding it.",
         "",
         ...(instruction ? [instruction, ""] : []),
         "## Decide using this order — stop at the first step that applies, do not weigh it against the others",
-        "1. A comment or document already shows this task's own deliverable is finished (a verdict, sign-off, " +
-            "completed artifact) → update_issue_status status='done' (or 'cancelled' if the work should not " +
-            "continue), with a short `comment`.",
+        "1. The deliverable is already finished (a comment/document shows it), OR you already have everything " +
+            "you need to make the call yourself — durable evidence fully in hand, nothing left but your own " +
+            "judgment, and finishing means one write with no external side effects → update_issue_status " +
+            "status='done' (or 'cancelled'), citing the evidence in `comment`.",
         "2. A human must answer or act before you can continue → ask_user_questions.",
         "3. Someone else must review the result → update_issue_status status='in_review' with reviewer_user_id.",
-        "4. Otherwise — including \"I can't tell if step 1 is true\" — update_issue_status status='blocked' with " +
-            "unblock_action naming yourself as owner and a concrete next step. This is always valid and is the " +
-            "safe default: use it instead of continuing to weigh alternatives.",
-        "Do not create a sub-issue in this run, call external APIs, or repeat the task.",
+        "4. Otherwise — evidence is genuinely missing, or finishing would need external side effects or " +
+            "multi-step work → update_issue_status status='blocked' with unblock_action naming yourself as " +
+            "owner and a concrete next step. This is always valid and is the safe default when you truly can't " +
+            "finish right now.",
+        "Do not create a sub-issue in this run or call external APIs with side effects.",
     ].join("\n");
 }
 const SHELL_LIKE_TOOL_NAMES = new Set([

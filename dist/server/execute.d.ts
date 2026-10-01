@@ -50,6 +50,19 @@ export declare function isDispositionRecoveryWake(context: Record<string, unknow
  * named safe default removes the comparison itself instead of just capping
  * how long the model gets to make it (see the two-nudge fallback below,
  * which still exists for when a model ignores even this).
+ *
+ * Step 1 used to flatly forbid finishing the task ("do NOT redo the work").
+ * On DEBA-54 that produced a worse failure: a human retry woke the agent on
+ * an ordinary heartbeat, it read the draft + brief (already fully in hand)
+ * and got most of the way through a real compliance verdict, then caught
+ * itself ("this is disposition-only, don't redo the task") and threw the
+ * analysis away to self-block instead — "owner: me, action: try again
+ * later." The next retry repeated the identical cycle: nothing was actually
+ * blocked on anything external, so "blocked" never resolved. Step 1 now
+ * lets the model finish a judgment call it already has the inputs for —
+ * that's completing the one remaining step, not redoing the task. The ban
+ * stays on re-fetching data, repeating multi-step work, and external
+ * side effects, which is what this note was actually protecting against.
  */
 export declare function renderDispositionHandoffNote(context: Record<string, unknown>): string;
 export declare function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult>;
