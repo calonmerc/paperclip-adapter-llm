@@ -216,56 +216,93 @@ function updateIssueStatusTool(ctx: BuildToolsContext): Tool {
       if (!id) return fail("No issue_id supplied and no current issue.");
       const status = asString(args.status);
       if (!status) return fail("status is required.");
-      const isCurrent = targetsCurrentIssue(ctx, args.issue_id);
-      if (isCurrent && NON_DISPOSITION_STATUSES.has(status)) {
-        return fail(
-          `'${status}' is not a valid way to end a run on your own issue — Paperclip treats it as a missing ` +
-            "disposition. Use done, cancelled, blocked (with blocked_by_issue_ids or unblock_action), " +
-            "in_review (with reviewer_user_id), or call ask_user_questions if you need a human's input.",
-        );
-      }
-
-      const patch: Record<string, unknown> = { status };
-      if (typeof args.comment === "string" && args.comment.trim()) patch.comment = args.comment.trim();
-
-      if (status === "blocked") {
-        const blockerIds = Array.isArray(args.blocked_by_issue_ids)
-          ? args.blocked_by_issue_ids.filter((v): v is string => typeof v === "string" && v.length > 0)
-          : [];
-        const unblockAction = asString(args.unblock_action).trim();
-        if (blockerIds.length === 0 && !unblockAction) {
-          return fail(`status='blocked' needs a real blocker path. ${statusRejectionHint("blocked")}`);
-        }
-        if (blockerIds.length > 0) patch.blockedByIssueIds = blockerIds;
-        if (unblockAction) {
-          // Paperclip only lets an agent name itself as the unblock owner.
-          patch.unblockDescriptor = { owner: { agentId: ctx.agentId }, action: unblockAction.slice(0, 2000) };
-        }
-      }
-
-      if (status === "in_review") {
-        const reviewer = asString(args.reviewer_user_id).trim();
-        if (!reviewer && isCurrent) {
-          return fail(`status='in_review' needs a reviewer. ${statusRejectionHint("in_review")}`);
-        }
-        if (reviewer) patch.assigneeUserId = reviewer;
-      }
-
-      try {
-        return ok(await ctx.api.updateIssue(id, patch));
-      } catch (err) {
-        if (err instanceof PaperclipApiError) {
-          const hint = err.status === 422 ? statusRejectionHint(status) : null;
-          return fail(`update_issue_status failed: ${err.message}${hint ? ` — ${hint}` : ""}`, {
-            status: err.status,
-            body: err.body,
-          });
-        }
-        return fail(`update_issue_status failed: ${err instanceof Error ? err.message : String(err)}`);
-      }
+      const built = buildStatusPatch(ctx, args, status);
+      if ("error" in built) return built.error;
+      return sendStatusPatch(ctx, "update_issue_status", id, status, built.patch);
     },
   };
 }
+
+/**
+ * Validates a status change and builds its issue patch (status, comment,
+ * blocker path, reviewer). Shared by update_issue_status and by update_issue,
+ * which accepts a `status` too because models confuse the two tools.
+ */
+function buildStatusPatch(
+  ctx: BuildToolsContext,
+  args: Record<string, unknown>,
+  status: string,
+): { patch: Record<string, unknown> } | { error: ToolExecutionResult } {
+  const isCurrent = targetsCurrentIssue(ctx, args.issue_id);
+  if (isCurrent && NON_DISPOSITION_STATUSES.has(status)) {
+    return {
+      error: fail(
+        `'${status}' is not a valid way to end a run on your own issue — Paperclip treats it as a missing ` +
+          "disposition. Use done, cancelled, blocked (with blocked_by_issue_ids or unblock_action), " +
+          "in_review (with reviewer_user_id), or call ask_user_questions if you need a human's input.",
+      ),
+    };
+  }
+
+  const patch: Record<string, unknown> = { status };
+  if (typeof args.comment === "string" && args.comment.trim()) patch.comment = args.comment.trim();
+
+  if (status === "blocked") {
+    const blockerIds = Array.isArray(args.blocked_by_issue_ids)
+      ? args.blocked_by_issue_ids.filter((v): v is string => typeof v === "string" && v.length > 0)
+      : [];
+    const unblockAction = asString(args.unblock_action).trim();
+    if (blockerIds.length === 0 && !unblockAction) {
+      return { error: fail(`status='blocked' needs a real blocker path. ${statusRejectionHint("blocked")}`) };
+    }
+    if (blockerIds.length > 0) patch.blockedByIssueIds = blockerIds;
+    if (unblockAction) {
+      // Paperclip only lets an agent name itself as the unblock owner.
+      patch.unblockDescriptor = { owner: { agentId: ctx.agentId }, action: unblockAction.slice(0, 2000) };
+    }
+  }
+
+  if (status === "in_review") {
+    const reviewer = asString(args.reviewer_user_id).trim();
+    if (!reviewer && isCurrent) {
+      return { error: fail(`status='in_review' needs a reviewer. ${statusRejectionHint("in_review")}`) };
+    }
+    if (reviewer) patch.assigneeUserId = reviewer;
+  }
+
+  return { patch };
+}
+
+async function sendStatusPatch(
+  ctx: BuildToolsContext,
+  toolName: string,
+  id: string,
+  status: string,
+  patch: Record<string, unknown>,
+): Promise<ToolExecutionResult> {
+  try {
+    return ok(await ctx.api.updateIssue(id, patch));
+  } catch (err) {
+    if (err instanceof PaperclipApiError) {
+      const hint = err.status === 422 ? statusRejectionHint(status) : null;
+      return fail(`${toolName} failed: ${err.message}${hint ? ` — ${hint}` : ""}`, {
+        status: err.status,
+        body: err.body,
+      });
+    }
+    return fail(`${toolName} failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+const UPDATE_ISSUE_FIELDS = [
+  "issue_id",
+  "title",
+  "description",
+  "priority",
+  "blocked_by_issue_ids",
+  "assignee_agent_id",
+  "assignee_user_id",
+];
 
 function updateIssueTool(ctx: BuildToolsContext): Tool {
   return {
@@ -319,7 +356,26 @@ function updateIssueTool(ctx: BuildToolsContext): Tool {
       if (typeof args.assignee_agent_id === "string") patch.assigneeAgentId = args.assignee_agent_id || null;
       if (typeof args.assignee_user_id === "string") patch.assigneeUserId = args.assignee_user_id || null;
 
-      if (Object.keys(patch).length === 0) return fail("No fields supplied to update.");
+      // Not advertised in the schema, but models regularly send a status (and
+      // comment) here instead of to update_issue_status. The intent is
+      // unambiguous, so honor it with the same validation rather than
+      // rejecting it and watching the model retry the identical call.
+      const status = asString(args.status);
+      if (status) {
+        const built = buildStatusPatch(ctx, args, status);
+        if ("error" in built) return built.error;
+        return sendStatusPatch(ctx, "update_issue", id, status, { ...patch, ...built.patch });
+      }
+
+      if (Object.keys(patch).length === 0) {
+        const ignored = Object.keys(args).filter((k) => !UPDATE_ISSUE_FIELDS.includes(k));
+        const commentHint = "comment" in args ? " To post a comment, use add_comment." : "";
+        return fail(
+          `No updatable fields supplied${ignored.length ? ` (ignored: ${ignored.join(", ")})` : ""}. ` +
+            `update_issue accepts ${UPDATE_ISSUE_FIELDS.slice(1).join(", ")}. ` +
+            `To change status, use update_issue_status.${commentHint}`,
+        );
+      }
 
       return safeCall("update_issue", () => ctx.api.updateIssue(id, patch));
     },

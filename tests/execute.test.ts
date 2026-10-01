@@ -339,6 +339,27 @@ describe("execute()", () => {
     expect(issuePatchCalls.some((c) => (c.body as any)?.status === "done")).toBe(true);
   });
 
+  it("treats update_issue with a status as the disposition (models confuse it with update_issue_status)", async () => {
+    // Real incident: gpt-oss-120b sent update_issue({status:"done", comment})
+    // eight times while its own reasoning said "use update_issue_status";
+    // the repeat-loop guard then marked the finished issue blocked.
+    fetchMock = setupFetchMock([
+      toolCallResponse([{ id: "call-1", name: "update_issue", args: { status: "done", comment: "Verified." } }]),
+      assistantResponse("Done."),
+    ]);
+
+    const result = await execute(makeContext());
+
+    expect(result.exitCode).toBe(0);
+    const chatCalls = fetchMock.calls.filter((c) => c.path.endsWith("/chat/completions"));
+    expect(chatCalls.length).toBe(2); // no disposition nudge
+    const issuePatchCalls = fetchMock.calls.filter(
+      (c) => c.method === "PATCH" && c.path === "/api/issues/issue-1",
+    );
+    expect(issuePatchCalls.some((c) => (c.body as any)?.status === "done")).toBe(true);
+    expect(issuePatchCalls.some((c) => (c.body as any)?.status === "blocked")).toBe(false);
+  });
+
   it("nudges the model for a disposition when it stops without calling update_issue_status, and accepts one if given", async () => {
     // Real incident: a model's final comment confidently claimed "closed
     // done, verified in the API response" — but had never actually called

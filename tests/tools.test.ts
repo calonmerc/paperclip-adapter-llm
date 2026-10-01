@@ -146,7 +146,53 @@ describe("tools.ts", () => {
 
     const result = await findTool(tools, "update_issue")!.execute({});
     expect(result.isError).toBe(true);
-    expect(result.content).toContain("No fields supplied");
+    expect(result.content).toContain("No updatable fields supplied");
+  });
+
+  it("update_issue names ignored keys and points at the right tools", async () => {
+    const api = makeApi(async () => jsonResponse({}));
+    const tools = buildTools({ api, agentId: "agent-1", companyId: "company-1", currentIssueId: "issue-1", autoApprove: false });
+
+    const result = await findTool(tools, "update_issue")!.execute({ foo: 1, comment: "hi" });
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain("ignored: foo, comment");
+    expect(result.content).toContain("update_issue_status");
+    expect(result.content).toContain("add_comment");
+  });
+
+  it("update_issue accepts a status (models confuse it with update_issue_status) in one PATCH", async () => {
+    const calls: Array<{ body: any }> = [];
+    const api = makeApi(async (_input: any, init: any) => {
+      calls.push({ body: init?.body ? JSON.parse(init.body) : undefined });
+      return jsonResponse({ id: "issue-1" });
+    });
+    const tools = buildTools({ api, agentId: "agent-1", companyId: "company-1", currentIssueId: "issue-1", autoApprove: false });
+
+    const result = await findTool(tools, "update_issue")!.execute({ status: "done", comment: "Verified.", priority: "low" });
+
+    expect(result.isError).toBe(false);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.body).toMatchObject({ status: "done", comment: "Verified.", priority: "low" });
+  });
+
+  it("update_issue applies update_issue_status validation to a supplied status", async () => {
+    const calls: unknown[] = [];
+    const api = makeApi(async () => {
+      calls.push(1);
+      return jsonResponse({});
+    });
+    const tools = buildTools({ api, agentId: "agent-1", companyId: "company-1", currentIssueId: "issue-1", autoApprove: false });
+    const tool = findTool(tools, "update_issue")!;
+
+    const inProgress = await tool.execute({ status: "in_progress" });
+    expect(inProgress.isError).toBe(true);
+    expect(inProgress.content).toContain("not a valid way to end a run");
+
+    const bareBlocked = await tool.execute({ status: "blocked" });
+    expect(bareBlocked.isError).toBe(true);
+    expect(bareBlocked.content).toContain("needs a real blocker path");
+
+    expect(calls).toHaveLength(0);
   });
 
   it("update_issue fails gracefully with no current issue and no issue_id", async () => {
