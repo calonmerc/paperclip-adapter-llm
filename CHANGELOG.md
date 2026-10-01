@@ -86,6 +86,27 @@
   now returns `key`/`title`/`format`/`latestRevisionNumber`/`updatedAt`/a
   200-character `preview` per document; `action='read'` is unchanged and
   still returns the full body.
+- **`DEFAULT_SYSTEM_PROMPT` no longer contradicts the disposition-recovery
+  note.** The always-on system prompt carried its own stale one-liner —
+  "only record the disposition — do not redo the task" — left over from
+  before `renderDispositionHandoffNote` was rewritten to allow reads. On
+  every recovery wake the model was handed two different rules for the same
+  situation in the same context. The system prompt now defers entirely to
+  whatever the recovery note itself says.
+- **Added `action='append'` to `library` and `issue_document`, and trimmed
+  `list_issues` the same way `library`'s `list` was trimmed.** The run that
+  got furthest into actually finishing the `DEBA-54` review — it read the
+  draft and brief, performed the real 7-point compliance check — still ran
+  out of its turn's token budget (133k input tokens) before ever emitting
+  the write, mid-way through retyping the entire multi-KB draft verbatim
+  just to add one review-log paragraph (`action='write'` requires the full
+  body; Paperclip has no diff/patch endpoint). `append` sends only the new
+  text and does the read-modify-write here. Separately, that same run burned
+  tens of thousands of tokens on `list_issues(limit=50)` just to check
+  whether a follow-up task already existed; `list_issues` now returns
+  `id`/`identifier`/`title`/`status`/`priority`/`assigneeAgentId`/
+  `parentId`/`updatedAt` instead of Paperclip's full issue objects
+  (`get_issue` already covers one issue's full detail).
 
 ## [0.13.0] - 2026-09-30
 

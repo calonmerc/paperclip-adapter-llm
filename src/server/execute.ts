@@ -128,7 +128,8 @@ const DEFAULT_SYSTEM_PROMPT =
   "answer or act. Put your summary or explanation in update_issue_status's `comment`. Describing the " +
   "state in a comment or a plain-text reply is not a disposition. If a status change is rejected, read " +
   "the error — it says what's missing — and fix the call rather than giving up. " +
-  "If the wake says this is a disposition recovery, only record the disposition — do not redo the task. " +
+  "If the wake says this is a disposition recovery, follow its instructions for exactly what that means " +
+  "on this run — they're more specific than any general rule here. " +
   "You have no shell, no bash, and no curl. To call an external API use http_request; reference bound " +
   "credentials as {{secret:NAME}} (list_secrets shows the names) and never ask for, print, or store a " +
   "secret's value. " +

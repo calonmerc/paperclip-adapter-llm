@@ -305,6 +305,51 @@ describe("tools.ts", () => {
     expect(paths.at(-1)).toContain("limit=20");
   });
 
+  it("list_issues trims each issue down to a fixed set of fields", async () => {
+    // Real incident: a model called list_issues(limit=50) just to check
+    // whether a follow-up task already existed, and got back every field
+    // (full description text, blockerAttention/reviewAttention/
+    // successfulRunHandoff/relatedWork) of 50 issues — tens of thousands of
+    // tokens for what should have been a cheap scan. get_issue already
+    // covers "I need this one issue's full detail."
+    const api = makeApi(async () =>
+      jsonResponse([
+        {
+          id: "issue-9",
+          identifier: "DEBA-9",
+          title: "Some task",
+          status: "in_progress",
+          priority: "medium",
+          assigneeAgentId: "agent-2",
+          parentId: "issue-parent",
+          updatedAt: "2026-10-01T00:00:00.000Z",
+          description: "x".repeat(10000),
+          blockerAttention: { state: "none" },
+          reviewAttention: { state: "none" },
+          successfulRunHandoff: null,
+          relatedWork: { outbound: [], inbound: [] },
+          labels: [],
+          watchdog: null,
+        },
+      ]),
+    );
+    const tools = buildTools({ api, agentId: "agent-1", companyId: "company-1", currentIssueId: null, autoApprove: false });
+
+    const result = await findTool(tools, "list_issues")!.execute({});
+    expect(result.isError).toBe(false);
+    const [issue] = JSON.parse(result.content);
+    expect(issue).toEqual({
+      id: "issue-9",
+      identifier: "DEBA-9",
+      title: "Some task",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: "agent-2",
+      parentId: "issue-parent",
+      updatedAt: "2026-10-01T00:00:00.000Z",
+    });
+  });
+
   it("list_agents trims each agent down to a fixed set of fields", async () => {
     const api = makeApi(async () =>
       jsonResponse([
@@ -612,6 +657,37 @@ describe("library", () => {
     // action='read' still returns the full body — only 'list' is trimmed.
     const read = await tool.execute({ action: "read", key: "big-draft" });
     expect(read.content).toContain(longBody);
+  });
+
+  it("action='append' adds to an existing document without the caller resending its full body", async () => {
+    // Real incident: a model correctly finished a real compliance review,
+    // then had to retype the entire multi-KB draft verbatim (write requires
+    // the full body — Paperclip has no diff/patch endpoint) just to add one
+    // review-log paragraph, and ran out of its turn's token budget before
+    // ever finishing the call. append lets the caller send only the new text.
+    const server = fakeLibraryServer();
+    const tool = libraryTool(server.api);
+    await tool.execute({ action: "write", key: "draft", title: "Draft", body: "# Draft\n\nOriginal content." });
+
+    const addition = "## Review log\n\n- Toby Flenderson: APPROVED.";
+    const append = await tool.execute({ action: "append", key: "draft", body: addition });
+    expect(append.isError).toBe(false);
+
+    const stored = server.docs.get("lib-1")!.get("draft")!;
+    expect(stored.body).toContain("Original content.");
+    expect(stored.body).toContain("Toby Flenderson: APPROVED");
+    // The PUT this tool made carried only the new text plus what already
+    // existed server-side — never something larger than caller-sent + original.
+    expect(stored.body.length).toBeLessThan("# Draft\n\nOriginal content.".length + addition.length + 10);
+  });
+
+  it("action='append' on a key with no document fails with a pointer to action='write'", async () => {
+    const server = fakeLibraryServer();
+    const tool = libraryTool(server.api);
+
+    const result = await tool.execute({ action: "append", key: "missing", body: "some text" });
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain("use action='write' to create it first");
   });
 
   it("reuses the oldest existing Library issue instead of creating another", async () => {

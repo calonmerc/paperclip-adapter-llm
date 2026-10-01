@@ -472,13 +472,39 @@ function createSubIssueTool(ctx: BuildToolsContext): Tool {
   };
 }
 
+/**
+ * Paperclip's issue objects carry heavy bookkeeping (full description text,
+ * blockerAttention/reviewAttention/successfulRunHandoff/relatedWork, a
+ * couple dozen null fields) — fine for one issue via get_issue, but a real
+ * incident had the model call list_issues(limit=50) just to check "does a
+ * follow-up task already exist" and get back every field of 50 issues,
+ * contributing tens of thousands of tokens on top of the same run's bloated
+ * library(list) call. list_issues is for scanning/filtering; get_issue
+ * already exists for full detail on one issue.
+ */
+function summarizeIssueList(issues: Record<string, unknown>[]): Record<string, unknown>[] {
+  return issues.map((i) => ({
+    id: i.id ?? null,
+    identifier: i.identifier ?? null,
+    title: i.title ?? null,
+    status: i.status ?? null,
+    priority: i.priority ?? null,
+    assigneeAgentId: i.assigneeAgentId ?? null,
+    parentId: i.parentId ?? null,
+    updatedAt: i.updatedAt ?? null,
+  }));
+}
+
 function listIssuesTool(ctx: BuildToolsContext): Tool {
   return {
     schema: {
       type: "function",
       function: {
         name: "list_issues",
-        description: "List issues in the current company, optionally filtered by status or assignee.",
+        description:
+          "List issues in the current company, optionally filtered by status or assignee — a lightweight " +
+          "scan (id/identifier/title/status/priority/assignee/parent/updatedAt only). Use get_issue for " +
+          "an issue's full detail (description, comments, attachments).",
         parameters: {
           type: "object",
           properties: {
@@ -494,7 +520,10 @@ function listIssuesTool(ctx: BuildToolsContext): Tool {
       if (typeof args.status === "string") query.status = args.status;
       if (typeof args.assignee_agent_id === "string") query.assigneeAgentId = args.assignee_agent_id;
       query.limit = String(typeof args.limit === "number" ? args.limit : 20);
-      return safeCall("list_issues", () => ctx.api.listCompanyIssues(ctx.companyId, query));
+      return safeCall("list_issues", async () => {
+        const issues = await ctx.api.listCompanyIssues(ctx.companyId, query);
+        return Array.isArray(issues) ? summarizeIssueList(issues) : issues;
+      });
     },
   };
 }
@@ -790,15 +819,22 @@ function listInteractionsTool(ctx: BuildToolsContext): Tool {
 }
 
 const DOCUMENT_ACTION_PROPERTIES = {
-  action: { type: "string", enum: ["read", "write", "list"] },
+  action: { type: "string", enum: ["read", "write", "append", "list"] },
   key: {
     type: "string",
     description:
       "Short id for the document, e.g. 'content-log' or 'weekly-report'. Lowercase letters, " +
-      "numbers, - and _ only — anything else is auto-slugified. Required for read/write.",
+      "numbers, - and _ only — anything else is auto-slugified. Required for read/write/append.",
   },
-  title: { type: "string", description: "Display title. Optional for write." },
-  body: { type: "string", description: "Full markdown content. Required for write — replace, don't diff." },
+  title: { type: "string", description: "Display title. Optional for write/append." },
+  body: {
+    type: "string",
+    description:
+      "For write: the full markdown content — replace, don't diff; required, and must include " +
+      "everything you want kept, not just what changed. For append: just the new text to add " +
+      "(e.g. one review-log entry) — the existing document is kept and this is added after it, " +
+      "with no need to resend content you aren't changing.",
+  },
   change_summary: { type: "string", description: "One-line note on what changed this revision. Optional." },
 };
 
@@ -866,30 +902,85 @@ async function runDocumentAction(
         const currentDoc = await ctx.api.getIssueDocument(issueId, key).catch(() => null);
         const baseRevisionId =
           typeof currentDoc?.latestRevisionId === "string" ? currentDoc.latestRevisionId : undefined;
-        try {
-          return await ctx.api.upsertIssueDocument(issueId, key, { title, format: "markdown", body, changeSummary, baseRevisionId });
-        } catch (err) {
-          // One retry: if baseRevisionId went stale because of a
-          // concurrent write between our read and this write, re-fetch
-          // and try exactly once more before giving up.
-          if (err instanceof PaperclipApiError && err.status === 409) {
-            const retryDoc = await ctx.api.getIssueDocument(issueId, key).catch(() => null);
-            const retryRevisionId =
-              typeof retryDoc?.latestRevisionId === "string" ? retryDoc.latestRevisionId : undefined;
-            return await ctx.api.upsertIssueDocument(issueId, key, {
-              title,
-              format: "markdown",
-              body,
-              changeSummary,
-              baseRevisionId: retryRevisionId,
-            });
-          }
-          throw err;
+        return upsertDocumentWithRetry(ctx, issueId, key, { title, body, changeSummary, baseRevisionId });
+      });
+    }
+    case "append": {
+      // The most common write by far is "add one more entry to an
+      // existing document" (a review-log line, a sign-off, a log row) —
+      // but action='write' requires resending the ENTIRE document, since
+      // Paperclip has no diff/patch endpoint. A real incident: a model
+      // got all the way through a real compliance review, started
+      // reproducing the multi-KB draft verbatim to add one paragraph to
+      // its review log, and ran out of its turn's token budget before
+      // ever finishing the write — the review was correct, it just never
+      // got recorded. `append` does the read-modify-write here instead
+      // of asking the model to retype content it isn't changing.
+      const rawKey = asString(args.key);
+      if (!rawKey) return fail("key is required for action='append'.");
+      if (typeof args.body !== "string" || !args.body) {
+        return fail("body is required for action='append' — the new text to add, not the whole document.");
+      }
+      const key = slugifyDocumentKey(rawKey);
+      const addition = args.body as string;
+      const changeSummary =
+        typeof args.change_summary === "string" && args.change_summary.trim() ? args.change_summary.trim() : null;
+
+      return safeCall(`${label}(append)`, async () => {
+        const currentDoc = await ctx.api.getIssueDocument(issueId, key).catch(() => null);
+        if (!currentDoc || typeof currentDoc.body !== "string") {
+          throw new Error(`No document at key '${key}' to append to — use action='write' to create it first.`);
         }
+        const title =
+          typeof args.title === "string" && args.title.trim()
+            ? args.title.trim()
+            : typeof currentDoc.title === "string"
+              ? currentDoc.title
+              : null;
+        const body = `${currentDoc.body.replace(/\s+$/, "")}\n\n${addition}`;
+        const baseRevisionId =
+          typeof currentDoc.latestRevisionId === "string" ? currentDoc.latestRevisionId : undefined;
+        return upsertDocumentWithRetry(ctx, issueId, key, { title, body, changeSummary, baseRevisionId });
       });
     }
     default:
-      return fail("action must be one of: read, write, list.");
+      return fail("action must be one of: read, write, append, list.");
+  }
+}
+
+/**
+ * Shared by write and append: Paperclip 409s if baseRevisionId doesn't
+ * exactly match the document's current latestRevisionId. One retry covers
+ * a concurrent write landing between our read and this write.
+ */
+async function upsertDocumentWithRetry(
+  ctx: BuildToolsContext,
+  issueId: string,
+  key: string,
+  opts: { title: string | null; body: string; changeSummary: string | null; baseRevisionId: string | undefined },
+): Promise<Record<string, unknown>> {
+  try {
+    return await ctx.api.upsertIssueDocument(issueId, key, {
+      title: opts.title,
+      format: "markdown",
+      body: opts.body,
+      changeSummary: opts.changeSummary,
+      baseRevisionId: opts.baseRevisionId,
+    });
+  } catch (err) {
+    if (err instanceof PaperclipApiError && err.status === 409) {
+      const retryDoc = await ctx.api.getIssueDocument(issueId, key).catch(() => null);
+      const retryRevisionId =
+        typeof retryDoc?.latestRevisionId === "string" ? retryDoc.latestRevisionId : undefined;
+      return await ctx.api.upsertIssueDocument(issueId, key, {
+        title: opts.title,
+        format: "markdown",
+        body: opts.body,
+        changeSummary: opts.changeSummary,
+        baseRevisionId: retryRevisionId,
+      });
+    }
+    throw err;
   }
 }
 
@@ -900,11 +991,13 @@ function issueDocumentTool(ctx: BuildToolsContext): Tool {
       function: {
         name: "issue_document",
         description:
-          "Read, write, or list durable markdown documents attached to an issue — visible in the " +
-          "Documents panel in the Paperclip web UI and the company Artifacts view, with full revision " +
+          "Read, write, append to, or list durable markdown documents attached to an issue — visible in " +
+          "the Documents panel in the Paperclip web UI and the company Artifacts view, with full revision " +
           "history. Use this for a task's own deliverables (reports, plans, specs, write-ups). For " +
           "shared material other agents and future runs rely on, use `library`. Writing to an existing " +
-          "key adds a new revision; it does not delete history.",
+          "key adds a new revision; it does not delete history. To add one entry to an existing document " +
+          "instead of changing it, use action='append' with just the new text — much cheaper than " +
+          "action='write', which requires resending the whole document every time.",
         parameters: {
           type: "object",
           properties: {
@@ -944,13 +1037,17 @@ function libraryTool(ctx: BuildToolsContext): Tool {
       function: {
         name: "library",
         description:
-          `Read, write, or list the company's shared documents — the '${LIBRARY_ISSUE_TITLE}' issue that every ` +
-          "agent shares and humans can see in the web UI. This is the ONLY place for durable shared " +
-          "material: running logs (e.g. key 'content-log'), brief backlogs, drafts, reference notes, and " +
-          "anything a skill or your instructions call 'org storage', 'shared memory', or a file path like " +
-          "briefs/... — map a path to a key, e.g. 'briefs/2026-09-30-topic.md' → 'briefs-2026-09-30-topic'. " +
-          "Always action='list' first to see existing keys; update an existing key instead of creating a " +
-          "near-duplicate. There is no private or hidden storage.",
+          `Read, write, append to, or list the company's shared documents — the '${LIBRARY_ISSUE_TITLE}' issue ` +
+          "that every agent shares and humans can see in the web UI. This is the ONLY place for durable " +
+          "shared material: running logs (e.g. key 'content-log'), brief backlogs, drafts, reference " +
+          "notes, and anything a skill or your instructions call 'org storage', 'shared memory', or a " +
+          "file path like briefs/... — map a path to a key, e.g. 'briefs/2026-09-30-topic.md' → " +
+          "'briefs-2026-09-30-topic'. Always action='list' first to see existing keys; update an existing " +
+          "key instead of creating a near-duplicate. To add one more entry to an existing document — a " +
+          "review-log line, a sign-off, a status update — use action='append' and send only the new text; " +
+          "it's far cheaper than action='write', which requires resending the entire document every time. " +
+          "Reserve 'write' for creating a new document or changing content earlier in an existing one. " +
+          "There is no private or hidden storage.",
         parameters: {
           type: "object",
           properties: DOCUMENT_ACTION_PROPERTIES,
