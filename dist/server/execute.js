@@ -170,6 +170,16 @@ export function isDispositionRecoveryWake(context) {
         context.wakeReason === "finish_successful_run_handoff" ||
         context.handoffReason === "successful_run_missing_state");
 }
+/**
+ * This used to list 5 "valid" options for the model to weigh against each
+ * other (done / in_review / blocked / ask_user_questions / create a
+ * sub-issue). Two real recovery runs (DEBA-53, DEBA-54) got stuck comparing
+ * them — tens of thousands of reasoning tokens spent on "which path is more
+ * correct" with no tool call to show for it. An ordered checklist with a
+ * named safe default removes the comparison itself instead of just capping
+ * how long the model gets to make it (see the two-nudge fallback below,
+ * which still exists for when a model ignores even this).
+ */
 export function renderDispositionHandoffNote(context) {
     if (!isDispositionRecoveryWake(context))
         return "";
@@ -179,13 +189,16 @@ export function renderDispositionHandoffNote(context) {
         "Your previous run on this issue ended without a valid disposition. This run exists only to record one.",
         "",
         ...(instruction ? [instruction, ""] : []),
-        "## How to record each option with your tools",
-        "- Finished → update_issue_status status='done' (or 'cancelled'), with a short `comment`.",
-        "- Someone else must review → update_issue_status status='in_review' with reviewer_user_id, or ask_user_questions.",
-        "- Can't continue → update_issue_status status='blocked' with blocked_by_issue_ids and/or unblock_action.",
-        "- A human must answer or act → ask_user_questions.",
-        "- More work remains → create_sub_issue for it, then update_issue_status status='blocked' with blocked_by_issue_ids set to that sub-issue.",
-        "Do not call external APIs or repeat the task in this run.",
+        "## Decide using this order — stop at the first step that applies, do not weigh it against the others",
+        "1. A comment or document already shows this task's own deliverable is finished (a verdict, sign-off, " +
+            "completed artifact) → update_issue_status status='done' (or 'cancelled' if the work should not " +
+            "continue), with a short `comment`.",
+        "2. A human must answer or act before you can continue → ask_user_questions.",
+        "3. Someone else must review the result → update_issue_status status='in_review' with reviewer_user_id.",
+        "4. Otherwise — including \"I can't tell if step 1 is true\" — update_issue_status status='blocked' with " +
+            "unblock_action naming yourself as owner and a concrete next step. This is always valid and is the " +
+            "safe default: use it instead of continuing to weigh alternatives.",
+        "Do not create a sub-issue in this run, call external APIs, or repeat the task.",
     ].join("\n");
 }
 const SHELL_LIKE_TOOL_NAMES = new Set([

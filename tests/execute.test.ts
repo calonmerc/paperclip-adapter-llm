@@ -782,6 +782,27 @@ describe("execute()", () => {
     expect(userMsg.content).toContain("unblock_action");
   });
 
+  it("gives the recovery note a stop-at-first-match checklist with blocked as the safe default, not a list of options to weigh", async () => {
+    // Real incidents (DEBA-53, DEBA-54): a model given 5 "valid" options
+    // (done/in_review/blocked/ask_user_questions/create_sub_issue) burned
+    // tens of thousands of reasoning tokens comparing them instead of
+    // calling a tool. The note must read as an ordered checklist with a
+    // named default, and must not offer create_sub_issue as a path.
+    fetchMock = setupFetchMock([assistantResponse("ok")]);
+
+    await execute(
+      makeContext({
+        context: { issueId: "issue-1", handoffRequired: true },
+      }),
+    );
+
+    const firstChat = fetchMock.calls.find((c) => c.path.endsWith("/chat/completions"))!;
+    const userMsg = ((firstChat.body as any).messages as Array<{ role: string; content: string }>).find((m) => m.role === "user")!;
+    expect(userMsg.content).toContain("stop at the first step that applies");
+    expect(userMsg.content).toContain("safe default");
+    expect(userMsg.content).not.toContain("create_sub_issue");
+  });
+
   it("keeps the repeat-loop failure as the primary error when the blocked write also fails", async () => {
     const repeatedCall = toolCallResponse([{ id: "call-x", name: "list_agents", args: {} }]);
     fetchMock = setupFetchMock([repeatedCall, repeatedCall, repeatedCall]);

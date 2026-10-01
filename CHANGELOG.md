@@ -37,6 +37,18 @@
   `update_issue_status` with `blocked`/`unblock_action` naming itself as
   owner — the option that's always valid regardless of which path is "more
   correct."
+- **The disposition-recovery note is now an ordered checklist, not a menu
+  of options to weigh.** The nudge above is a safety net for when a model
+  already failed to decide; this targets the deliberation itself. A sibling
+  run on the same incident (`DEBA-54`, a different reviewer agent on the
+  same draft) burned ~10.3k reasoning tokens across three turns comparing
+  `done`/`in_review`/`blocked`/`ask_user_questions`/create-a-sub-issue
+  against each other before finally complying with the second nudge.
+  `renderDispositionHandoffNote` now presents those as a "stop at the first
+  step that applies" sequence, names `blocked` with a self-owned
+  `unblock_action` as the explicit safe default for unclear evidence, and
+  drops `create_sub_issue` from the offered paths entirely — it was the
+  biggest fork in the observed deliberation.
 
 ## [0.13.0] - 2026-09-30
 

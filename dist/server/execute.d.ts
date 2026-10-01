@@ -41,6 +41,16 @@ import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclip
  * the board with "Missing disposition recovery blocked".
  */
 export declare function isDispositionRecoveryWake(context: Record<string, unknown>): boolean;
+/**
+ * This used to list 5 "valid" options for the model to weigh against each
+ * other (done / in_review / blocked / ask_user_questions / create a
+ * sub-issue). Two real recovery runs (DEBA-53, DEBA-54) got stuck comparing
+ * them — tens of thousands of reasoning tokens spent on "which path is more
+ * correct" with no tool call to show for it. An ordered checklist with a
+ * named safe default removes the comparison itself instead of just capping
+ * how long the model gets to make it (see the two-nudge fallback below,
+ * which still exists for when a model ignores even this).
+ */
 export declare function renderDispositionHandoffNote(context: Record<string, unknown>): string;
 export declare function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult>;
 //# sourceMappingURL=execute.d.ts.map
