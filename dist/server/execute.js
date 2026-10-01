@@ -702,7 +702,9 @@ export async function execute(ctx) {
                 if (!isError && targetsCurrentIssue({ currentIssueId, currentIssueIdentifier }, args.issue_id)) {
                     // update_issue_status refuses non-disposition statuses on the
                     // current issue, so any success here is a real disposition.
-                    if (toolName === "update_issue_status") {
+                    // update_issue accepts a status too (models mix the two up).
+                    if (toolName === "update_issue_status" ||
+                        (toolName === "update_issue" && typeof args.status === "string" && args.status)) {
                         dispositionRecorded = true;
                         if (typeof args.comment === "string" && args.comment.trim())
                             commentedOnCurrentIssue = true;

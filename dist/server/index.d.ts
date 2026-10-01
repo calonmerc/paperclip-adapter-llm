@@ -6,7 +6,7 @@
  *   - execute             — the agent run loop (tool-calling)
  *   - testEnvironment     — env diagnostics + model fetch
  *   - sessionCodec        — persist/restore lastGenerationId across heartbeats
- *   - detectModel         — read OPENROUTER_MODEL env if present
+ *   - detectModel         — read LLM_MODEL / OPENROUTER_MODEL env if present
  *   - listSkills          — company-managed skills (config.paperclipRuntimeSkills)
  *                            plus whatever the operator drops in manually
  *   - syncSkills          — symlinks desired company-managed skills into the
@@ -29,7 +29,8 @@ export { execute, testEnvironment, listModels, listOpenRouterModels, getConfigSc
  */
 export declare const sessionCodec: AdapterSessionCodec;
 /**
- * Best-effort detection: read OPENROUTER_MODEL or fall back to "openrouter/auto".
+ * Best-effort detection: read LLM_MODEL / OPENROUTER_MODEL, else null (no
+ * guessed default — it showed up as a misleading "detected" entry).
  * Other adapters read from on-disk CLI configs; OpenRouter has none, so env
  * is the only meaningful source.
  */

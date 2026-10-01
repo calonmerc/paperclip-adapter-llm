@@ -157,15 +157,15 @@ export async function testEnvironment(ctx) {
     }
 }
 /**
- * Fetch all models from the configured endpoint — used by listModels()
- * for dynamic model picker.
+ * Fetch all models from the provider's /models endpoint — used by the
+ * dynamic model picker. Paperclip calls this with no arguments (no agent
+ * config), so the provider comes from LLM_BASE_URL in the server env.
+ * The key is optional: /models is public on OpenRouter and NIM.
  */
-export async function listModels(baseUrl) {
+export async function listModels(baseUrl = process.env.LLM_BASE_URL || undefined) {
     const endpoints = resolveEndpoints(baseUrl);
     const onOpenRouter = isOpenRouter(baseUrl);
     const apiKey = process.env.LLM_API_KEY || process.env.OPENROUTER_API_KEY;
-    if (!apiKey && onOpenRouter)
-        return [];
     try {
         const headers = {};
         if (apiKey)
@@ -177,15 +177,21 @@ export async function listModels(baseUrl) {
         if (!res.ok)
             return [];
         const data = (await res.json());
+        const isFree = (m) => m.id?.endsWith?.(":free") || (m.pricing?.prompt === "0" && m.pricing?.completion === "0");
         return (data.data || [])
+            .filter((m) => typeof m.id === "string" && m.id.length > 0)
             .sort((a, b) => {
-            const aFree = a.id?.endsWith?.(":free") || (a.pricing?.prompt === "0" && a.pricing?.completion === "0");
-            const bFree = b.id?.endsWith?.(":free") || (b.pricing?.prompt === "0" && b.pricing?.completion === "0");
-            if (aFree && !bFree)
-                return -1;
-            if (!aFree && bFree)
-                return 1;
-            return (a.name || a.id).localeCompare(b.name || b.id);
+            if (onOpenRouter) {
+                // Free models first on OpenRouter; other providers don't report pricing.
+                const aFree = isFree(a);
+                const bFree = isFree(b);
+                if (aFree && !bFree)
+                    return -1;
+                if (!aFree && bFree)
+                    return 1;
+                return (a.name || a.id).localeCompare(b.name || b.id);
+            }
+            return a.id.localeCompare(b.id);
         })
             .map((m) => ({
             id: m.id,
