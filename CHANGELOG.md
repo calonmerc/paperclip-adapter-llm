@@ -15,6 +15,14 @@
   set.** It used to report `openrouter/auto` as "detected" for everyone.
 
 ### Fixed
+- **Hiring an `llm` agent is no longer blocked by a missing API key.**
+  Paperclip's new "Configure your agent" wizard shows no adapter config
+  fields (only a built-in list of adapters gets a key input), and it
+  disables "Finish setup" when the environment test fails. The test failed
+  whenever no key was set, so hiring was impossible without `LLM_API_KEY`
+  on the server. A missing key, or a `/models` 401/403 with no key, is now
+  a warning; add the key under the agent's Configuration after hiring. A
+  key that's set but rejected still fails.
 - **`update_issue` with a `status` no longer ends in a repeat loop.** Models
   confuse it with `update_issue_status`: gpt-oss-120b sent
   `update_issue({status: "done", comment})` over and over, got back "No

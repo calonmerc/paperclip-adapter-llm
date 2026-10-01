@@ -148,6 +148,10 @@ Get a key at https://platform.deepseek.com.
 
 ## Environment variables
 
+Paperclip's hire wizard has no field for this adapter's API key. Finish the wizard
+(the test warns about the missing key), then set **API key** in the new agent's
+Configuration, or set `LLM_API_KEY` on the server before hiring.
+
 | Variable | Purpose |
 | --- | --- |
 | `LLM_API_KEY` | Primary auth env var, used as a fallback when `adapterConfig.apiKey` is unset. |

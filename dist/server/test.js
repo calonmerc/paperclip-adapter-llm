@@ -22,21 +22,17 @@ export async function testEnvironment(ctx) {
             });
         }
         else {
+            // Paperclip's hire wizard has no field for adapter config keys and blocks
+            // Finish on a failed test, so a missing key must only warn.
             checks.push({
                 code: "llm_api_key_missing",
-                level: "error",
-                message: "No LLM API key found",
-                detail: "Set adapterConfig.apiKey or LLM_API_KEY (or OPENROUTER_API_KEY) environment variable.",
+                level: "warn",
+                message: "No API key yet — add it under the agent's Configuration (API key) after hiring",
+                detail: "Runs fail until adapterConfig.apiKey or LLM_API_KEY (or OPENROUTER_API_KEY) on the server is set.",
                 hint: onOpenRouter
                     ? "Get a key at https://openrouter.ai/keys"
                     : "Provide the API key for your configured baseUrl.",
             });
-            return {
-                adapterType: "llm",
-                status: "fail",
-                checks,
-                testedAt: new Date().toISOString(),
-            };
         }
     }
     else {
@@ -68,6 +64,19 @@ export async function testEnvironment(ctx) {
             headers,
             signal: AbortSignal.timeout(15000),
         });
+        if (!res.ok && !apiKey && (res.status === 401 || res.status === 403)) {
+            checks.push({
+                code: "llm_api_key_required",
+                level: "warn",
+                message: `${endpoints.base} requires an API key to list models — add one after hiring`,
+            });
+            return {
+                adapterType: "llm",
+                status: "warn",
+                checks,
+                testedAt: new Date().toISOString(),
+            };
+        }
         if (!res.ok) {
             const errText = await res.text();
             checks.push({
