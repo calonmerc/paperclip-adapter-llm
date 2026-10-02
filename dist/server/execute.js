@@ -12,8 +12,8 @@
  *     at end)
  *   - Post the final assistant output as an issue comment
  *   - Emit typed TranscriptEntry lines so the run viewer renders properly
- *   - Track usage and cost via OpenRouter's /generation endpoint (OpenRouter
- *     only — other providers don't have an equivalent, so cost stays null)
+ *   - Sum usage and cost across every call: OpenRouter's per-response
+ *     usage.cost, else model time × the configured hourlyRateUsd
  *
  * Aligned with @paperclipai/adapter-utils 2026.916.1 API surface:
  *   - PaperclipApi exposes updateIssue / addIssueComment (not updateIssueState / addComment)
@@ -34,7 +34,7 @@ import fs from "node:fs/promises";
 import { isPaperclipRuntimeEnvKey, joinPromptSections, renderPaperclipWakePrompt, selectPaperclipTaskMarkdown, } from "@paperclipai/adapter-utils/server-utils";
 import { DEFAULT_BASE_URL, resolveEndpoints, isOpenRouter, } from "../index.js";
 import { PaperclipApi } from "./paperclip-api.js";
-import { buildTools, toolSchemas, findTool, targetsCurrentIssue } from "./tools.js";
+import { buildTools, detectPaperclipFeatures, toolSchemas, findTool, targetsCurrentIssue, } from "./tools.js";
 import { collectBoundSecrets, SecretStore } from "./http-request.js";
 import { LibraryResolver, migrateMemoryToLibrary } from "./library.js";
 import { loadSkills, renderSkillsForPrompt, reconcilePaperclipSkills } from "./skills.js";
@@ -67,6 +67,10 @@ const DEFAULT_SYSTEM_PROMPT = "You are an AI agent working inside Paperclip, an 
     "You have no shell, no bash, and no curl. To call an external API use http_request; reference bound " +
     "credentials as {{secret:NAME}} (list_secrets shows the names) and never ask for, print, or store a " +
     "secret's value. " +
+    "Where a skill says to call the Paperclip agent API (PATCH /api/agents/..., instructions-bundle), use " +
+    "the tools instead: get_agent to inspect an agent, update_agent to change its title, role, manager " +
+    "(reports_to), adapter, model, or heartbeat, and agent_instructions to read or edit its prompt " +
+    "(AGENTS.md). Call list_agents first. " +
     "All storage is Paperclip documents that humans can see — there is no hidden, private, or file " +
     "storage, no filesystem, and no shell. A task's own deliverables (a report, plan, spec, write-up) go " +
     "on its issue via issue_document. Anything shared across tasks or agents — running logs, brief " +
@@ -91,9 +95,21 @@ function resolveApiKey(config, authToken) {
     }
     return key;
 }
-function resolveBillingType() {
-    // Every supported provider today is API-key based.
-    return "api";
+function resolveBillingType(costSource = "none") {
+    return costSource === "hourly_rate" ? "fixed" : "api";
+}
+/**
+ * Provider-reported cost wins. Self-hosted endpoints have no price, so they
+ * can be billed per hour of model time instead.
+ */
+export function resolveRunCost(opts) {
+    if (opts.sawReportedCost)
+        return { costUsd: opts.reportedCostUsd, source: "provider" };
+    const rate = Number(opts.hourlyRateUsd);
+    if (Number.isFinite(rate) && rate > 0) {
+        return { costUsd: (opts.modelMs / 3_600_000) * rate, source: "hourly_rate" };
+    }
+    return { costUsd: null, source: "none" };
 }
 function buildHeaders(apiKey, config) {
     return {
@@ -179,6 +195,29 @@ export function isDispositionRecoveryWake(context) {
  * evidence-gathering because every run starts from an empty context — a
  * "use what's already in hand" rule is never satisfied at turn 1.
  */
+/**
+ * The paperclip skill documents cases as HTTP endpoints this adapter can't
+ * call, so map them to the tools. Only for features that are enabled.
+ */
+export function renderPaperclipFeatureNote(features) {
+    if (!features)
+        return "";
+    const lines = [];
+    if (features.cases) {
+        lines.push("- Cases: anything your skills describe as the cases API (POST /api/companies/:companyId/cases, " +
+            "PUT /api/cases/.../documents/...) is the `case` tool. Don't use http_request for Paperclip's own API.");
+    }
+    if (features.statusCards) {
+        lines.push("- Status cards: use the `status_card` tool to list, create, update, or refresh status-board cards.");
+    }
+    if (features.statusCardTask) {
+        lines.push("- THIS ISSUE IS A STATUS-CARD TASK: you are the card's summarizer. Ignore the PUT endpoints in the task " +
+            "description and use publish_status_card instead: " +
+            (features.statusCardTask.operation === "compile" ? "save_query, then preview, then " : "optionally preview, then ") +
+            "save_summary, then update_issue_status status='done'.");
+    }
+    return lines.length ? `# Paperclip features\n${lines.join("\n")}` : "";
+}
 export function renderDispositionHandoffNote(context) {
     if (!isDispositionRecoveryWake(context))
         return "";
@@ -308,6 +347,8 @@ async function callChatCompletions(apiKey, config, endpoints, messages, tools, m
         body.transforms = transforms;
     if (config.route)
         body.route = config.route;
+    if (isOpenRouter(config.baseUrl))
+        body.usage = { include: true };
     const response = await fetch(endpoints.chat, {
         method: "POST",
         headers: buildHeaders(apiKey, config),
@@ -319,28 +360,6 @@ async function callChatCompletions(apiKey, config, endpoints, messages, tools, m
     }
     const json = (await response.json());
     return json;
-}
-async function fetchGenerationCost(generationId, apiKey, endpoints) {
-    const fallback = { costUsd: null, inputTokens: 0, outputTokens: 0 };
-    try {
-        // OpenRouter's /generation endpoint takes a moment to populate.
-        await new Promise((r) => setTimeout(r, 1500));
-        const res = await fetch(`${endpoints.generation}?id=${encodeURIComponent(generationId)}`, {
-            headers: { Authorization: `Bearer ${apiKey}` },
-        });
-        if (!res.ok)
-            return fallback;
-        const data = (await res.json());
-        const d = data.data ?? {};
-        return {
-            costUsd: typeof d.total_cost === "number" ? d.total_cost : null,
-            inputTokens: typeof d.tokens_prompt === "number" ? d.tokens_prompt : 0,
-            outputTokens: typeof d.tokens_completion === "number" ? d.tokens_completion : 0,
-        };
-    }
-    catch {
-        return fallback;
-    }
 }
 // ----- main -----
 export async function execute(ctx) {
@@ -378,6 +397,7 @@ export async function execute(ctx) {
     // Logged right after emitInit so the run viewer's header comes first.
     const startupNotes = [];
     const startupErrors = [];
+    let features = null;
     if (authToken) {
         api = new PaperclipApi({ authToken });
         secretStore = new SecretStore(envSecrets, api);
@@ -405,7 +425,21 @@ export async function execute(ctx) {
             const reason = err instanceof Error ? err.message : String(err);
             startupErrors.push(`[llm] memory → Library migration failed (will retry next run): ${reason}`);
         }
+        features = await detectPaperclipFeatures(api, companyId, currentIssueId);
+        for (const error of features.errors) {
+            startupErrors.push(`[llm] could not check Paperclip features (their tools are off this run): ${error}`);
+        }
+        const featureTools = [
+            features.cases && "case",
+            features.statusCards && "status_card",
+            features.statusCardTask && "publish_status_card",
+        ].filter(Boolean);
+        if (featureTools.length > 0)
+            startupNotes.push(`Paperclip feature tools enabled: ${featureTools.join(", ")}`);
         tools = buildTools({
+            features,
+            statusCardTask: features.statusCardTask,
+            model,
             library,
             api,
             agentId: agent.id,
@@ -483,6 +517,10 @@ export async function execute(ctx) {
         const reason = err instanceof Error ? err.message : String(err);
         await writeRawStderr(onLog, `[llm] skill loading error (continuing): ${reason}`);
     }
+    // After the skills, which describe these features as raw HTTP endpoints.
+    const featureNote = tools.length > 0 ? renderPaperclipFeatureNote(features) : "";
+    if (featureNote)
+        systemContent = `${systemContent}\n\n${featureNote}`;
     messages.push({ role: "system", content: systemContent });
     // User prompt = Paperclip wake payload rendered as text. Some heartbeats
     // arrive without a structured wake payload (manual "Run Heartbeat" with no
@@ -604,6 +642,7 @@ export async function execute(ctx) {
             errorMessage: reason,
             errorCode: "missing_api_key",
             usage: { inputTokens: 0, outputTokens: 0 },
+            usageBasis: "per_run",
             model,
             provider,
             biller: provider,
@@ -612,14 +651,35 @@ export async function execute(ctx) {
     }
     let lastGenerationId;
     let totalUsage = { inputTokens: 0, outputTokens: 0 };
+    let reportedCostUsd = 0;
+    let sawReportedCost = false;
+    let modelMs = 0;
     const addUsage = (response) => {
         lastGenerationId = response.id || lastGenerationId;
-        if (!response.usage)
+        const usage = response.usage;
+        if (!usage)
             return;
+        const cached = (totalUsage.cachedInputTokens ?? 0) + (usage.prompt_tokens_details?.cached_tokens ?? 0);
         totalUsage = {
-            inputTokens: totalUsage.inputTokens + (response.usage.prompt_tokens ?? 0),
-            outputTokens: totalUsage.outputTokens + (response.usage.completion_tokens ?? 0),
+            inputTokens: totalUsage.inputTokens + (usage.prompt_tokens ?? 0),
+            outputTokens: totalUsage.outputTokens + (usage.completion_tokens ?? 0),
+            ...(cached > 0 ? { cachedInputTokens: cached } : {}),
         };
+        if (typeof usage.cost === "number") {
+            sawReportedCost = true;
+            reportedCostUsd += usage.cost;
+            if (usage.is_byok)
+                reportedCostUsd += usage.cost_details?.upstream_inference_cost ?? 0;
+        }
+    };
+    const timedChatCall = async (maxTokensOverride) => {
+        const started = performance.now();
+        try {
+            return await callChatCompletions(apiKey, config, endpoints, messages, tools, maxTokensOverride);
+        }
+        finally {
+            modelMs += performance.now() - started;
+        }
     };
     let finalAssistantText = "";
     let turn = 0;
@@ -670,14 +730,14 @@ export async function execute(ctx) {
             turn += 1;
             let response;
             try {
-                response = await callChatCompletions(apiKey, config, endpoints, messages, tools);
+                response = await timedChatCall();
                 addUsage(response);
                 // An operator-set cap that cuts the turn off gets one retry at double
                 // before we fall back to continuing from the partial output.
                 const capped = configuredMaxTokens(config);
                 if (capped && response.choices?.[0]?.finish_reason === "length") {
                     await emitSystem(onLog, `Response cut off at max_tokens (${capped}); retrying this turn with ${capped * 2}.`);
-                    response = await callChatCompletions(apiKey, config, endpoints, messages, tools, capped * 2);
+                    response = await timedChatCall(capped * 2);
                     addUsage(response);
                 }
             }
@@ -865,15 +925,12 @@ export async function execute(ctx) {
         stoppedReason = "error";
     }
     // ----- post-loop: cost, comment, status -----
-    let costUsd = null;
-    if (lastGenerationId && isOpenRouter(config.baseUrl)) {
-        const cost = await fetchGenerationCost(lastGenerationId, apiKey, endpoints);
-        costUsd = cost.costUsd;
-        // Prefer the generation endpoint's token counts when present (more accurate).
-        if (cost.inputTokens > 0 || cost.outputTokens > 0) {
-            totalUsage = { inputTokens: cost.inputTokens, outputTokens: cost.outputTokens };
-        }
-    }
+    const { costUsd, source: costSource } = resolveRunCost({
+        reportedCostUsd,
+        sawReportedCost,
+        modelMs,
+        hourlyRateUsd: config.hourlyRateUsd,
+    });
     // Post the final assistant text as a comment so other agents can see it.
     // Skip it when the model already commented on the issue itself: the text
     // would be a duplicate, and an extra comment also makes an otherwise idle
@@ -975,6 +1032,7 @@ export async function execute(ctx) {
         text: finalAssistantText,
         inputTokens: totalUsage.inputTokens,
         outputTokens: totalUsage.outputTokens,
+        cachedTokens: totalUsage.cachedInputTokens,
         costUsd: costUsd ?? 0,
         subtype: stoppedReason,
         isError: stoppedReason === "error",
@@ -988,10 +1046,11 @@ export async function execute(ctx) {
             errorMessage: [runError.message, ...secondaryErrors].join(" — also: "),
             errorCode: runError.code,
             usage: totalUsage,
+            usageBasis: "per_run",
             model,
             provider,
             biller: provider,
-            billingType: resolveBillingType(),
+            billingType: resolveBillingType(costSource),
             costUsd,
             sessionId: lastGenerationId ?? null,
             sessionDisplayId: lastGenerationId ?? null,
@@ -1003,10 +1062,11 @@ export async function execute(ctx) {
         signal: null,
         timedOut: false,
         usage: totalUsage,
+        usageBasis: "per_run",
         model,
         provider,
         biller: provider,
-        billingType: resolveBillingType(),
+        billingType: resolveBillingType(costSource),
         costUsd,
         sessionId: lastGenerationId ?? null,
         sessionDisplayId: lastGenerationId ?? null,

@@ -2,6 +2,70 @@
 
 ## [Unreleased]
 
+### Added — agent management
+- **`get_agent`, `update_agent`, `agent_instructions`** tools. Agents on this
+  adapter could list and hire agents but not change one, so a CEO couldn't
+  edit another agent's prompt, adapter/model, heartbeat, manager, or title —
+  things it does under Claude Code by curling `/api/agents/...`. Agents are
+  referenced by id, name, or title. Paperclip enforces permission
+  (`agents:configure`); a 403 tells the model to ask a human.
+
+### Fixed — `hire_agent`
+- `hire_agent` sent fields Paperclip no longer reads: `reportsToAgentId`,
+  `mission`, and a top-level `model` were dropped, and a job title in `role`
+  failed Paperclip's role enum. It now sends `title`, `role` (enum; free text
+  becomes the title), `reportsTo` (id or name), `capabilities` (`mission`
+  still accepted), and `adapterConfig.model`, defaults `adapterType` to
+  `llm`, and accepts `instructions` for the new agent's `AGENTS.md`.
+
+### Fixed — run cost and usage
+- OpenRouter runs reported the cost of the **last** call only: cost came
+  from one `/generation` lookup on the final generation id, after a 1.5s
+  sleep. That lookup also replaced the token totals summed across the run
+  with the last call's counts. Cost now comes from each response's
+  `usage.cost` (requested with `usage: { include: true }`) and is summed,
+  including the upstream cost under BYOK. The `/generation` call is gone.
+- `usage.cachedInputTokens` is now reported (from
+  `prompt_tokens_details.cached_tokens`, for any provider that sends it),
+  and results set `usageBasis: "per_run"`.
+
+- `create_sub_issue` accepted a human identifier for `parent_issue_id`
+  (e.g. `DEBA-59`) but sent it straight to Paperclip, which rejected it with
+  a bare "parentId: Invalid GUID". It now resolves identifiers to the issue
+  UUID, as `case`'s `link_issue` already did (shared `resolveIssueUuid`).
+- The run's final `result` entry now reports `cachedTokens` instead of
+  always 0.
+
+### Added
+- **`hourlyRateUsd`** config: self-hosted endpoints (llama-swap, Ollama,
+  vLLM) have no price, so cost is the time spent waiting on the model ×
+  this rate. Used only when the provider reports no cost; such runs report
+  `billingType: "fixed"`.
+
+### Added — Cases and Status Cards
+- **`case` tool** for Paperclip's experimental Cases: list, get, save
+  (upsert on `case_type` + `key`), update, read/write/append case
+  documents, and link issues. `update` merges `fields` into the existing
+  ones, because Paperclip replaces the whole object and models send
+  partial ones.
+- **`status_card` tool** to list, get, create, update, and refresh
+  status-board cards. A missing `interval_minutes`/`debounce_seconds` for
+  the chosen refresh mode gets a default instead of an error.
+- **`publish_status_card` tool** for runs on a card's hidden generation
+  issue: `save_query`, `preview`, and `save_summary`, with the card and
+  generation ids read from the issue description. Before this, a card
+  whose summarizer was an LLM-adapter agent could never be written.
+  Marking that issue `done` is refused until the summary is saved,
+  since Paperclip fails the card when its task closes without one.
+- **Feature probe.** Paperclip doesn't advertise experimental features,
+  so each run makes one read per feature and registers its tools only
+  when the read succeeds. The system prompt gets a note pointing the
+  `paperclip` skill's case endpoints at the `case` tool.
+
+### Changed
+- The document write/append/409-retry logic behind `issue_document` and
+  `library` now works on any document store, so case documents share it.
+
 ### Changed — model picker
 - **The Model dropdown now lists real models from the provider.** Paperclip
   calls `listModels()` with no agent config, so it reads the provider from

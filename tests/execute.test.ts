@@ -5,7 +5,6 @@
  * OpenAI-compatible chat/completions endpoint (no CLI subprocess). global
  * fetch is replaced with an in-memory recorder that serves:
  *   - POST .../chat/completions — a queue of canned ChatCompletionResponses
- *   - GET  .../generation       — 404 (OpenRouter cost lookup, best-effort)
  *   - /api/*                    — Paperclip API calls, recorded and asserted
  *
  * Goals:
@@ -28,7 +27,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { execute } from "../src/server/execute.js";
+import { execute, resolveRunCost } from "../src/server/execute.js";
 
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "llm-adapter-test-"));
 
@@ -40,9 +39,10 @@ interface ToolCallSpec {
   args: Record<string, unknown>;
 }
 
-function assistantResponse(text: string, opts: { id?: string } = {}) {
+function assistantResponse(text: string, opts: { id?: string; usage?: Record<string, unknown> } = {}) {
   return {
     id: opts.id ?? "gen-1",
+    ...(opts.usage ? { usage: opts.usage } : {}),
     choices: [
       {
         finish_reason: "stop",
@@ -80,9 +80,10 @@ function truncatedResponse(
   };
 }
 
-function toolCallResponse(calls: ToolCallSpec[], opts: { id?: string } = {}) {
+function toolCallResponse(calls: ToolCallSpec[], opts: { id?: string; usage?: Record<string, unknown> } = {}) {
   return {
     id: opts.id ?? "gen-1",
+    ...(opts.usage ? { usage: opts.usage } : {}),
     choices: [
       {
         finish_reason: "tool_calls",
@@ -110,7 +111,11 @@ interface CallLog {
 
 function setupFetchMock(
   chatResponses: unknown[] = [],
-  opts: { chatFailureStatus?: number } = {},
+  opts: {
+    chatFailureStatus?: number;
+    /** Per-route Paperclip API override; return undefined to fall through to the default 200. */
+    api?: (method: string, path: string, body: unknown) => Response | undefined;
+  } = {},
 ): { calls: CallLog[]; restore: () => void } {
   const calls: CallLog[] = [];
   const queue = [...chatResponses];
@@ -136,11 +141,9 @@ function setupFetchMock(
       });
     }
 
-    if (reqPath.endsWith("/generation")) {
-      return new Response("not found", { status: 404 });
-    }
-
     if (reqPath.startsWith("/api/")) {
+      const override = opts.api?.(method, reqPath, body);
+      if (override) return override;
       return new Response(JSON.stringify({ ok: true, id: "issue-1" }), {
         status: 200,
         headers: { "content-type": "application/json" },
@@ -662,7 +665,7 @@ describe("execute()", () => {
     expect(blocked).toBeDefined();
   });
 
-  it("does not throw when baseUrl points at a non-OpenRouter endpoint, and skips the /generation cost fetch", async () => {
+  it("does not throw when baseUrl points at a non-OpenRouter endpoint", async () => {
     fetchMock = setupFetchMock([assistantResponse("done")]);
 
     const result = await execute(
@@ -680,15 +683,67 @@ describe("execute()", () => {
     expect(fetchMock.calls.some((c) => c.path.endsWith("/generation"))).toBe(false);
   });
 
-  it("attempts the /generation cost lookup on OpenRouter and tolerates a 404", async () => {
-    fetchMock = setupFetchMock([assistantResponse("done", { id: "gen-123" })]);
+  it("sums OpenRouter's per-call cost and tokens across the whole run", async () => {
+    fetchMock = setupFetchMock([
+      toolCallResponse([{ id: "c1", name: "get_issue", args: {} }], {
+        id: "gen-1",
+        usage: { prompt_tokens: 1000, completion_tokens: 50, prompt_tokens_details: { cached_tokens: 600 }, cost: 0.001 },
+      }),
+      assistantResponse("done", {
+        id: "gen-2",
+        usage: { prompt_tokens: 1200, completion_tokens: 30, prompt_tokens_details: { cached_tokens: 900 }, cost: 0.002 },
+      }),
+    ]);
 
     const result = await execute(makeContext());
 
     expect(result.exitCode).toBe(0);
-    expect(fetchMock.calls.some((c) => c.path.endsWith("/generation"))).toBe(true);
+    expect(result.costUsd).toBeCloseTo(0.003, 10);
+    expect(result.usage).toEqual({ inputTokens: 2200, outputTokens: 80, cachedInputTokens: 1500 });
+    expect(result.usageBasis).toBe("per_run");
+    expect(result.billingType).toBe("api");
+    const chat = fetchMock.calls.find((c) => c.path.endsWith("/chat/completions"));
+    expect((chat?.body as any)?.usage).toEqual({ include: true });
+    expect(fetchMock.calls.some((c) => c.path.endsWith("/generation"))).toBe(false);
+  });
+
+  it("adds the upstream cost under OpenRouter BYOK", async () => {
+    fetchMock = setupFetchMock([
+      assistantResponse("done", {
+        usage: { prompt_tokens: 10, completion_tokens: 5, cost: 0.0001, is_byok: true, cost_details: { upstream_inference_cost: 0.002 } },
+      }),
+    ]);
+
+    const result = await execute(makeContext());
+
+    expect(result.costUsd).toBeCloseTo(0.0021, 10);
+  });
+
+  it("reports no cost for a self-hosted endpoint without hourlyRateUsd, and doesn't request usage accounting", async () => {
+    fetchMock = setupFetchMock([assistantResponse("done", { usage: { prompt_tokens: 10, completion_tokens: 5 } })]);
+
+    const result = await execute(
+      makeContext({ config: { model: "qwen3", baseUrl: "http://localhost:8080/v1", apiKey: "x" } as any }),
+    );
+
     expect(result.costUsd ?? null).toBeNull();
-  }, 10000);
+    expect(result.usage).toEqual({ inputTokens: 10, outputTokens: 5 });
+    const chat = fetchMock.calls.find((c) => c.path.endsWith("/chat/completions"));
+    expect((chat?.body as any)?.usage).toBeUndefined();
+  });
+
+  it("bills a self-hosted endpoint by model time × hourlyRateUsd", async () => {
+    fetchMock = setupFetchMock([assistantResponse("done")]);
+
+    const result = await execute(
+      makeContext({ config: { model: "qwen3", baseUrl: "http://localhost:8080/v1", apiKey: "x", hourlyRateUsd: 3600 } as any }),
+    );
+
+    // $3600/h is $1 per second of model time; the mocked call takes well under a second.
+    expect(result.costUsd).toBeGreaterThan(0);
+    expect(result.costUsd).toBeLessThan(1);
+    expect(result.billingType).toBe("fixed");
+  });
 
   it("falls back to a concise default prompt when the wake context is empty", async () => {
     fetchMock = setupFetchMock([assistantResponse("done")]);
@@ -1136,6 +1191,108 @@ describe("execute()", () => {
     expect(umamiHeader).toBe("umami-live-value");
     for (const call of fetchMock.calls.filter((c) => c.path.endsWith("/chat/completions"))) {
       expect(JSON.stringify(call.body)).not.toContain("umami-live-value");
+    }
+  });
+  it("leaves the case and status-card tools out when Paperclip has the features turned off", async () => {
+    fetchMock = setupFetchMock([assistantResponse("done")], {
+      api: (method, reqPath) => {
+        if (method === "GET" && reqPath === "/api/companies/company-1/cases") {
+          return new Response(JSON.stringify({ error: "Cases are disabled" }), { status: 403, headers: { "content-type": "application/json" } });
+        }
+        if (method === "GET" && reqPath === "/api/companies/company-1/status-cards") {
+          return new Response(JSON.stringify({ error: "Status cards are not enabled" }), { status: 404, headers: { "content-type": "application/json" } });
+        }
+        return undefined;
+      },
+    });
+    await execute(makeContext());
+
+    const firstChat = fetchMock.calls.find((c) => c.path.endsWith("/chat/completions"))!;
+    const toolNames = ((firstChat.body as any).tools as Array<{ function: { name: string } }>).map((t) => t.function.name);
+    expect(toolNames).not.toContain("case");
+    expect(toolNames).not.toContain("status_card");
+    const system = ((firstChat.body as any).messages as Array<{ role: string; content: string }>)[0]!.content;
+    expect(system).not.toContain("# Paperclip features");
+  });
+
+  it("runs a status-card compile task end to end: save_query, save_summary, then done", async () => {
+    const description =
+      "Compile this status-card interest prompt...\n\n```json\n" +
+      JSON.stringify({ operation: "compile", statusCardId: "card-1", companyId: "company-1", generationIssueId: "issue-1" }) +
+      "\n```";
+    fetchMock = setupFetchMock(
+      [
+        toolCallResponse([
+          {
+            id: "c1",
+            name: "publish_status_card",
+            args: { action: "save_query", title: "Launch blockers", queries: [{ q: "launch", status: ["blocked"] }] },
+          },
+        ]),
+        toolCallResponse([{ id: "c2", name: "publish_status_card", args: { action: "save_summary", markdown: "- PAP-3 is blocked" } }]),
+        toolCallResponse([{ id: "c3", name: "update_issue_status", args: { status: "done", comment: "Summary saved." } }]),
+        assistantResponse("done"),
+      ],
+      {
+        api: (method, reqPath) =>
+          method === "GET" && reqPath === "/api/issues/issue-1"
+            ? new Response(JSON.stringify({ id: "issue-1", status: "in_progress", description }), {
+                status: 200,
+                headers: { "content-type": "application/json" },
+              })
+            : undefined,
+      },
+    );
+    const ctx = makeContext();
+    const result = await execute(ctx);
+
+    const firstChat = fetchMock.calls.find((c) => c.path.endsWith("/chat/completions"))!;
+    const toolNames = ((firstChat.body as any).tools as Array<{ function: { name: string } }>).map((t) => t.function.name);
+    expect(toolNames).toEqual(expect.arrayContaining(["case", "status_card", "publish_status_card"]));
+    const system = ((firstChat.body as any).messages as Array<{ role: string; content: string }>)[0]!.content;
+    expect(system).toContain("THIS ISSUE IS A STATUS-CARD TASK");
+
+    const queryPut = fetchMock.calls.find((c) => c.method === "PUT" && c.path === "/api/status-cards/card-1/query")!;
+    expect(queryPut.body).toEqual({
+      queries: [{ q: "launch", status: ["blocked"] }],
+      title: "Launch blockers",
+      changeSummary: "Compiled the interest prompt into queries.",
+      generationIssueId: "issue-1",
+    });
+    const summaryPut = fetchMock.calls.find((c) => c.method === "PUT" && c.path === "/api/status-cards/card-1/summary")!;
+    expect(summaryPut.body).toEqual({
+      markdown: "- PAP-3 is blocked",
+      changeSummary: "Updated the summary.",
+      generationIssueId: "issue-1",
+      model: "moonshotai/kimi-k2.6",
+    });
+    const donePatch = fetchMock.calls.find((c) => c.method === "PATCH" && (c.body as any)?.status === "done");
+    expect(donePatch).toBeDefined();
+    expect(findTranscriptResultEntry(ctx)?.subtype).toBe("completed");
+    expect(result.exitCode).toBe(0);
+  });
+});
+
+describe("resolveRunCost", () => {
+  it("prefers a provider-reported cost, even $0, over the hourly rate", () => {
+    expect(resolveRunCost({ reportedCostUsd: 0, sawReportedCost: true, modelMs: 60_000, hourlyRateUsd: 2 })).toEqual({
+      costUsd: 0,
+      source: "provider",
+    });
+  });
+
+  it("charges model hours × rate when the provider reports nothing", () => {
+    const { costUsd, source } = resolveRunCost({ reportedCostUsd: 0, sawReportedCost: false, modelMs: 90_000, hourlyRateUsd: 2 });
+    expect(costUsd).toBeCloseTo(0.05, 10);
+    expect(source).toBe("hourly_rate");
+  });
+
+  it("returns null with no reported cost and no usable rate", () => {
+    for (const hourlyRateUsd of [undefined, 0, -1, Number.NaN]) {
+      expect(resolveRunCost({ reportedCostUsd: 0, sawReportedCost: false, modelMs: 1000, hourlyRateUsd })).toEqual({
+        costUsd: null,
+        source: "none",
+      });
     }
   });
 });

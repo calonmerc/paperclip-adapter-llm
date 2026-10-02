@@ -10,7 +10,15 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { PaperclipApi } from "../src/server/paperclip-api.js";
-import { buildTools, findTool, toolSchemas } from "../src/server/tools.js";
+import {
+  buildTools,
+  detectPaperclipFeatures,
+  findTool,
+  parseStatusCardTask,
+  toolSchemas,
+  type BuildToolsContext,
+  type StatusCardTask,
+} from "../src/server/tools.js";
 import { SecretStore } from "../src/server/http-request.js";
 
 function makeApi(fetchImpl: typeof fetch): PaperclipApi {
@@ -24,12 +32,19 @@ function jsonResponse(body: unknown, status = 200): Response {
   });
 }
 
+const AGENTS = [
+  { id: "agent-ceo", name: "Michael", title: "CEO", role: "ceo", adapterType: "llm", status: "idle" },
+  { id: "agent-dwight", name: "Dwight", title: "Sales Lead", role: "general", adapterType: "llm", status: "idle", reportsTo: "agent-ceo" },
+  { id: "agent-jim", name: "Jim", title: "Sales", role: "general", adapterType: "llm", status: "idle" },
+  { id: "agent-jim2", name: "Jim", title: "Intern", role: "general", adapterType: "llm", status: "idle" },
+];
+
 describe("tools.ts", () => {
   it("toolSchemas() returns one schema per tool, matching buildTools()'s output", () => {
     const api = makeApi(async () => jsonResponse({}));
     const tools = buildTools({ api, agentId: "agent-1", companyId: "company-1", currentIssueId: null, autoApprove: false });
 
-    expect(tools.length).toBe(15);
+    expect(tools.length).toBe(18);
     const names = toolSchemas(tools).map((s) => s.function.name);
     expect(names).toEqual([
       "get_issue",
@@ -41,6 +56,9 @@ describe("tools.ts", () => {
       "list_issues",
       "list_agents",
       "hire_agent",
+      "get_agent",
+      "update_agent",
+      "agent_instructions",
       "request_approval",
       "ask_user_questions",
       "list_interactions",
@@ -204,32 +222,52 @@ describe("tools.ts", () => {
     expect(result.content).toContain("No issue_id supplied");
   });
 
-  it("hire_agent routes through createApproval when autoApprove is false", async () => {
-    const paths: string[] = [];
-    const api = makeApi(async (input: any) => {
-      paths.push(new URL(typeof input === "string" ? input : input.url).pathname);
+  it("hire_agent routes through createApproval with Paperclip's field names when autoApprove is false", async () => {
+    const calls: Array<{ path: string; body: any }> = [];
+    const api = makeApi(async (input: any, init: any) => {
+      const url = new URL(typeof input === "string" ? input : input.url);
+      calls.push({ path: url.pathname, body: init?.body ? JSON.parse(init.body) : null });
+      if (url.pathname === "/api/companies/company-1/agents") return jsonResponse(AGENTS);
       return jsonResponse({ ok: true });
     });
     const tools = buildTools({ api, agentId: "agent-1", companyId: "company-1", currentIssueId: null, autoApprove: false });
 
-    await findTool(tools, "hire_agent")!.execute({ name: "Sam", role: "Engineer", mission: "Ship things" });
+    await findTool(tools, "hire_agent")!.execute({
+      name: "Sam", role: "Senior Engineer", mission: "Ship things", reports_to: "michael", model: "openai/gpt-oss-120b",
+    });
 
-    expect(paths).toContain("/api/companies/company-1/approvals");
-    expect(paths).not.toContain("/api/companies/company-1/agent-hires");
+    const approval = calls.find((c) => c.path === "/api/companies/company-1/approvals");
+    expect(approval?.body.payload).toMatchObject({
+      name: "Sam",
+      role: "general",
+      title: "Senior Engineer",
+      capabilities: "Ship things",
+      reportsTo: "agent-ceo",
+      adapterType: "llm",
+      adapterConfig: { model: "openai/gpt-oss-120b" },
+    });
+    expect(calls.map((c) => c.path)).not.toContain("/api/companies/company-1/agent-hires");
   });
 
-  it("hire_agent calls hireAgent directly when autoApprove is true", async () => {
-    const paths: string[] = [];
-    const api = makeApi(async (input: any) => {
-      paths.push(new URL(typeof input === "string" ? input : input.url).pathname);
+  it("hire_agent calls hireAgent directly when autoApprove is true, with instructions as AGENTS.md", async () => {
+    const calls: Array<{ path: string; body: any }> = [];
+    const api = makeApi(async (input: any, init: any) => {
+      const url = new URL(typeof input === "string" ? input : input.url);
+      calls.push({ path: url.pathname, body: init?.body ? JSON.parse(init.body) : null });
       return jsonResponse({ ok: true });
     });
     const tools = buildTools({ api, agentId: "agent-1", companyId: "company-1", currentIssueId: null, autoApprove: true });
 
-    await findTool(tools, "hire_agent")!.execute({ name: "Sam", role: "Engineer", mission: "Ship things" });
+    await findTool(tools, "hire_agent")!.execute({ name: "Sam", title: "Engineer", role: "engineer", instructions: "You are Sam." });
 
-    expect(paths).toContain("/api/companies/company-1/agent-hires");
-    expect(paths).not.toContain("/api/companies/company-1/approvals");
+    const hire = calls.find((c) => c.path === "/api/companies/company-1/agent-hires");
+    expect(hire?.body).toMatchObject({
+      role: "engineer",
+      title: "Engineer",
+      instructionsBundle: { files: { "AGENTS.md": "You are Sam." } },
+    });
+    expect(hire?.body).not.toHaveProperty("reportsTo");
+    expect(calls.map((c) => c.path)).not.toContain("/api/companies/company-1/approvals");
   });
 
   it("add_comment posts to the current issue and requires a body", async () => {
@@ -290,6 +328,34 @@ describe("tools.ts", () => {
       path: "/api/companies/company-1/issues",
       body: { title: "Do the thing", parentId: "issue-parent", assigneeAgentId: "agent-2" },
     });
+  });
+
+  it("create_sub_issue resolves an identifier parent to its UUID (run-log regression: 'parentId Invalid GUID')", async () => {
+    const parentUuid = "99a6e396-1d8a-456c-aa07-ef9a1360e7f6";
+    const otherUuid = "11111111-2222-3333-4444-555555555555";
+    const calls: Array<{ method: string; path: string; body: any }> = [];
+    const api = makeApi(async (input: any, init: any) => {
+      const path = new URL(typeof input === "string" ? input : input.url).pathname;
+      calls.push({ method: init?.method ?? "GET", path, body: init?.body ? JSON.parse(init.body) : undefined });
+      if (path === "/api/issues/DEBA-12") return jsonResponse({ id: otherUuid, identifier: "DEBA-12" });
+      return jsonResponse({ id: "issue-child" });
+    });
+    const tools = buildTools({
+      api,
+      agentId: "agent-1",
+      companyId: "company-1",
+      currentIssueId: parentUuid,
+      currentIssueIdentifier: "DEBA-59",
+      autoApprove: false,
+    });
+    const create = findTool(tools, "create_sub_issue")!;
+
+    await create.execute({ parent_issue_id: "DEBA-59", title: "Child of current" });
+    expect(calls.at(-1)?.body.parentId).toBe(parentUuid);
+
+    await create.execute({ parent_issue_id: "DEBA-12", title: "Child of other" });
+    expect(calls.some((c) => c.method === "GET" && c.path === "/api/issues/DEBA-12")).toBe(true);
+    expect(calls.at(-1)?.body.parentId).toBe(otherUuid);
   });
 
   it("list_issues builds a query string with a default limit", async () => {
@@ -530,6 +596,166 @@ describe("tools.ts", () => {
     const result = await findTool(tools, "ask_user_questions")!.execute({ questions: [{ prompt: "Which one?" }] });
     expect(result.isError).toBe(true);
     expect(result.content).toContain("No current issue");
+  });
+});
+
+/** Fake Paperclip agent API: list, get, patch, pause/resume, and an in-memory instructions bundle. */
+function fakeAgentServer(opts: { files?: Record<string, string>; forbidWrites?: boolean } = {}) {
+  const files: Record<string, string> = { ...(opts.files ?? { "AGENTS.md": "You are Dwight." }) };
+  const calls: Array<{ method: string; path: string; body: any }> = [];
+  const dwight = {
+    ...AGENTS[1],
+    adapterConfig: { model: "old-model", env: { SECRET: "x" }, instructionsFilePath: "/x/AGENTS.md", maxTurns: 20 },
+    runtimeConfig: { heartbeat: { enabled: false, intervalSec: 3600 }, other: 1 },
+  };
+  const api = makeApi(async (input: any, init: any) => {
+    const url = new URL(typeof input === "string" ? input : input.url);
+    const method = init?.method ?? "GET";
+    const body = init?.body ? JSON.parse(init.body) : null;
+    calls.push({ method, path: url.pathname, body });
+    const forbidden = () => jsonResponse({ error: "Missing permission agents:configure" }, 403);
+    if (url.pathname === "/api/companies/company-1/agents") return jsonResponse(AGENTS);
+    if (url.pathname === "/api/agents/agent-dwight" && method === "GET") return jsonResponse(dwight);
+    if (url.pathname === "/api/agents/agent-dwight" && method === "PATCH") {
+      if (opts.forbidWrites) return forbidden();
+      return jsonResponse({ ...dwight, ...body, adapterConfig: { ...dwight.adapterConfig, ...(body.adapterConfig ?? {}) } });
+    }
+    if (url.pathname === "/api/agents/agent-dwight/pause") return jsonResponse({ ...dwight, status: "paused" });
+    if (url.pathname === "/api/agents/agent-dwight/instructions-bundle") {
+      return jsonResponse({ entryFile: "AGENTS.md", files: Object.keys(files).map((p) => ({ path: p, size: files[p].length })) });
+    }
+    if (url.pathname === "/api/agents/agent-dwight/instructions-bundle/file") {
+      if (method === "GET") {
+        const p = url.searchParams.get("path")!;
+        return p in files ? jsonResponse({ path: p, content: files[p] }) : jsonResponse({ error: "Instructions file not found" }, 404);
+      }
+      if (opts.forbidWrites) return forbidden();
+      files[body.path] = body.content;
+      return jsonResponse({ path: body.path, size: body.content.length });
+    }
+    return jsonResponse({ error: `unexpected ${method} ${url.pathname}` }, 500);
+  });
+  const tools = buildTools({ api, agentId: "agent-ceo", companyId: "company-1", currentIssueId: null, autoApprove: false });
+  return { tools, calls, files };
+}
+
+describe("agent management", () => {
+  it("resolves an agent by id, by name case-insensitively, and by title", async () => {
+    for (const ref of ["agent-dwight", "dwight", "SALES LEAD"]) {
+      const { tools } = fakeAgentServer();
+      const result = await findTool(tools, "get_agent")!.execute({ agent: ref });
+      expect(result.isError).toBe(false);
+      expect(JSON.parse(result.content).id).toBe("agent-dwight");
+    }
+  });
+
+  it("lists the candidates when an agent ref is ambiguous or unknown", async () => {
+    const { tools } = fakeAgentServer();
+    const ambiguous = JSON.parse((await findTool(tools, "get_agent")!.execute({ agent: "Jim" })).content);
+    expect(ambiguous.error).toContain("matches 2 agents");
+    expect(ambiguous.detail.matches.map((m: any) => m.id)).toEqual(["agent-jim", "agent-jim2"]);
+
+    const unknown = JSON.parse((await findTool(tools, "update_agent")!.execute({ agent: "Pam", title: "x" })).content);
+    expect(unknown.error).toContain("No agent matches 'Pam'");
+    expect(unknown.detail.agents).toHaveLength(AGENTS.length);
+  });
+
+  it("get_agent hides secrets and instruction plumbing, and names the manager", async () => {
+    const { tools } = fakeAgentServer();
+    const agent = JSON.parse((await findTool(tools, "get_agent")!.execute({ agent: "Dwight" })).content);
+    expect(agent.reportsTo).toEqual({ id: "agent-ceo", name: "Michael" });
+    expect(agent.model).toBe("old-model");
+    expect(agent.adapterConfig).toEqual({ maxTurns: 20 });
+    expect(agent.instructions).toEqual({ entryFile: "AGENTS.md", files: ["AGENTS.md"] });
+  });
+
+  it("update_agent maps reports_to, model, and a free-text role into Paperclip's fields", async () => {
+    const { tools, calls } = fakeAgentServer();
+    const result = await findTool(tools, "update_agent")!.execute({
+      agent: "Dwight", role: "VP of Sales", reports_to: "Sales", model: "new-model",
+    });
+    expect(result.isError).toBe(false);
+    const patch = calls.find((c) => c.method === "PATCH")!.body;
+    expect(patch).toEqual({ title: "VP of Sales", reportsTo: "agent-jim", adapterConfig: { model: "new-model" } });
+  });
+
+  it("update_agent clears the manager with reports_to 'none' and refuses self-reporting", async () => {
+    const { tools, calls } = fakeAgentServer();
+    await findTool(tools, "update_agent")!.execute({ agent: "Dwight", reports_to: "none" });
+    expect(calls.find((c) => c.method === "PATCH")!.body).toEqual({ reportsTo: null });
+
+    const self = await findTool(tools, "update_agent")!.execute({ agent: "Dwight", reports_to: "Dwight" });
+    expect(self.isError).toBe(true);
+    expect(self.content).toContain("cannot report to itself");
+  });
+
+  it("update_agent merges heartbeat changes over the existing runtimeConfig", async () => {
+    const { tools, calls } = fakeAgentServer();
+    await findTool(tools, "update_agent")!.execute({ agent: "Dwight", heartbeat_enabled: true });
+    expect(calls.find((c) => c.method === "PATCH")!.body.runtimeConfig).toEqual({
+      heartbeat: { enabled: true, intervalSec: 3600 },
+      other: 1,
+    });
+  });
+
+  it("update_agent pauses through the pause endpoint", async () => {
+    const { tools, calls } = fakeAgentServer();
+    const result = JSON.parse((await findTool(tools, "update_agent")!.execute({ agent: "Dwight", status: "paused" })).content);
+    expect(calls.some((c) => c.path === "/api/agents/agent-dwight/pause")).toBe(true);
+    expect(calls.some((c) => c.method === "PATCH")).toBe(false);
+    expect(result.agent.status).toBe("paused");
+  });
+
+  it("update_agent with nothing to change lists the editable fields", async () => {
+    const { tools } = fakeAgentServer();
+    const result = await findTool(tools, "update_agent")!.execute({ agent: "Dwight" });
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain("reports_to");
+    expect(result.content).toContain("heartbeat_enabled");
+  });
+
+  it("update_agent turns a 403 into a next step instead of a bare failure", async () => {
+    const { tools } = fakeAgentServer({ forbidWrites: true });
+    const result = await findTool(tools, "update_agent")!.execute({ agent: "Dwight", title: "VP" });
+    expect(result.isError).toBe(true);
+    const body = JSON.parse(result.content);
+    expect(body.error).toContain("Missing permission agents:configure");
+    expect(body.next_step).toContain("request_approval");
+  });
+
+  it("agent_instructions lists, reads the entry file by default, writes, and appends", async () => {
+    const { tools, files } = fakeAgentServer();
+    const tool = findTool(tools, "agent_instructions")!;
+
+    const list = JSON.parse((await tool.execute({ agent: "Dwight", action: "list" })).content);
+    expect(list.files).toEqual([{ path: "AGENTS.md", size: 15 }]);
+
+    const read = JSON.parse((await tool.execute({ agent: "Dwight", action: "read" })).content);
+    expect(read).toMatchObject({ path: "AGENTS.md", content: "You are Dwight." });
+
+    await tool.execute({ agent: "Dwight", action: "append", content: "Report weekly." });
+    expect(files["AGENTS.md"]).toBe("You are Dwight.\n\nReport weekly.");
+
+    await tool.execute({ agent: "Dwight", action: "write", path: "TOOLS.md", content: "Use the CRM." });
+    expect(files["TOOLS.md"]).toBe("Use the CRM.");
+  });
+
+  it("agent_instructions append creates a missing file, and write requires content", async () => {
+    const { tools, files } = fakeAgentServer({ files: {} });
+    const tool = findTool(tools, "agent_instructions")!;
+    await tool.execute({ agent: "Dwight", action: "append", path: "NOTES.md", content: "First." });
+    expect(files["NOTES.md"]).toBe("First.");
+
+    const empty = await tool.execute({ agent: "Dwight", action: "write" });
+    expect(empty.isError).toBe(true);
+    expect(empty.content).toContain("needs 'content'");
+  });
+
+  it("agent_instructions surfaces a 403 with a next step", async () => {
+    const { tools } = fakeAgentServer({ forbidWrites: true });
+    const result = await findTool(tools, "agent_instructions")!.execute({ agent: "Dwight", action: "write", content: "x" });
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content).next_step).toContain("agents:configure");
   });
 });
 
@@ -1310,5 +1536,380 @@ describe("API-access secrets (GET /agents/me/secrets, fetched on demand)", () =>
     expect(valueFetches).toEqual(["GSC_SERVICE_ACCOUNT"]);
     expect(result.content).toContain("not valid JSON"); // got the value, then parsed it
     expect(result.content).not.toContain("not-json-key");
+  });
+});
+
+// ----- Cases and status cards -----
+
+type Route = [method: string, path: RegExp, handler: (body: any, match: RegExpMatchArray) => Response];
+
+/** Routes Paperclip calls by method + path regex; anything unmatched is a 500 so a stray call fails loudly. */
+function routedApi(routes: Route[]) {
+  const calls: Array<{ method: string; path: string; body: any }> = [];
+  const fetchImpl = (async (input: any, init: any) => {
+    const url = new URL(typeof input === "string" ? input : input.url);
+    const method = (init?.method || "GET").toUpperCase();
+    const body = init?.body ? JSON.parse(init.body) : undefined;
+    calls.push({ method, path: `${url.pathname}${url.search}`, body });
+    for (const [m, re, handler] of routes) {
+      const match = url.pathname.match(re);
+      if (m === method && match) return handler(body, match);
+    }
+    return jsonResponse({ error: `unexpected ${method} ${url.pathname}` }, 500);
+  }) as typeof fetch;
+  return { calls, api: makeApi(fetchImpl) };
+}
+
+const CASE_UUID = "11111111-1111-4111-8111-111111111111";
+const PARENT_UUID = "22222222-2222-4222-8222-222222222222";
+const PROJECT_UUID = "33333333-3333-4333-8333-333333333333";
+const LABEL_UUID = "44444444-4444-4444-8444-444444444444";
+const ISSUE_UUID = "55555555-5555-4555-8555-555555555555";
+
+function featureTools(
+  api: PaperclipApi,
+  extra: Partial<BuildToolsContext> = {},
+) {
+  return buildTools({
+    api,
+    agentId: "agent-1",
+    companyId: "company-1",
+    currentIssueId: "issue-1",
+    currentIssueIdentifier: "PAP-1",
+    autoApprove: false,
+    features: { cases: true, statusCards: true },
+    ...extra,
+  });
+}
+
+function generationDescription(payload: Record<string, unknown>): string {
+  return `Compile this status-card interest prompt...\n\n\`\`\`json\n${JSON.stringify(payload, null, 2)}\n\`\`\``;
+}
+
+describe("detectPaperclipFeatures", () => {
+  it("enables both features and finds the status-card task on the current issue", async () => {
+    const { api } = routedApi([
+      ["GET", /\/cases$/, () => jsonResponse([])],
+      ["GET", /\/status-cards$/, () => jsonResponse([])],
+      [
+        "GET",
+        /^\/api\/issues\/issue-1$/,
+        () =>
+          jsonResponse({
+            id: "issue-1",
+            description: generationDescription({
+              operation: "compile",
+              statusCardId: "card-1",
+              companyId: "company-1",
+              generationIssueId: "issue-1",
+            }),
+          }),
+      ],
+    ]);
+    const features = await detectPaperclipFeatures(api, "company-1", "issue-1");
+    expect(features).toEqual({
+      cases: true,
+      statusCards: true,
+      statusCardTask: { operation: "compile", statusCardId: "card-1", generationIssueId: "issue-1", summaryWritten: false },
+      errors: [],
+    });
+  });
+
+  it("treats 403 'Cases are disabled' and 404 'Status cards are not enabled' as off, quietly", async () => {
+    const { api, calls } = routedApi([
+      ["GET", /\/cases$/, () => jsonResponse({ error: "Cases are disabled" }, 403)],
+      ["GET", /\/status-cards$/, () => jsonResponse({ error: "Status cards are not enabled" }, 404)],
+    ]);
+    const features = await detectPaperclipFeatures(api, "company-1", "issue-1");
+    expect(features).toEqual({ cases: false, statusCards: false, statusCardTask: null, errors: [] });
+    // No issue lookup when status cards are off.
+    expect(calls.map((c) => c.path)).not.toContain("/api/issues/issue-1");
+  });
+
+  it("reports unexpected probe failures", async () => {
+    const { api } = routedApi([
+      ["GET", /\/cases$/, () => jsonResponse({ error: "boom" }, 500)],
+      ["GET", /\/status-cards$/, () => jsonResponse({ error: "Status cards are not enabled" }, 404)],
+    ]);
+    const features = await detectPaperclipFeatures(api, "company-1", null);
+    expect(features.cases).toBe(false);
+    expect(features.errors).toEqual(["cases: 500 boom"]);
+  });
+
+  it("parseStatusCardTask ignores ordinary issues and payloads for a different issue", () => {
+    expect(parseStatusCardTask({ id: "issue-1", description: "Write the launch post." })).toBeNull();
+    expect(
+      parseStatusCardTask({
+        id: "issue-1",
+        description: generationDescription({ operation: "update", statusCardId: "card-1", generationIssueId: "issue-9" }),
+      }),
+    ).toBeNull();
+    expect(
+      parseStatusCardTask({
+        id: "issue-1",
+        description: generationDescription({ operation: "update", statusCardId: "card-1", generationIssueId: "issue-1" }),
+      }),
+    ).toMatchObject({ operation: "update", statusCardId: "card-1" });
+  });
+
+  it("buildTools registers the feature tools only when enabled", () => {
+    const api = makeApi(async () => jsonResponse({}));
+    const names = (extra: Partial<BuildToolsContext>) => toolSchemas(featureTools(api, extra)).map((s) => s.function.name);
+    const off = names({ features: { cases: false, statusCards: false } });
+    expect(off).not.toContain("case");
+    expect(off).not.toContain("status_card");
+    expect(names({})).toEqual(expect.arrayContaining(["case", "status_card"]));
+    expect(names({})).not.toContain("publish_status_card");
+    const task: StatusCardTask = { operation: "compile", statusCardId: "card-1", generationIssueId: "issue-1", summaryWritten: false };
+    expect(names({ statusCardTask: task })).toContain("publish_status_card");
+  });
+});
+
+describe("case tool", () => {
+  it("save sends Paperclip's strict body, resolving a parent identifier and a project name", async () => {
+    const { api, calls } = routedApi([
+      ["GET", /^\/api\/cases\/PAP-C1$/, () => jsonResponse({ id: PARENT_UUID })],
+      ["GET", /\/projects$/, () => jsonResponse([{ id: PROJECT_UUID, name: "Website" }])],
+      ["POST", /\/companies\/company-1\/cases$/, (body) => jsonResponse({ id: CASE_UUID, ...body, documents: [] }, 201)],
+    ]);
+    const result = await findTool(featureTools(api), "case")!.execute({
+      action: "save",
+      case_type: "blog_post",
+      key: "launch-announcement",
+      title: "Launch announcement",
+      status: "draft",
+      fields: { slug: "launch-announcement" },
+      parent_case_id: "PAP-C1",
+      project: "website",
+    });
+    expect(result.isError).toBe(false);
+    expect(calls.at(-1)!.body).toEqual({
+      caseType: "blog_post",
+      key: "launch-announcement",
+      title: "Launch announcement",
+      status: "draft",
+      fields: { slug: "launch-announcement" },
+      parentCaseId: PARENT_UUID,
+      projectId: PROJECT_UUID,
+    });
+  });
+
+  it("save names the missing field, and a bad status lists the case statuses", async () => {
+    const { api, calls } = routedApi([]);
+    const tool = findTool(featureTools(api), "case")!;
+    const noType = await tool.execute({ action: "save", title: "X" });
+    expect(noType.content).toContain("case_type is required");
+    const badStatus = await tool.execute({ action: "update", case_id: "PAP-C1", status: "todo" });
+    expect(badStatus.isError).toBe(true);
+    expect(badStatus.content).toContain("draft, in_progress, in_review, approved, done, cancelled");
+    expect(calls).toHaveLength(0);
+  });
+
+  it("update merges fields into the existing ones unless replace_fields is set", async () => {
+    const { api, calls } = routedApi([
+      ["GET", /^\/api\/cases\/PAP-C1$/, () => jsonResponse({ id: CASE_UUID, fields: { slug: "a", publish_url: null } })],
+      ["PATCH", /^\/api\/cases\/PAP-C1$/, (body) => jsonResponse({ id: CASE_UUID, ...body, documents: [] })],
+    ]);
+    const tool = findTool(featureTools(api), "case")!;
+    await tool.execute({ action: "update", case_id: "PAP-C1", status: "in_review", fields: { publish_url: "https://x" } });
+    expect(calls.at(-1)!.body).toEqual({ status: "in_review", fields: { slug: "a", publish_url: "https://x" } });
+
+    await tool.execute({ action: "update", case_id: "PAP-C1", fields: { only: 1 }, replace_fields: true });
+    expect(calls.at(-1)!.body).toEqual({ fields: { only: 1 } });
+  });
+
+  it("list returns only summary fields", async () => {
+    const { api, calls } = routedApi([
+      [
+        "GET",
+        /\/companies\/company-1\/cases$/,
+        () =>
+          jsonResponse([
+            { id: CASE_UUID, identifier: "PAP-C1", caseType: "blog_post", key: "k", title: "T", status: "draft", fields: { big: "x".repeat(5000) } },
+          ]),
+      ],
+    ]);
+    const result = await findTool(featureTools(api), "case")!.execute({ action: "list", case_type: "blog_post", status: "active" });
+    expect(calls[0]!.path).toBe("/api/companies/company-1/cases?limit=50&type=blog_post&status=active");
+    expect(JSON.parse(result.content)).toEqual([
+      { id: CASE_UUID, identifier: "PAP-C1", caseType: "blog_post", key: "k", title: "T", status: "draft", parentCaseId: null, updatedAt: null },
+    ]);
+  });
+
+  it("write_document creates, then updates with the current revision, and append_document keeps the body", async () => {
+    const docs = new Map<string, { title: string | null; body: string; latestRevisionId: string }>();
+    let rev = 0;
+    const { api, calls } = routedApi([
+      [
+        "GET",
+        /^\/api\/cases\/PAP-C1\/documents\/([^/]+)$/,
+        (_b, m) => {
+          const d = docs.get(m[1]!);
+          return d ? jsonResponse({ key: m[1], ...d }) : jsonResponse({ error: "Case document not found" }, 404);
+        },
+      ],
+      [
+        "PUT",
+        /^\/api\/cases\/PAP-C1\/documents\/([^/]+)$/,
+        (body, m) => {
+          const d = { title: body.title ?? null, body: body.body, latestRevisionId: `rev-${++rev}` };
+          docs.set(m[1]!, d);
+          return jsonResponse({ key: m[1], ...d });
+        },
+      ],
+    ]);
+    const tool = findTool(featureTools(api), "case")!;
+    await tool.execute({ action: "write_document", case_id: "PAP-C1", title: "Draft", body: "# Draft" });
+    expect(calls.at(-1)!.body).toEqual({ title: "Draft", body: "# Draft", format: "markdown", changeSummary: null });
+    expect(calls.at(-1)!.path).toBe("/api/cases/PAP-C1/documents/body");
+
+    await tool.execute({ action: "append_document", case_id: "PAP-C1", body: "Reviewed." });
+    expect(calls.at(-1)!.body).toMatchObject({ body: "# Draft\n\nReviewed.", title: "Draft", baseRevisionId: "rev-1" });
+
+    const missing = await tool.execute({ action: "append_document", case_id: "PAP-C1", key: "notes", body: "x" });
+    expect(missing.isError).toBe(true);
+    expect(missing.content).toContain("action='write_document'");
+  });
+
+  it("write_document retries once when the revision went stale", async () => {
+    let puts = 0;
+    const { api, calls } = routedApi([
+      ["GET", /\/documents\/body$/, () => jsonResponse({ key: "body", body: "old", latestRevisionId: `rev-${puts + 1}` })],
+      [
+        "PUT",
+        /\/documents\/body$/,
+        (body) =>
+          ++puts === 1
+            ? jsonResponse({ error: "Case document was updated by someone else" }, 409)
+            : jsonResponse({ key: "body", ...body }),
+      ],
+    ]);
+    const result = await findTool(featureTools(api), "case")!.execute({ action: "write_document", case_id: "PAP-C1", body: "new" });
+    expect(result.isError).toBe(false);
+    expect(calls.filter((c) => c.method === "PUT").map((c) => c.body.baseRevisionId)).toEqual(["rev-1", "rev-2"]);
+  });
+
+  it("link_issue resolves an issue identifier to its UUID", async () => {
+    const { api, calls } = routedApi([
+      ["GET", /^\/api\/issues\/PAP-7$/, () => jsonResponse({ id: ISSUE_UUID })],
+      ["POST", /^\/api\/cases\/PAP-C1\/links$/, (body) => jsonResponse({ id: "link-1", ...body })],
+    ]);
+    await findTool(featureTools(api), "case")!.execute({ action: "link_issue", case_id: "PAP-C1", issue_id: "PAP-7" });
+    expect(calls.at(-1)!.body).toEqual({ issueId: ISSUE_UUID, role: "reference" });
+  });
+});
+
+describe("status_card tool", () => {
+  it("create builds the refresh policy, filling the field the mode requires", async () => {
+    const { api, calls } = routedApi([
+      ["POST", /\/companies\/company-1\/status-cards$/, (body) => jsonResponse({ id: "card-1", state: "compiling", ...body }, 201)],
+    ]);
+    const result = await findTool(featureTools(api), "status_card")!.execute({
+      action: "create",
+      interest_prompt: "Launch blockers in Website",
+      refresh_mode: "reactive",
+    });
+    expect(calls[0]!.body).toEqual({
+      interestPrompt: "Launch blockers in Website",
+      refreshPolicy: { mode: "reactive", debounceSeconds: 300 },
+    });
+    expect(JSON.parse(result.content)).toMatchObject({ id: "card-1", state: "compiling", defaultsApplied: "debounce_seconds=300" });
+  });
+
+  it("rejects an interest_prompt over Paperclip's agent limit without calling the API", async () => {
+    const { api, calls } = routedApi([]);
+    const result = await findTool(featureTools(api), "status_card")!.execute({ action: "create", interest_prompt: "x".repeat(4001) });
+    expect(result.content).toContain("limit is 4000");
+    expect(calls).toHaveLength(0);
+  });
+
+  it("explains the authored-cards-only 403", async () => {
+    const { api } = routedApi([
+      ["PATCH", /^\/api\/status-cards\/card-1$/, () => jsonResponse({ error: "Agents can only manage status cards they authored" }, 403)],
+    ]);
+    const result = await findTool(featureTools(api), "status_card")!.execute({ action: "update", card_id: "card-1", archived: true });
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain("only change status cards you created");
+  });
+});
+
+describe("publish_status_card tool", () => {
+  function task(operation: "compile" | "update"): StatusCardTask {
+    return { operation, statusCardId: "card-1", generationIssueId: "issue-1", summaryWritten: false };
+  }
+
+  it("save_query resolves project and label names and fills the generation ids", async () => {
+    const { api, calls } = routedApi([
+      ["GET", /\/projects$/, () => jsonResponse([{ id: PROJECT_UUID, name: "Website" }])],
+      ["GET", /\/labels$/, () => jsonResponse([{ id: LABEL_UUID, name: "launch" }])],
+      ["PUT", /^\/api\/status-cards\/card-1\/query$/, (body) => jsonResponse({ id: "card-1", queryVersion: 1, ...body })],
+    ]);
+    const tool = findTool(featureTools(api, { statusCardTask: task("compile") }), "publish_status_card")!;
+    const result = await tool.execute({
+      action: "save_query",
+      title: "Launch blockers",
+      queries: [{ q: "launch", status: ["blocked", "in_progress"], project: "Website", label: "launch", updated_within: "7d" }],
+    });
+    expect(result.isError).toBe(false);
+    expect(calls.at(-1)!.body).toEqual({
+      queries: [{ q: "launch", status: ["blocked", "in_progress"], projectId: PROJECT_UUID, labelId: LABEL_UUID, updatedWithin: "7d" }],
+      title: "Launch blockers",
+      changeSummary: "Compiled the interest prompt into queries.",
+      generationIssueId: "issue-1",
+    });
+  });
+
+  it("save_query lists the available projects when the name doesn't match", async () => {
+    const { api } = routedApi([["GET", /\/projects$/, () => jsonResponse([{ id: PROJECT_UUID, name: "Website" }])]]);
+    const tool = findTool(featureTools(api, { statusCardTask: task("compile") }), "publish_status_card")!;
+    const result = await tool.execute({ action: "save_query", title: "T", queries: [{ project: "Mobile" }] });
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain("No project named 'Mobile'. Available projects: Website");
+  });
+
+  it("save_query is refused on an update task", async () => {
+    const { api, calls } = routedApi([]);
+    const tool = findTool(featureTools(api, { statusCardTask: task("update") }), "publish_status_card")!;
+    const result = await tool.execute({ action: "save_query", title: "T", queries: [{ q: "x" }] });
+    expect(result.content).toContain("already compiled");
+    expect(calls).toHaveLength(0);
+  });
+
+  it("save_summary sends the generation id and model, and unlocks marking the task done", async () => {
+    const { api, calls } = routedApi([
+      ["PUT", /^\/api\/status-cards\/card-1\/summary$/, () => jsonResponse({ card: {}, document: { id: "doc-1" } })],
+      ["PATCH", /^\/api\/issues\/issue-1$/, (body) => jsonResponse({ id: "issue-1", ...body })],
+    ]);
+    const statusCardTask = task("compile");
+    const tools = featureTools(api, { statusCardTask, model: "openai/gpt-oss-120b" });
+
+    const early = await findTool(tools, "update_issue_status")!.execute({ status: "done" });
+    expect(early.isError).toBe(true);
+    expect(early.content).toContain("save_summary");
+    const earlyViaUpdateIssue = await findTool(tools, "update_issue")!.execute({ status: "done" });
+    expect(earlyViaUpdateIssue.isError).toBe(true);
+    expect(calls).toHaveLength(0);
+
+    const saved = await findTool(tools, "publish_status_card")!.execute({ action: "save_summary", markdown: "## Launch\n- PAP-3 blocked" });
+    expect(saved.isError).toBe(false);
+    expect(calls[0]!.body).toEqual({
+      markdown: "## Launch\n- PAP-3 blocked",
+      changeSummary: "Updated the summary.",
+      generationIssueId: "issue-1",
+      model: "openai/gpt-oss-120b",
+    });
+    expect(statusCardTask.summaryWritten).toBe(true);
+
+    const done = await findTool(tools, "update_issue_status")!.execute({ status: "done" });
+    expect(done.isError).toBe(false);
+  });
+
+  it("save_summary before the query is compiled points to save_query", async () => {
+    const { api } = routedApi([
+      ["PUT", /\/summary$/, () => jsonResponse({ error: "Compile the status-card query before writing its summary" }, 409)],
+    ]);
+    const tool = findTool(featureTools(api, { statusCardTask: task("compile") }), "publish_status_card")!;
+    const result = await tool.execute({ action: "save_summary", markdown: "x" });
+    expect(result.content).toContain("Call action='save_query' first");
   });
 });
