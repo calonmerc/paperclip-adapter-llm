@@ -459,11 +459,64 @@ async function callChatCompletions(
 
   if (!response.ok) {
     const errText = await response.text().catch(() => "");
-    throw new Error(`LLM API error (${response.status}): ${errText}`);
+    throw new LlmHttpError(response.status, errText, response.headers.get("retry-after"));
   }
 
   const json = (await response.json()) as ChatCompletionResponse;
   return json;
+}
+
+type AdapterExecutionErrorFamily = NonNullable<AdapterExecutionResult["errorFamily"]>;
+
+class LlmHttpError extends Error {
+  constructor(
+    readonly status: number,
+    readonly body: string,
+    readonly retryAfter: string | null,
+  ) {
+    super(`LLM API error (${status}): ${body}`);
+  }
+}
+
+interface LlmErrorClass {
+  code: string;
+  errorFamily?: AdapterExecutionErrorFamily;
+  retryNotBefore?: string;
+}
+
+const QUOTA_BODY = /limit|quota|credit|insufficient|exceeded/i;
+
+/**
+ * Tells Paperclip which LLM failures are worth retrying. A run that reports
+ * `provider_quota` / `transient_upstream` gets Paperclip's bounded retry; any
+ * other error needs a human, so it still ends with the issue blocked.
+ */
+export function classifyLlmError(err: unknown, now = Date.now()): LlmErrorClass {
+  if (err instanceof LlmHttpError) {
+    const retryNotBefore = parseRetryAfter(err.retryAfter, now);
+    const withRetry = retryNotBefore ? { retryNotBefore } : {};
+    // OpenRouter reports an exhausted key limit as a 403, not a 429.
+    if (err.status === 402 || err.status === 429 || (err.status === 403 && QUOTA_BODY.test(err.body))) {
+      return { code: "llm_provider_quota", errorFamily: "provider_quota", ...withRetry };
+    }
+    if (err.status >= 500) {
+      return { code: "llm_transient_upstream", errorFamily: "transient_upstream", ...withRetry };
+    }
+    return { code: "llm_request_failed" };
+  }
+  // fetch() rejects with a TypeError on network failure (DNS, reset, refused).
+  if (err instanceof TypeError) {
+    return { code: "llm_transient_upstream", errorFamily: "transient_upstream" };
+  }
+  return { code: "llm_request_failed" };
+}
+
+function parseRetryAfter(value: string | null, now: number): string | undefined {
+  if (!value) return undefined;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds) && seconds >= 0) return new Date(now + seconds * 1000).toISOString();
+  const date = Date.parse(value);
+  return Number.isNaN(date) ? undefined : new Date(date).toISOString();
 }
 
 // ----- main -----
@@ -816,7 +869,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   let finalAssistantText = "";
   let turn = 0;
   let stoppedReason: "completed" | "max_turns" | "error" | "repeat_loop" = "completed";
-  let runError: { message: string; code: string } | null = null;
+  let runError: {
+    message: string;
+    code: string;
+    errorFamily?: AdapterExecutionErrorFamily;
+    retryNotBefore?: string;
+  } | null = null;
   // Set when update_issue_status records a disposition on the CURRENT issue
   // — see the disposition-nudge block below, which exists because of a real,
   // observed failure mode: models confidently write "Done — closed as
@@ -873,7 +931,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         }
       } catch (err) {
         const reason = err instanceof Error ? err.message : String(err);
-        runError = { message: reason, code: "llm_request_failed" };
+        runError = { message: reason, ...classifyLlmError(err) };
         stoppedReason = "error";
         break;
       }
@@ -1125,6 +1183,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     } else if (stoppedReason === "repeat_loop" && runError) {
       nextStatus = "blocked";
       statusReason = runError.message;
+    } else if (stoppedReason === "error" && runError?.errorFamily) {
+      // Retryable provider failure: leave the issue in_progress so Paperclip's
+      // bounded retry can re-run it. Blocking it here stranded the issue.
+      await api
+        .addIssueComment(currentIssueId, {
+          body: `Run paused: ${runError.message}\n\nPaperclip will retry this run automatically.`,
+        })
+        .catch(() => undefined);
     } else if (stoppedReason === "error" && runError) {
       nextStatus = "blocked";
       statusReason = runError.message;
@@ -1193,6 +1259,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       timedOut: false,
       errorMessage: [runError.message, ...secondaryErrors].join(" — also: "),
       errorCode: runError.code,
+      ...(runError.errorFamily ? { errorFamily: runError.errorFamily } : {}),
+      ...(runError.retryNotBefore ? { retryNotBefore: runError.retryNotBefore } : {}),
       usage: totalUsage,
       usageBasis: "per_run",
       model,

@@ -356,10 +356,55 @@ async function callChatCompletions(apiKey, config, endpoints, messages, tools, m
     });
     if (!response.ok) {
         const errText = await response.text().catch(() => "");
-        throw new Error(`LLM API error (${response.status}): ${errText}`);
+        throw new LlmHttpError(response.status, errText, response.headers.get("retry-after"));
     }
     const json = (await response.json());
     return json;
+}
+class LlmHttpError extends Error {
+    status;
+    body;
+    retryAfter;
+    constructor(status, body, retryAfter) {
+        super(`LLM API error (${status}): ${body}`);
+        this.status = status;
+        this.body = body;
+        this.retryAfter = retryAfter;
+    }
+}
+const QUOTA_BODY = /limit|quota|credit|insufficient|exceeded/i;
+/**
+ * Tells Paperclip which LLM failures are worth retrying. A run that reports
+ * `provider_quota` / `transient_upstream` gets Paperclip's bounded retry; any
+ * other error needs a human, so it still ends with the issue blocked.
+ */
+export function classifyLlmError(err, now = Date.now()) {
+    if (err instanceof LlmHttpError) {
+        const retryNotBefore = parseRetryAfter(err.retryAfter, now);
+        const withRetry = retryNotBefore ? { retryNotBefore } : {};
+        // OpenRouter reports an exhausted key limit as a 403, not a 429.
+        if (err.status === 402 || err.status === 429 || (err.status === 403 && QUOTA_BODY.test(err.body))) {
+            return { code: "llm_provider_quota", errorFamily: "provider_quota", ...withRetry };
+        }
+        if (err.status >= 500) {
+            return { code: "llm_transient_upstream", errorFamily: "transient_upstream", ...withRetry };
+        }
+        return { code: "llm_request_failed" };
+    }
+    // fetch() rejects with a TypeError on network failure (DNS, reset, refused).
+    if (err instanceof TypeError) {
+        return { code: "llm_transient_upstream", errorFamily: "transient_upstream" };
+    }
+    return { code: "llm_request_failed" };
+}
+function parseRetryAfter(value, now) {
+    if (!value)
+        return undefined;
+    const seconds = Number(value);
+    if (Number.isFinite(seconds) && seconds >= 0)
+        return new Date(now + seconds * 1000).toISOString();
+    const date = Date.parse(value);
+    return Number.isNaN(date) ? undefined : new Date(date).toISOString();
 }
 // ----- main -----
 export async function execute(ctx) {
@@ -743,7 +788,7 @@ export async function execute(ctx) {
             }
             catch (err) {
                 const reason = err instanceof Error ? err.message : String(err);
-                runError = { message: reason, code: "llm_request_failed" };
+                runError = { message: reason, ...classifyLlmError(err) };
                 stoppedReason = "error";
                 break;
             }
@@ -976,6 +1021,15 @@ export async function execute(ctx) {
             nextStatus = "blocked";
             statusReason = runError.message;
         }
+        else if (stoppedReason === "error" && runError?.errorFamily) {
+            // Retryable provider failure: leave the issue in_progress so Paperclip's
+            // bounded retry can re-run it. Blocking it here stranded the issue.
+            await api
+                .addIssueComment(currentIssueId, {
+                body: `Run paused: ${runError.message}\n\nPaperclip will retry this run automatically.`,
+            })
+                .catch(() => undefined);
+        }
         else if (stoppedReason === "error" && runError) {
             nextStatus = "blocked";
             statusReason = runError.message;
@@ -1045,6 +1099,8 @@ export async function execute(ctx) {
             timedOut: false,
             errorMessage: [runError.message, ...secondaryErrors].join(" — also: "),
             errorCode: runError.code,
+            ...(runError.errorFamily ? { errorFamily: runError.errorFamily } : {}),
+            ...(runError.retryNotBefore ? { retryNotBefore: runError.retryNotBefore } : {}),
             usage: totalUsage,
             usageBasis: "per_run",
             model,

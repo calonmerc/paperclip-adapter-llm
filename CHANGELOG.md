@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Fixed — LLM quota and upstream errors stranded the issue
+- Any LLM HTTP error set the issue to `blocked` with a generic
+  `llm_request_failed`, so Paperclip never retried it. When OpenRouter's
+  weekly key limit hit mid-run on DEBA-63, the issue stayed blocked even after
+  the limit was raised. Quota/rate-limit errors (402, 429, 403 with a
+  limit/quota body) now report `errorFamily: "provider_quota"`, and 5xx or
+  network errors report `transient_upstream`, both with `retryNotBefore` from
+  `Retry-After`. Those runs leave the issue `in_progress` with a "Run paused"
+  comment so Paperclip's bounded retry picks it up. Other errors still block.
+
 ### Added — agent management
 - **`get_agent`, `update_agent`, `agent_instructions`** tools. Agents on this
   adapter could list and hire agents but not change one, so a CEO couldn't

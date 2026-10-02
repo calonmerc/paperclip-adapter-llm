@@ -54,7 +54,7 @@ Calling a tool that doesn't exist (e.g. `bash`) returns the list of available to
 
 ### Disposition handling
 
-The adapter never guesses an issue's final disposition: a run only changes issue status when the model explicitly calls `update_issue_status`, or on `max_turns`/an unrecoverable error (both `blocked`, with an `unblockDescriptor` naming the agent so Paperclip accepts it). A plain-text turn with no such call leaves status untouched, and Paperclip's own `missing_disposition` recovery owns prompting the agent for a real disposition.
+The adapter never guesses an issue's final disposition: a run only changes issue status when the model explicitly calls `update_issue_status`, or on `max_turns`/an unrecoverable error (both `blocked`, with an `unblockDescriptor` naming the agent so Paperclip accepts it). A retryable LLM provider failure is the exception: a quota or rate limit (402, 429, or OpenRouter's 403 "Key limit exceeded") or a 5xx/network error is reported to Paperclip as `errorFamily: provider_quota` / `transient_upstream` (with `retryNotBefore` from `Retry-After` when sent). The issue is left `in_progress` with a "Run paused" comment, and Paperclip's bounded retry re-runs it. A plain-text turn with no such call leaves status untouched, and Paperclip's own `missing_disposition` recovery owns prompting the agent for a real disposition.
 
 When Paperclip wakes the agent for that recovery (a "successful run handoff"), its instructions arrive at the top level of the run context rather than in the wake payload, so the adapter renders them itself at the top of the prompt. Otherwise the corrective run looks like an ordinary wake, the model redoes the task, and Paperclip's single corrective attempt is spent.
 

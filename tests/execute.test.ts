@@ -113,6 +113,8 @@ function setupFetchMock(
   chatResponses: unknown[] = [],
   opts: {
     chatFailureStatus?: number;
+    chatFailureBody?: string;
+    chatFailureHeaders?: Record<string, string>;
     /** Per-route Paperclip API override; return undefined to fall through to the default 200. */
     api?: (method: string, path: string, body: unknown) => Response | undefined;
   } = {},
@@ -132,7 +134,10 @@ function setupFetchMock(
 
     if (reqPath.endsWith("/chat/completions")) {
       if (opts.chatFailureStatus) {
-        return new Response("boom", { status: opts.chatFailureStatus });
+        return new Response(opts.chatFailureBody ?? "boom", {
+          status: opts.chatFailureStatus,
+          headers: opts.chatFailureHeaders,
+        });
       }
       const next = queue.shift() ?? assistantResponse("done");
       return new Response(JSON.stringify(next), {
@@ -651,11 +656,13 @@ describe("execute()", () => {
   });
 
   it("reports exitCode and marks the issue blocked when the model call fails", async () => {
-    fetchMock = setupFetchMock([], { chatFailureStatus: 500 });
+    fetchMock = setupFetchMock([], { chatFailureStatus: 400 });
 
     const result = await execute(makeContext());
 
     expect(result.exitCode).toBe(1);
+    expect(result.errorCode).toBe("llm_request_failed");
+    expect(result.errorFamily).toBeUndefined();
     const blocked = fetchMock.calls.find(
       (c) =>
         c.method === "PATCH" &&
@@ -663,6 +670,52 @@ describe("execute()", () => {
         (c.body as any)?.status === "blocked",
     );
     expect(blocked).toBeDefined();
+  });
+
+  it("reports an OpenRouter key-limit 403 as provider_quota and leaves the issue for Paperclip to retry", async () => {
+    // Replays DEBA-63: the run died on this error, the issue went to blocked,
+    // and nothing re-woke the agent after the limit was raised.
+    fetchMock = setupFetchMock([], {
+      chatFailureStatus: 403,
+      chatFailureBody: JSON.stringify({
+        error: { message: "Key limit exceeded (weekly limit). Manage it using https://openrouter.ai/workspaces/default/keys/x", code: 403 },
+      }),
+    });
+
+    const result = await execute(makeContext());
+
+    expect(result.exitCode).toBe(1);
+    expect(result.errorCode).toBe("llm_provider_quota");
+    expect(result.errorFamily).toBe("provider_quota");
+    const patches = fetchMock.calls.filter((c) => c.method === "PATCH" && c.path === "/api/issues/issue-1");
+    expect(patches.some((c) => (c.body as any)?.status === "blocked")).toBe(false);
+    const comments = fetchMock.calls.filter((c) => c.method === "POST" && c.path === "/api/issues/issue-1/comments");
+    expect(comments).toHaveLength(1);
+    expect((comments[0].body as any).body).toContain("retry this run automatically");
+  });
+
+  it("reports a 5xx as transient_upstream without blocking the issue", async () => {
+    fetchMock = setupFetchMock([], { chatFailureStatus: 503 });
+
+    const result = await execute(makeContext());
+
+    expect(result.errorFamily).toBe("transient_upstream");
+    expect(result.errorCode).toBe("llm_transient_upstream");
+    expect(
+      fetchMock.calls.some((c) => c.method === "PATCH" && (c.body as any)?.status === "blocked"),
+    ).toBe(false);
+  });
+
+  it("passes a 429 Retry-After through as retryNotBefore", async () => {
+    fetchMock = setupFetchMock([], { chatFailureStatus: 429, chatFailureHeaders: { "retry-after": "120" } });
+
+    const before = Date.now();
+    const result = await execute(makeContext());
+
+    expect(result.errorFamily).toBe("provider_quota");
+    const retryAt = Date.parse(result.retryNotBefore!);
+    expect(retryAt - before).toBeGreaterThanOrEqual(119_000);
+    expect(retryAt - before).toBeLessThan(130_000);
   });
 
   it("does not throw when baseUrl points at a non-OpenRouter endpoint", async () => {

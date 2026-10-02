@@ -70,6 +70,18 @@ export declare function isDispositionRecoveryWake(context: Record<string, unknow
  */
 export declare function renderPaperclipFeatureNote(features: PaperclipFeatures | null): string;
 export declare function renderDispositionHandoffNote(context: Record<string, unknown>): string;
+type AdapterExecutionErrorFamily = NonNullable<AdapterExecutionResult["errorFamily"]>;
+interface LlmErrorClass {
+    code: string;
+    errorFamily?: AdapterExecutionErrorFamily;
+    retryNotBefore?: string;
+}
+/**
+ * Tells Paperclip which LLM failures are worth retrying. A run that reports
+ * `provider_quota` / `transient_upstream` gets Paperclip's bounded retry; any
+ * other error needs a human, so it still ends with the issue blocked.
+ */
+export declare function classifyLlmError(err: unknown, now?: number): LlmErrorClass;
 export declare function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult>;
 export {};
 //# sourceMappingURL=execute.d.ts.map
