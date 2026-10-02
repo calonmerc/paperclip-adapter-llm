@@ -80,6 +80,14 @@ export function getConfigSchema(): AdapterConfigSchema {
         hint: "Only applies when reasoning is on. Higher effort spends more of each response thinking.",
       },
       {
+        key: "hourlyRateUsd",
+        label: "Hourly rate (USD)",
+        type: "number",
+        hint:
+          "Cost per hour of model time for self-hosted endpoints with no real price (llama-swap, Ollama, " +
+          "vLLM). Used only when the provider doesn't report a cost.",
+      },
+      {
         key: "maxTurns",
         label: "Max tool-loop turns",
         type: "number",

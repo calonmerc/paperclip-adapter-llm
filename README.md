@@ -192,7 +192,7 @@ Emits to `dist/`.
 | --- | --- |
 | `/models` env-test | ✅ Uses `baseUrl` |
 | `/chat/completions` (the actual agent loop) | ✅ Uses `baseUrl` directly via `resolveEndpoints(baseUrl)` — no subprocess |
-| `/generation` cost reporting | ⚠️ OpenRouter-specific endpoint — only attempted when `baseUrl` resolves to OpenRouter; cost shows `$0`/`null` for other providers. |
+| Cost reporting | ✅ OpenRouter: each call's `usage.cost` (usage accounting), summed over the run. Other providers: `hourlyRateUsd` × model time if set, otherwise no cost. |
 | Backwards compatibility | ✅ Existing OpenRouter installs need zero config changes. |
 
 ## Programmatic API

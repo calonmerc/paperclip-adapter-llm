@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+### Fixed — run cost and usage
+- OpenRouter runs reported the cost of the **last** call only: cost came
+  from one `/generation` lookup on the final generation id, after a 1.5s
+  sleep. That lookup also replaced the token totals summed across the run
+  with the last call's counts. Cost now comes from each response's
+  `usage.cost` (requested with `usage: { include: true }`) and is summed,
+  including the upstream cost under BYOK. The `/generation` call is gone.
+- `usage.cachedInputTokens` is now reported (from
+  `prompt_tokens_details.cached_tokens`, for any provider that sends it),
+  and results set `usageBasis: "per_run"`.
+
+### Added
+- **`hourlyRateUsd`** config: self-hosted endpoints (llama-swap, Ollama,
+  vLLM) have no price, so cost is the time spent waiting on the model ×
+  this rate. Used only when the provider reports no cost; such runs report
+  `billingType: "fixed"`.
+
 ### Added — Cases and Status Cards
 - **`case` tool** for Paperclip's experimental Cases: list, get, save
   (upsert on `case_type` + `key`), update, read/write/append case

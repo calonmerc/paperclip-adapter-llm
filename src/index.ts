@@ -20,7 +20,7 @@ export interface ResolvedEndpoints {
   base: string;
   models: string;
   chat: string;
-  /** OpenRouter-specific cost endpoint; gracefully 404s on other providers. */
+  /** OpenRouter-specific cost endpoint. Unused: cost now comes from each response's usage. */
   generation: string;
 }
 
@@ -103,6 +103,12 @@ export const agentConfigurationDoc = `# llm adapter configuration
 - \`agentHomeDir\` (string, optional) — Legacy. Where the retired \`memory_fs\` tool kept
   hidden files (default \`~/.paperclip-llm-adapter/homes\`). Only read, once, to migrate
   leftover files into Library documents; nothing writes there anymore.
+- \`hourlyRateUsd\` (number, optional) — Cost per hour of model time, for self-hosted
+  endpoints with no real price (llama-swap, Ollama, vLLM). Only the time spent waiting on
+  the model counts, not tool calls. Used only when the provider doesn't report a cost.
+
+Cost: OpenRouter's own per-call cost (usage accounting) is summed over the run. Other
+providers report \`hourlyRateUsd\` × model time if set, and no cost otherwise.
 
 OpenRouter-specific fields (ignored by other providers):
 - \`transforms\` (string[]) — e.g. ["middle-out"]
@@ -133,7 +139,8 @@ Use the \`provider/model-name\` format and an \`nvapi-...\` key.
 \`\`\`json
 {
   "baseUrl": "http://localhost:11434/v1",
-  "model": "llama3.1"
+  "model": "llama3.1",
+  "hourlyRateUsd": 0.05
 }
 \`\`\`
 
@@ -217,6 +224,8 @@ export interface LlmConfig {
   libraryIssue?: string;
   /** Legacy memory_fs location, read only by the one-time migration. See memory-fs.ts. */
   agentHomeDir?: string;
+  /** USD per hour of model time when the provider reports no cost. See resolveRunCost. */
+  hourlyRateUsd?: number;
 }
 
 /** @deprecated Use LlmConfig. */

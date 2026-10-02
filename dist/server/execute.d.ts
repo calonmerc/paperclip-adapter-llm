@@ -12,8 +12,8 @@
  *     at end)
  *   - Post the final assistant output as an issue comment
  *   - Emit typed TranscriptEntry lines so the run viewer renders properly
- *   - Track usage and cost via OpenRouter's /generation endpoint (OpenRouter
- *     only — other providers don't have an equivalent, so cost stays null)
+ *   - Sum usage and cost across every call: OpenRouter's per-response
+ *     usage.cost, else model time × the configured hourlyRateUsd
  *
  * Aligned with @paperclipai/adapter-utils 2026.916.1 API surface:
  *   - PaperclipApi exposes updateIssue / addIssueComment (not updateIssueState / addComment)
@@ -32,6 +32,20 @@
  */
 import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
 import { type PaperclipFeatures } from "./tools.js";
+type CostSource = "provider" | "hourly_rate" | "none";
+/**
+ * Provider-reported cost wins. Self-hosted endpoints have no price, so they
+ * can be billed per hour of model time instead.
+ */
+export declare function resolveRunCost(opts: {
+    reportedCostUsd: number;
+    sawReportedCost: boolean;
+    modelMs: number;
+    hourlyRateUsd?: number;
+}): {
+    costUsd: number | null;
+    source: CostSource;
+};
 /**
  * Paperclip's missing-disposition recovery (a "successful run handoff") puts
  * its instructions at the top level of the run context — `handoffRequired`
@@ -57,4 +71,5 @@ export declare function isDispositionRecoveryWake(context: Record<string, unknow
 export declare function renderPaperclipFeatureNote(features: PaperclipFeatures | null): string;
 export declare function renderDispositionHandoffNote(context: Record<string, unknown>): string;
 export declare function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult>;
+export {};
 //# sourceMappingURL=execute.d.ts.map

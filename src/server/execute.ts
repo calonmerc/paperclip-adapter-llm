@@ -12,8 +12,8 @@
  *     at end)
  *   - Post the final assistant output as an issue comment
  *   - Emit typed TranscriptEntry lines so the run viewer renders properly
- *   - Track usage and cost via OpenRouter's /generation endpoint (OpenRouter
- *     only — other providers don't have an equivalent, so cost stays null)
+ *   - Sum usage and cost across every call: OpenRouter's per-response
+ *     usage.cost, else model time × the configured hourlyRateUsd
  *
  * Aligned with @paperclipai/adapter-utils 2026.916.1 API surface:
  *   - PaperclipApi exposes updateIssue / addIssueComment (not updateIssueState / addComment)
@@ -108,6 +108,11 @@ interface ChatCompletionResponse {
     prompt_tokens?: number;
     completion_tokens?: number;
     total_tokens?: number;
+    prompt_tokens_details?: { cached_tokens?: number };
+    /** OpenRouter usage accounting, in USD. Under BYOK it is only OpenRouter's fee. */
+    cost?: number;
+    is_byok?: boolean;
+    cost_details?: { upstream_inference_cost?: number };
   };
 }
 
@@ -170,9 +175,28 @@ function resolveApiKey(config: LlmConfig, authToken: string | undefined): string
   return key;
 }
 
-function resolveBillingType(): "api" | "subscription" {
-  // Every supported provider today is API-key based.
-  return "api";
+function resolveBillingType(costSource: CostSource = "none"): "api" | "fixed" {
+  return costSource === "hourly_rate" ? "fixed" : "api";
+}
+
+type CostSource = "provider" | "hourly_rate" | "none";
+
+/**
+ * Provider-reported cost wins. Self-hosted endpoints have no price, so they
+ * can be billed per hour of model time instead.
+ */
+export function resolveRunCost(opts: {
+  reportedCostUsd: number;
+  sawReportedCost: boolean;
+  modelMs: number;
+  hourlyRateUsd?: number;
+}): { costUsd: number | null; source: CostSource } {
+  if (opts.sawReportedCost) return { costUsd: opts.reportedCostUsd, source: "provider" };
+  const rate = Number(opts.hourlyRateUsd);
+  if (Number.isFinite(rate) && rate > 0) {
+    return { costUsd: (opts.modelMs / 3_600_000) * rate, source: "hourly_rate" };
+  }
+  return { costUsd: null, source: "none" };
 }
 
 function buildHeaders(apiKey: string, config: LlmConfig): Record<string, string> {
@@ -421,6 +445,7 @@ async function callChatCompletions(
       : undefined;
   if (transforms?.length) body.transforms = transforms;
   if (config.route) body.route = config.route;
+  if (isOpenRouter(config.baseUrl)) body.usage = { include: true };
 
   const response = await fetch(endpoints.chat, {
     method: "POST",
@@ -435,31 +460,6 @@ async function callChatCompletions(
 
   const json = (await response.json()) as ChatCompletionResponse;
   return json;
-}
-
-async function fetchGenerationCost(
-  generationId: string,
-  apiKey: string,
-  endpoints: ResolvedEndpoints,
-): Promise<{ costUsd: number | null; inputTokens: number; outputTokens: number }> {
-  const fallback = { costUsd: null as number | null, inputTokens: 0, outputTokens: 0 };
-  try {
-    // OpenRouter's /generation endpoint takes a moment to populate.
-    await new Promise((r) => setTimeout(r, 1500));
-    const res = await fetch(`${endpoints.generation}?id=${encodeURIComponent(generationId)}`, {
-      headers: { Authorization: `Bearer ${apiKey}` },
-    });
-    if (!res.ok) return fallback;
-    const data = (await res.json()) as { data?: Record<string, unknown> };
-    const d = data.data ?? {};
-    return {
-      costUsd: typeof d.total_cost === "number" ? d.total_cost : null,
-      inputTokens: typeof d.tokens_prompt === "number" ? d.tokens_prompt : 0,
-      outputTokens: typeof d.tokens_completion === "number" ? d.tokens_completion : 0,
-    };
-  } catch {
-    return fallback;
-  }
 }
 
 // ----- main -----
@@ -772,6 +772,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       errorMessage: reason,
       errorCode: "missing_api_key",
       usage: { inputTokens: 0, outputTokens: 0 },
+      usageBasis: "per_run",
       model,
       provider,
       biller: provider,
@@ -781,13 +782,32 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
   let lastGenerationId: string | undefined;
   let totalUsage: UsageSummary = { inputTokens: 0, outputTokens: 0 };
+  let reportedCostUsd = 0;
+  let sawReportedCost = false;
+  let modelMs = 0;
   const addUsage = (response: ChatCompletionResponse): void => {
     lastGenerationId = response.id || lastGenerationId;
-    if (!response.usage) return;
+    const usage = response.usage;
+    if (!usage) return;
+    const cached = (totalUsage.cachedInputTokens ?? 0) + (usage.prompt_tokens_details?.cached_tokens ?? 0);
     totalUsage = {
-      inputTokens: totalUsage.inputTokens + (response.usage.prompt_tokens ?? 0),
-      outputTokens: totalUsage.outputTokens + (response.usage.completion_tokens ?? 0),
+      inputTokens: totalUsage.inputTokens + (usage.prompt_tokens ?? 0),
+      outputTokens: totalUsage.outputTokens + (usage.completion_tokens ?? 0),
+      ...(cached > 0 ? { cachedInputTokens: cached } : {}),
     };
+    if (typeof usage.cost === "number") {
+      sawReportedCost = true;
+      reportedCostUsd += usage.cost;
+      if (usage.is_byok) reportedCostUsd += usage.cost_details?.upstream_inference_cost ?? 0;
+    }
+  };
+  const timedChatCall = async (maxTokensOverride?: number): Promise<ChatCompletionResponse> => {
+    const started = performance.now();
+    try {
+      return await callChatCompletions(apiKey, config, endpoints, messages, tools, maxTokensOverride);
+    } finally {
+      modelMs += performance.now() - started;
+    }
   };
   let finalAssistantText = "";
   let turn = 0;
@@ -837,14 +857,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
       let response: ChatCompletionResponse;
       try {
-        response = await callChatCompletions(apiKey, config, endpoints, messages, tools);
+        response = await timedChatCall();
         addUsage(response);
         // An operator-set cap that cuts the turn off gets one retry at double
         // before we fall back to continuing from the partial output.
         const capped = configuredMaxTokens(config);
         if (capped && response.choices?.[0]?.finish_reason === "length") {
           await emitSystem(onLog, `Response cut off at max_tokens (${capped}); retrying this turn with ${capped * 2}.`);
-          response = await callChatCompletions(apiKey, config, endpoints, messages, tools, capped * 2);
+          response = await timedChatCall(capped * 2);
           addUsage(response);
         }
       } catch (err) {
@@ -1052,15 +1072,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
   // ----- post-loop: cost, comment, status -----
 
-  let costUsd: number | null = null;
-  if (lastGenerationId && isOpenRouter(config.baseUrl)) {
-    const cost = await fetchGenerationCost(lastGenerationId, apiKey, endpoints);
-    costUsd = cost.costUsd;
-    // Prefer the generation endpoint's token counts when present (more accurate).
-    if (cost.inputTokens > 0 || cost.outputTokens > 0) {
-      totalUsage = { inputTokens: cost.inputTokens, outputTokens: cost.outputTokens };
-    }
-  }
+  const { costUsd, source: costSource } = resolveRunCost({
+    reportedCostUsd,
+    sawReportedCost,
+    modelMs,
+    hourlyRateUsd: config.hourlyRateUsd,
+  });
 
   // Post the final assistant text as a comment so other agents can see it.
   // Skip it when the model already commented on the issue itself: the text
@@ -1172,10 +1189,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       errorMessage: [runError.message, ...secondaryErrors].join(" — also: "),
       errorCode: runError.code,
       usage: totalUsage,
+      usageBasis: "per_run",
       model,
       provider,
       biller: provider,
-      billingType: resolveBillingType(),
+      billingType: resolveBillingType(costSource),
       costUsd,
       sessionId: lastGenerationId ?? null,
       sessionDisplayId: lastGenerationId ?? null,
@@ -1188,10 +1206,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     signal: null,
     timedOut: false,
     usage: totalUsage,
+    usageBasis: "per_run",
     model,
     provider,
     biller: provider,
-    billingType: resolveBillingType(),
+    billingType: resolveBillingType(costSource),
     costUsd,
     sessionId: lastGenerationId ?? null,
     sessionDisplayId: lastGenerationId ?? null,
