@@ -511,12 +511,60 @@ export function classifyLlmError(err: unknown, now = Date.now()): LlmErrorClass 
   return { code: "llm_request_failed" };
 }
 
+/** In-run retry timing for transient model-call failures. Tests shorten it. */
+export const llmRetry = { delaysMs: [2_000, 8_000], maxRetryAfterMs: 30_000 };
+
+/**
+ * Retries a 5xx, 429 or network failure inside the run, so a brief outage
+ * doesn't end the run and leave the issue behind Paperclip's recovery hold.
+ * Quota errors (402/403) are not retried here: waiting won't fix them.
+ */
+async function withTransientRetry<T>(call: () => Promise<T>, onRetry: (msg: string) => Promise<void>): Promise<T> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await call();
+    } catch (err) {
+      const retryable =
+        err instanceof TypeError ||
+        (err instanceof LlmHttpError && (err.status >= 500 || err.status === 429));
+      if (!retryable || attempt >= llmRetry.delaysMs.length) throw err;
+      const retryAt = err instanceof LlmHttpError ? parseRetryAfter(err.retryAfter, Date.now()) : undefined;
+      const delay = retryAt
+        ? Math.min(Math.max(Date.parse(retryAt) - Date.now(), 0), llmRetry.maxRetryAfterMs)
+        : llmRetry.delaysMs[attempt];
+      await onRetry(`Model call failed (${err instanceof Error ? err.message : String(err)}); retrying in ${Math.round(delay / 1000)}s.`);
+      await new Promise((r) => setTimeout(r, delay));
+    }
+  }
+}
+
 function parseRetryAfter(value: string | null, now: number): string | undefined {
   if (!value) return undefined;
   const seconds = Number(value);
   if (Number.isFinite(seconds) && seconds >= 0) return new Date(now + seconds * 1000).toISOString();
   const date = Date.parse(value);
   return Number.isNaN(date) ? undefined : new Date(date).toISOString();
+}
+
+// Paperclip's conversation-continuation policy (see legacyExecutionNeedsReconciliation).
+const CONVERSATION_CONTINUATION_POLICY = "continue_conversation_v1";
+
+/**
+ * Without evidence, Paperclip holds any run that failed mid-work until a board
+ * user reconciles its actions by API (there's no UI for it). A model-call
+ * failure can only land between tool calls, so nothing is ever half-done:
+ * before any tool ran it's a bootstrap failure; after, the next run continues
+ * from the issue's current state. Either lets Paperclip's bounded retry run.
+ */
+function retryableFailureEvidence(
+  runError: { errorFamily?: AdapterExecutionErrorFamily },
+  toolCallsExecuted: number,
+): Pick<AdapterExecutionResult, "executionRecovery" | "resultJson"> {
+  if (!runError.errorFamily) return {};
+  if (toolCallsExecuted === 0) {
+    return { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } };
+  }
+  return { resultJson: { conversationContinuation: CONVERSATION_CONTINUATION_POLICY } };
 }
 
 // ----- main -----
@@ -861,12 +909,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const timedChatCall = async (maxTokensOverride?: number): Promise<ChatCompletionResponse> => {
     const started = performance.now();
     try {
-      return await callChatCompletions(apiKey, config, endpoints, messages, tools, maxTokensOverride);
+      return await withTransientRetry(
+        () => callChatCompletions(apiKey, config, endpoints, messages, tools, maxTokensOverride),
+        (msg) => emitSystem(onLog, msg),
+      );
     } finally {
       modelMs += performance.now() - started;
     }
   };
   let finalAssistantText = "";
+  let toolCallsExecuted = 0;
   let turn = 0;
   let stoppedReason: "completed" | "max_turns" | "error" | "repeat_loop" = "completed";
   let runError: {
@@ -1046,6 +1098,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           resultContent = JSON.stringify(unknownToolError(toolName, tools));
           isError = true;
         } else {
+          toolCallsExecuted += 1;
           try {
             const out = await tool.execute(args);
             resultContent = out.content;
@@ -1261,6 +1314,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       errorCode: runError.code,
       ...(runError.errorFamily ? { errorFamily: runError.errorFamily } : {}),
       ...(runError.retryNotBefore ? { retryNotBefore: runError.retryNotBefore } : {}),
+      ...retryableFailureEvidence(runError, toolCallsExecuted),
       usage: totalUsage,
       usageBasis: "per_run",
       model,

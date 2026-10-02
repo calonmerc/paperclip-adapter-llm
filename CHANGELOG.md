@@ -11,6 +11,13 @@
   network errors report `transient_upstream`, both with `retryNotBefore` from
   `Retry-After`. Those runs leave the issue `in_progress` with a "Run paused"
   comment so Paperclip's bounded retry picks it up. Other errors still block.
+- That alone didn't clear Paperclip's recovery hold: a run that fails after
+  starting work is held until a board user reconciles it, and there's no UI
+  for that, only the `/recovery-actions/resolve` API. Retryable failures now
+  carry recovery evidence (`executionRecovery: bootstrap` before any tool
+  call, `conversationContinuation` after), so Paperclip retries without the
+  hold. 5xx, 429 and network errors are also retried twice inside the run
+  before failing.
 
 ### Added — agent management
 - **`get_agent`, `update_agent`, `agent_instructions`** tools. Agents on this

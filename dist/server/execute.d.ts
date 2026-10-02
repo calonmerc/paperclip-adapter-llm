@@ -82,6 +82,11 @@ interface LlmErrorClass {
  * other error needs a human, so it still ends with the issue blocked.
  */
 export declare function classifyLlmError(err: unknown, now?: number): LlmErrorClass;
+/** In-run retry timing for transient model-call failures. Tests shorten it. */
+export declare const llmRetry: {
+    delaysMs: number[];
+    maxRetryAfterMs: number;
+};
 export declare function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult>;
 export {};
 //# sourceMappingURL=execute.d.ts.map

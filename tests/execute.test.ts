@@ -27,7 +27,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { execute, resolveRunCost } from "../src/server/execute.js";
+import { execute, llmRetry, resolveRunCost } from "../src/server/execute.js";
 
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "llm-adapter-test-"));
 
@@ -115,12 +115,17 @@ function setupFetchMock(
     chatFailureStatus?: number;
     chatFailureBody?: string;
     chatFailureHeaders?: Record<string, string>;
+    /** Successful chat calls before failures start. */
+    chatFailAfter?: number;
+    /** How many chat calls fail before they succeed again (default: all). */
+    chatFailTimes?: number;
     /** Per-route Paperclip API override; return undefined to fall through to the default 200. */
     api?: (method: string, path: string, body: unknown) => Response | undefined;
   } = {},
 ): { calls: CallLog[]; restore: () => void } {
   const calls: CallLog[] = [];
   const queue = [...chatResponses];
+  let chatCalls = 0;
   const original = globalThis.fetch;
 
   globalThis.fetch = (async (input: any, init?: any) => {
@@ -133,7 +138,13 @@ function setupFetchMock(
     calls.push({ method, path: reqPath, body });
 
     if (reqPath.endsWith("/chat/completions")) {
-      if (opts.chatFailureStatus) {
+      const n = chatCalls++;
+      const failAfter = opts.chatFailAfter ?? 0;
+      if (
+        opts.chatFailureStatus &&
+        n >= failAfter &&
+        (opts.chatFailTimes === undefined || n < failAfter + opts.chatFailTimes)
+      ) {
         return new Response(opts.chatFailureBody ?? "boom", {
           status: opts.chatFailureStatus,
           headers: opts.chatFailureHeaders,
@@ -223,6 +234,8 @@ describe("execute()", () => {
   let originalEnv: NodeJS.ProcessEnv;
 
   beforeEach(() => {
+    llmRetry.delaysMs = [0, 0];
+    llmRetry.maxRetryAfterMs = 0;
     originalEnv = { ...process.env };
     process.env.PAPERCLIP_API_URL = "http://localhost:9999";
     delete process.env.LLM_API_KEY;
@@ -704,6 +717,58 @@ describe("execute()", () => {
     expect(
       fetchMock.calls.some((c) => c.method === "PATCH" && (c.body as any)?.status === "blocked"),
     ).toBe(false);
+  });
+
+  it("retries a transient model-call failure inside the run and carries on", async () => {
+    fetchMock = setupFetchMock([assistantResponse("done")], { chatFailureStatus: 503, chatFailTimes: 2 });
+
+    const result = await execute(makeContext());
+
+    expect(result.exitCode).toBe(0);
+    expect(result.errorCode).toBeUndefined();
+    // Two failed attempts, then the run continues (a disposition nudge may follow).
+    expect(fetchMock.calls.filter((c) => c.path.endsWith("/chat/completions")).length).toBeGreaterThanOrEqual(3);
+  });
+
+  it("does not retry a quota error inside the run", async () => {
+    fetchMock = setupFetchMock([], { chatFailureStatus: 402 });
+
+    await execute(makeContext());
+
+    expect(fetchMock.calls.filter((c) => c.path.endsWith("/chat/completions"))).toHaveLength(1);
+  });
+
+  it("marks a retryable failure before any tool ran as bootstrap, so Paperclip retries without a recovery hold", async () => {
+    fetchMock = setupFetchMock([], { chatFailureStatus: 402 });
+
+    const result = await execute(makeContext());
+
+    expect(result.executionRecovery).toEqual({ kind: "bootstrap", providerWorkStarted: false });
+    expect(result.resultJson).toBeUndefined();
+  });
+
+  it("marks a retryable failure after tool calls for conversation continuation", async () => {
+    // DEBA-63: the quota error landed after eight tool calls, and Paperclip
+    // held the task until a board user reconciled it from the browser console.
+    fetchMock = setupFetchMock(
+      [toolCallResponse([{ id: "call-1", name: "get_issue", args: { issue_id: "issue-1" } }])],
+      { chatFailureStatus: 403, chatFailureBody: "Key limit exceeded (weekly limit)", chatFailAfter: 1 },
+    );
+
+    const result = await execute(makeContext());
+
+    expect(result.errorFamily).toBe("provider_quota");
+    expect(result.executionRecovery).toBeUndefined();
+    expect(result.resultJson).toEqual({ conversationContinuation: "continue_conversation_v1" });
+  });
+
+  it("gives a non-retryable failure no recovery evidence", async () => {
+    fetchMock = setupFetchMock([], { chatFailureStatus: 400 });
+
+    const result = await execute(makeContext());
+
+    expect(result.executionRecovery).toBeUndefined();
+    expect(result.resultJson).toBeUndefined();
   });
 
   it("passes a 429 Retry-After through as retryNotBefore", async () => {
