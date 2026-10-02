@@ -1028,6 +1028,7 @@ export async function execute(ctx) {
         text: finalAssistantText,
         inputTokens: totalUsage.inputTokens,
         outputTokens: totalUsage.outputTokens,
+        cachedTokens: totalUsage.cachedInputTokens,
         costUsd: costUsd ?? 0,
         subtype: stoppedReason,
         isError: stoppedReason === "error",

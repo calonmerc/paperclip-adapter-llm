@@ -13,6 +13,13 @@
   `prompt_tokens_details.cached_tokens`, for any provider that sends it),
   and results set `usageBasis: "per_run"`.
 
+- `create_sub_issue` accepted a human identifier for `parent_issue_id`
+  (e.g. `DEBA-59`) but sent it straight to Paperclip, which rejected it with
+  a bare "parentId: Invalid GUID". It now resolves identifiers to the issue
+  UUID, as `case`'s `link_issue` already did (shared `resolveIssueUuid`).
+- The run's final `result` entry now reports `cachedTokens` instead of
+  always 0.
+
 ### Added
 - **`hourlyRateUsd`** config: self-hosted endpoints (llama-swap, Ollama,
   vLLM) have no price, so cost is the time spent waiting on the model ×

@@ -159,6 +159,13 @@ export function targetsCurrentIssue(ctx: Pick<BuildToolsContext, "currentIssueId
   return issueId === ctx.currentIssueId || (!!ctx.currentIssueIdentifier && issueId === ctx.currentIssueIdentifier);
 }
 
+/** Issue UUID for an id or human identifier (DEBA-59). Paperclip rejects identifiers in id fields like parentId. */
+export async function resolveIssueUuid(ctx: Pick<BuildToolsContext, "api" | "currentIssueId" | "currentIssueIdentifier">, value: string): Promise<string> {
+  if (ctx.currentIssueId && targetsCurrentIssue(ctx, value)) return ctx.currentIssueId;
+  if (isUuid(value)) return value;
+  return String((await ctx.api.getIssue(value)).id);
+}
+
 // Statuses that leave the current issue without a disposition Paperclip will
 // accept at the end of a run: a successful run that leaves its issue
 // in_progress triggers Paperclip's missing-disposition recovery, and
@@ -470,7 +477,7 @@ function createSubIssueTool(ctx: BuildToolsContext): Tool {
         parameters: {
           type: "object",
           properties: {
-            parent_issue_id: { type: "string", description: "Parent issue id. Omit to use current issue." },
+            parent_issue_id: { type: "string", description: "Parent issue id or identifier (e.g. ABC-12). Omit to use current issue." },
             title: { type: "string" },
             description: { type: "string" },
             assignee_agent_id: { type: "string", description: "Optional agent id to assign to." },
@@ -481,17 +488,19 @@ function createSubIssueTool(ctx: BuildToolsContext): Tool {
       },
     },
     execute: async (args) => {
-      const parentId = asString(args.parent_issue_id, ctx.currentIssueId ?? "");
+      const rawParent = asString(args.parent_issue_id, ctx.currentIssueId ?? "").trim();
       const title = asString(args.title);
       if (!title) return fail("title is required.");
-      const payload: Record<string, unknown> = {
-        title,
-        description: args.description ?? "",
-        parentId: parentId || undefined,
-        assigneeAgentId: args.assignee_agent_id ?? undefined,
-        priority: args.priority ?? undefined,
-      };
-      return safeCall("create_sub_issue", () => ctx.api.createIssue(ctx.companyId, payload));
+      return safeCall("create_sub_issue", async () => {
+        const payload: Record<string, unknown> = {
+          title,
+          description: args.description ?? "",
+          parentId: rawParent ? await resolveIssueUuid(ctx, rawParent) : undefined,
+          assigneeAgentId: args.assignee_agent_id ?? undefined,
+          priority: args.priority ?? undefined,
+        };
+        return ctx.api.createIssue(ctx.companyId, payload);
+      });
     },
   };
 }
@@ -1668,7 +1677,7 @@ function caseTool(ctx: BuildToolsContext): Tool {
           const rawIssue = asString(args.issue_id, ctx.currentIssueId ?? "").trim();
           if (!rawIssue) return fail("issue_id is required — there is no current issue.");
           return safeCall("case(link_issue)", async () => {
-            const issueId = isUuid(rawIssue) ? rawIssue : String((await ctx.api.getIssue(rawIssue)).id);
+            const issueId = await resolveIssueUuid(ctx, rawIssue);
             return ctx.api.linkCaseIssue(caseId, { issueId, role });
           });
         }

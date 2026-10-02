@@ -300,6 +300,34 @@ describe("tools.ts", () => {
     });
   });
 
+  it("create_sub_issue resolves an identifier parent to its UUID (run-log regression: 'parentId Invalid GUID')", async () => {
+    const parentUuid = "99a6e396-1d8a-456c-aa07-ef9a1360e7f6";
+    const otherUuid = "11111111-2222-3333-4444-555555555555";
+    const calls: Array<{ method: string; path: string; body: any }> = [];
+    const api = makeApi(async (input: any, init: any) => {
+      const path = new URL(typeof input === "string" ? input : input.url).pathname;
+      calls.push({ method: init?.method ?? "GET", path, body: init?.body ? JSON.parse(init.body) : undefined });
+      if (path === "/api/issues/DEBA-12") return jsonResponse({ id: otherUuid, identifier: "DEBA-12" });
+      return jsonResponse({ id: "issue-child" });
+    });
+    const tools = buildTools({
+      api,
+      agentId: "agent-1",
+      companyId: "company-1",
+      currentIssueId: parentUuid,
+      currentIssueIdentifier: "DEBA-59",
+      autoApprove: false,
+    });
+    const create = findTool(tools, "create_sub_issue")!;
+
+    await create.execute({ parent_issue_id: "DEBA-59", title: "Child of current" });
+    expect(calls.at(-1)?.body.parentId).toBe(parentUuid);
+
+    await create.execute({ parent_issue_id: "DEBA-12", title: "Child of other" });
+    expect(calls.some((c) => c.method === "GET" && c.path === "/api/issues/DEBA-12")).toBe(true);
+    expect(calls.at(-1)?.body.parentId).toBe(otherUuid);
+  });
+
   it("list_issues builds a query string with a default limit", async () => {
     const paths: string[] = [];
     const api = makeApi(async (input: any) => {

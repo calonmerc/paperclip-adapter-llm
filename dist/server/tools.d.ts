@@ -78,6 +78,8 @@ export interface StatusCardTask {
 }
 /** True when `issueId` (absent, the current issue's id, or its identifier) targets the current issue. */
 export declare function targetsCurrentIssue(ctx: Pick<BuildToolsContext, "currentIssueId" | "currentIssueIdentifier">, issueId: unknown): boolean;
+/** Issue UUID for an id or human identifier (DEBA-59). Paperclip rejects identifiers in id fields like parentId. */
+export declare function resolveIssueUuid(ctx: Pick<BuildToolsContext, "api" | "currentIssueId" | "currentIssueIdentifier">, value: string): Promise<string>;
 export declare function libraryFor(ctx: BuildToolsContext): LibraryResolver;
 /** Status-card generation issues carry their target in a ```json block in the description. */
 export declare function parseStatusCardTask(issue: Record<string, unknown>): StatusCardTask | null;
