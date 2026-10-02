@@ -561,6 +561,74 @@ function listIssuesTool(ctx: BuildToolsContext): Tool {
   };
 }
 
+// Source of truth: AGENT_ROLES in @paperclipai/shared/constants.
+const AGENT_ROLES = [
+  "ceo", "cto", "cmo", "cfo", "security", "engineer", "designer", "pm", "qa", "devops", "researcher", "general",
+] as const;
+
+const ROLE_DESCRIPTION =
+  `Role category, one of: ${AGENT_ROLES.join(", ")}. A free-text job title goes in 'title'.`;
+
+/** A free-text role ("Head of Sales") is a job title; models routinely put it in `role`. */
+function splitRoleAndTitle(args: Record<string, unknown>): { role?: string; title?: string } {
+  const role = optionalTrimmed(args.role);
+  const title = optionalTrimmed(args.title) ?? undefined;
+  if (!role) return { title };
+  const normalized = role.toLowerCase();
+  if ((AGENT_ROLES as readonly string[]).includes(normalized)) return { role: normalized, title };
+  return { title: title ?? role };
+}
+
+type AgentRef = { agent: Record<string, unknown> } | { error: ToolExecutionResult };
+
+/**
+ * Resolve an agent by id, name, or title (case-insensitive). Models usually
+ * pass a name ("Dwight") rather than the id list_agents returned.
+ */
+async function resolveAgentRef(ctx: BuildToolsContext, ref: unknown, field = "agent"): Promise<AgentRef> {
+  const wanted = asString(ref).trim();
+  if (!wanted) return { error: fail(`'${field}' is required: an agent id or name from list_agents.`) };
+  let agents: Record<string, unknown>[];
+  try {
+    agents = await ctx.api.listCompanyAgents(ctx.companyId);
+  } catch (err) {
+    const reason = err instanceof PaperclipApiError ? `${err.message} (${err.status})` : err instanceof Error ? err.message : String(err);
+    return { error: fail(`Could not list agents to resolve '${wanted}': ${reason}`) };
+  }
+  const byId = agents.find((a) => a.id === wanted);
+  if (byId) return { agent: byId };
+  const lower = wanted.toLowerCase();
+  for (const key of ["name", "title"]) {
+    const matches = agents.filter((a) => typeof a[key] === "string" && (a[key] as string).toLowerCase() === lower);
+    if (matches.length === 1) return { agent: matches[0] };
+    if (matches.length > 1) {
+      return { error: fail(`'${wanted}' matches ${matches.length} agents; pass the id instead.`, { matches: agentChoices(matches) }) };
+    }
+  }
+  return { error: fail(`No agent matches '${wanted}'. Pass one of these ids or names.`, { agents: agentChoices(agents) }) };
+}
+
+function agentChoices(agents: Record<string, unknown>[]): Array<Record<string, unknown>> {
+  return agents.map((a) => ({ id: a.id, name: a.name, title: a.title ?? null }));
+}
+
+/** Clearing words for `reports_to`; null clears it too. */
+function isClearValue(v: unknown): boolean {
+  return v === null || (typeof v === "string" && ["", "none", "null", "nobody"].includes(v.trim().toLowerCase()));
+}
+
+/** The server decides who may edit agents; on a 403, tell the model how to get the change made. */
+async function agentConfigCall(label: string, fn: () => Promise<unknown>): Promise<ToolExecutionResult> {
+  const result = await safeCall(label, fn);
+  if (!result.isError) return result;
+  const body = JSON.parse(result.content);
+  if (body.detail?.status !== 403) return result;
+  body.next_step =
+    "You lack permission for this change (it needs the agents:configure grant). Ask a human: use " +
+    "request_approval describing the exact change, or update_issue_status blocked with an unblock_action.";
+  return { content: JSON.stringify(body), isError: true };
+}
+
 function hireAgentTool(ctx: BuildToolsContext): Tool {
   return {
     schema: {
@@ -569,35 +637,54 @@ function hireAgentTool(ctx: BuildToolsContext): Tool {
         name: "hire_agent",
         description:
           "Hire a new agent into the company. By default this creates an approval request that a human " +
-          "must approve before the agent is created. Use this when you need a new role on your team.",
+          "must approve before the agent is created. Use this when you need a new role on your team. " +
+          "Call list_agents first to pick the manager for reports_to.",
         parameters: {
           type: "object",
           properties: {
             name: { type: "string" },
-            role: { type: "string", description: "Job title, e.g. 'Senior Engineer'." },
-            mission: { type: "string", description: "What this agent is responsible for." },
+            title: { type: "string", description: "Job title, e.g. 'Senior Engineer'." },
+            role: { type: "string", enum: [...AGENT_ROLES], description: ROLE_DESCRIPTION },
+            capabilities: { type: "string", description: "What this agent is responsible for." },
+            reports_to: { type: "string", description: "Manager's agent id or name." },
             adapter_type: {
               type: "string",
-              description: "Adapter to use, e.g. 'openrouter', 'claude_local'.",
-              default: "openrouter",
+              description: "Adapter to use, e.g. 'llm' (this adapter) or 'claude_local'.",
+              default: "llm",
             },
-            model: { type: "string", description: "Model id, e.g. 'stepfun/step-3.5-flash:free'." },
-            reports_to_agent_id: { type: "string", description: "Manager agent id." },
+            model: { type: "string", description: "Model id, e.g. 'openai/gpt-oss-120b'." },
+            instructions: {
+              type: "string",
+              description: "The new agent's AGENTS.md: its full prompt (who it is, what it owns, how it works).",
+            },
           },
-          required: ["name", "role", "mission"],
+          required: ["name", "title"],
         },
       },
     },
     execute: async (args) => {
+      const name = optionalTrimmed(args.name);
+      if (!name) return fail("hire_agent needs 'name'.");
+      const { role, title } = splitRoleAndTitle(args);
       const payload: Record<string, unknown> = {
-        name: args.name,
-        role: args.role,
-        mission: args.mission,
-        adapterType: args.adapter_type ?? "openrouter",
-        model: args.model,
-        reportsToAgentId: args.reports_to_agent_id,
-        requestedByAgentId: ctx.agentId,
+        name,
+        role: role ?? "general",
+        adapterType: asString(args.adapter_type, "llm"),
       };
+      if (title) payload.title = title;
+      // `mission` was this tool's old name for capabilities; models still send it.
+      const capabilities = optionalTrimmed(args.capabilities) ?? optionalTrimmed(args.mission);
+      if (capabilities) payload.capabilities = capabilities;
+      const model = optionalTrimmed(args.model);
+      if (model) payload.adapterConfig = { model };
+      const instructions = optionalTrimmed(args.instructions);
+      if (instructions) payload.instructionsBundle = { files: { "AGENTS.md": instructions } };
+      const managerRef = args.reports_to ?? args.reports_to_agent_id;
+      if (!isClearValue(managerRef) && managerRef !== undefined) {
+        const manager = await resolveAgentRef(ctx, managerRef, "reports_to");
+        if ("error" in manager) return manager.error;
+        payload.reportsTo = manager.agent.id;
+      }
 
       if (ctx.autoApprove) {
         return safeCall("hire_agent", () => ctx.api.hireAgent(ctx.companyId, payload));
@@ -608,9 +695,281 @@ function hireAgentTool(ctx: BuildToolsContext): Tool {
         ctx.api.createApproval(ctx.companyId, {
           type: "hire_agent",
           requestedByAgentId: ctx.agentId,
-          payload: { ...payload, summary: `Hire ${args.name} as ${args.role}` },
+          payload: { ...payload, summary: `Hire ${name} as ${title ?? role ?? "general"}` },
         }),
       );
+    },
+  };
+}
+
+/** Adapter config keys that are secrets or instruction-bundle plumbing, not useful to the model. */
+const HIDDEN_ADAPTER_CONFIG_KEYS = new Set([
+  "env", "apiKey", "instructionsFilePath", "instructionsRootPath", "instructionsEntryFile",
+  "instructionsBundleMode", "promptTemplate", "bootstrapPromptTemplate", "systemPrompt",
+]);
+
+function getAgentTool(ctx: BuildToolsContext): Tool {
+  return {
+    schema: {
+      type: "function",
+      function: {
+        name: "get_agent",
+        description:
+          "Show one agent's setup: name, title, role, manager, status, adapter and model, other adapter " +
+          "settings, heartbeat, and its instruction files. Read this before changing an agent with " +
+          "update_agent or agent_instructions.",
+        parameters: {
+          type: "object",
+          properties: { agent: { type: "string", description: "Agent id or name." } },
+          required: ["agent"],
+        },
+      },
+    },
+    execute: async (args) => {
+      const ref = await resolveAgentRef(ctx, args.agent);
+      if ("error" in ref) return ref.error;
+      const id = ref.agent.id as string;
+      return safeCall("get_agent", async () => {
+        const agent = await ctx.api.getAgent(id);
+        const adapterConfig = (agent.adapterConfig ?? {}) as Record<string, unknown>;
+        const runtimeConfig = (agent.runtimeConfig ?? {}) as Record<string, unknown>;
+        let manager: Record<string, unknown> | null = null;
+        if (typeof agent.reportsTo === "string") {
+          const all = await ctx.api.listCompanyAgents(ctx.companyId).catch(() => []);
+          const m = all.find((a) => a.id === agent.reportsTo);
+          manager = { id: agent.reportsTo, name: m?.name ?? null };
+        }
+        let instructionFiles: unknown = null;
+        try {
+          const bundle = await ctx.api.getAgentInstructionsBundle(id);
+          instructionFiles = {
+            entryFile: bundle.entryFile ?? null,
+            files: Array.isArray(bundle.files) ? bundle.files.map((f: Record<string, unknown>) => f.path) : [],
+          };
+        } catch (err) {
+          instructionFiles = { unavailable: err instanceof Error ? err.message : String(err) };
+        }
+        return {
+          id: agent.id,
+          name: agent.name,
+          title: agent.title ?? null,
+          role: agent.role,
+          status: agent.status,
+          reportsTo: manager,
+          capabilities: agent.capabilities ?? null,
+          adapterType: agent.adapterType,
+          model: adapterConfig.model ?? null,
+          adapterConfig: Object.fromEntries(
+            Object.entries(adapterConfig).filter(([k]) => !HIDDEN_ADAPTER_CONFIG_KEYS.has(k) && k !== "model"),
+          ),
+          heartbeat: runtimeConfig.heartbeat ?? null,
+          instructions: instructionFiles,
+        };
+      });
+    },
+  };
+}
+
+const UPDATE_AGENT_FIELDS = [
+  "name", "title", "role", "reports_to", "capabilities", "adapter_type", "model", "adapter_config",
+  "heartbeat_enabled", "heartbeat_interval_sec", "status",
+];
+
+function updateAgentTool(ctx: BuildToolsContext): Tool {
+  return {
+    schema: {
+      type: "function",
+      function: {
+        name: "update_agent",
+        description:
+          "Change an existing agent: name, job title, role, who it reports to, its responsibilities, its " +
+          "adapter (harness) and model, other adapter settings, its heartbeat schedule, or pause/resume it. " +
+          "Send only the fields to change. To change what the agent is told to do (its prompt), use " +
+          "agent_instructions instead.",
+        parameters: {
+          type: "object",
+          properties: {
+            agent: { type: "string", description: "Agent id or name to change." },
+            name: { type: "string" },
+            title: { type: "string", description: "Job title, e.g. 'VP of Sales'." },
+            role: { type: "string", enum: [...AGENT_ROLES], description: ROLE_DESCRIPTION },
+            reports_to: {
+              type: ["string", "null"],
+              description: "New manager's agent id or name. 'none' or null removes the manager.",
+            },
+            capabilities: { type: "string", description: "What this agent is responsible for." },
+            adapter_type: { type: "string", description: "Adapter (harness), e.g. 'llm' or 'claude_local'." },
+            model: { type: "string", description: "Model id, e.g. 'openai/gpt-oss-120b'." },
+            adapter_config: {
+              type: "object",
+              description: "Other adapter settings to set, merged into the existing ones (e.g. {\"maxTurns\": 30}).",
+            },
+            heartbeat_enabled: { type: "boolean", description: "Whether the agent wakes on a timer." },
+            heartbeat_interval_sec: { type: "number", description: "Seconds between timer wakes." },
+            status: { type: "string", enum: ["paused", "active"], description: "Pause or resume the agent." },
+          },
+          required: ["agent"],
+        },
+      },
+    },
+    execute: async (args) => {
+      const ref = await resolveAgentRef(ctx, args.agent);
+      if ("error" in ref) return ref.error;
+      const id = ref.agent.id as string;
+
+      const patch: Record<string, unknown> = {};
+      const name = optionalTrimmed(args.name);
+      if (name) patch.name = name;
+      const { role, title } = splitRoleAndTitle(args);
+      if (role) patch.role = role;
+      if (title) patch.title = title;
+      const capabilities = optionalTrimmed(args.capabilities);
+      if (capabilities) patch.capabilities = capabilities;
+      const adapterType = optionalTrimmed(args.adapter_type);
+      if (adapterType) patch.adapterType = adapterType;
+
+      if ("reports_to" in args) {
+        if (isClearValue(args.reports_to)) {
+          patch.reportsTo = null;
+        } else {
+          const manager = await resolveAgentRef(ctx, args.reports_to, "reports_to");
+          if ("error" in manager) return manager.error;
+          if (manager.agent.id === id) return fail("An agent cannot report to itself. Pick a different reports_to.");
+          patch.reportsTo = manager.agent.id;
+        }
+      }
+
+      const adapterConfig: Record<string, unknown> = {};
+      if (args.adapter_config !== undefined) {
+        if (!args.adapter_config || typeof args.adapter_config !== "object" || Array.isArray(args.adapter_config)) {
+          return fail("adapter_config must be an object of settings, e.g. {\"maxTurns\": 30}.");
+        }
+        Object.assign(adapterConfig, args.adapter_config);
+      }
+      const model = optionalTrimmed(args.model);
+      if (model) adapterConfig.model = model;
+      // Paperclip merges adapterConfig into the existing one unless replaceAdapterConfig is set.
+      if (Object.keys(adapterConfig).length > 0) patch.adapterConfig = adapterConfig;
+
+      const wantsHeartbeat = typeof args.heartbeat_enabled === "boolean" || args.heartbeat_interval_sec !== undefined;
+      const interval = Number(args.heartbeat_interval_sec);
+      if (args.heartbeat_interval_sec !== undefined && !(Number.isFinite(interval) && interval > 0)) {
+        return fail("heartbeat_interval_sec must be a positive number of seconds.");
+      }
+
+      const status = optionalTrimmed(args.status)?.toLowerCase();
+      if (status && status !== "paused" && status !== "active") {
+        return fail("status must be 'paused' or 'active'. Agents cannot be terminated with this tool.");
+      }
+
+      if (Object.keys(patch).length === 0 && !wantsHeartbeat && !status) {
+        return fail(`Nothing to change. Pass at least one of: ${UPDATE_AGENT_FIELDS.join(", ")}.`);
+      }
+
+      return agentConfigCall("update_agent", async () => {
+        if (wantsHeartbeat) {
+          // runtimeConfig is replaced wholesale, so merge over the current one.
+          const current = ((await ctx.api.getAgent(id)).runtimeConfig ?? {}) as Record<string, unknown>;
+          const heartbeat = { ...((current.heartbeat ?? {}) as Record<string, unknown>) };
+          if (typeof args.heartbeat_enabled === "boolean") heartbeat.enabled = args.heartbeat_enabled;
+          if (args.heartbeat_interval_sec !== undefined) heartbeat.intervalSec = Math.round(interval);
+          patch.runtimeConfig = { ...current, heartbeat };
+        }
+        let updated: Record<string, unknown> | null = null;
+        if (Object.keys(patch).length > 0) updated = await ctx.api.updateAgent(id, patch);
+        if (status === "paused") updated = await ctx.api.pauseAgent(id);
+        if (status === "active") updated = await ctx.api.resumeAgent(id);
+        const u = updated ?? {};
+        return {
+          updated: Object.keys(patch).concat(status ? ["status"] : []),
+          agent: {
+            id: u.id ?? id,
+            name: u.name ?? null,
+            title: u.title ?? null,
+            role: u.role ?? null,
+            status: u.status ?? null,
+            reportsTo: u.reportsTo ?? null,
+            adapterType: u.adapterType ?? null,
+            model: ((u.adapterConfig ?? {}) as Record<string, unknown>).model ?? null,
+          },
+        };
+      });
+    },
+  };
+}
+
+function agentInstructionsTool(ctx: BuildToolsContext): Tool {
+  return {
+    schema: {
+      type: "function",
+      function: {
+        name: "agent_instructions",
+        description:
+          "Read or change an agent's instruction files: its prompt (usually AGENTS.md), which it reads " +
+          "at the start of every run. action='list' shows the files; 'read' returns one; 'write' REPLACES " +
+          "the whole file with 'content' (read it first and send the complete new text); 'append' adds " +
+          "'content' to the end. Changes take effect on the agent's next run.",
+        parameters: {
+          type: "object",
+          properties: {
+            agent: { type: "string", description: "Agent id or name." },
+            action: { type: "string", enum: ["list", "read", "write", "append"] },
+            path: { type: "string", description: "File path in the bundle. Omit for the main file (AGENTS.md)." },
+            content: { type: "string", description: "For write: the full new file. For append: the text to add." },
+          },
+          required: ["agent", "action"],
+        },
+      },
+    },
+    execute: async (args) => {
+      const action = asString(args.action);
+      if (!["list", "read", "write", "append"].includes(action)) {
+        return fail("action must be one of: list, read, write, append.");
+      }
+      const content = typeof args.content === "string" ? args.content : "";
+      if ((action === "write" || action === "append") && !content.trim()) {
+        return fail(`action='${action}' needs 'content'.`);
+      }
+      const ref = await resolveAgentRef(ctx, args.agent);
+      if ("error" in ref) return ref.error;
+      const id = ref.agent.id as string;
+      const label = `agent_instructions ${action}`;
+
+      if (action === "list") {
+        return agentConfigCall(label, async () => {
+          const bundle = await ctx.api.getAgentInstructionsBundle(id);
+          return {
+            agent: ref.agent.name,
+            entryFile: bundle.entryFile ?? null,
+            files: Array.isArray(bundle.files)
+              ? bundle.files.map((f: Record<string, unknown>) => ({ path: f.path, size: f.size }))
+              : [],
+          };
+        });
+      }
+
+      return agentConfigCall(label, async () => {
+        let path = optionalTrimmed(args.path);
+        if (!path) {
+          const bundle = await ctx.api.getAgentInstructionsBundle(id).catch(() => null);
+          path = typeof bundle?.entryFile === "string" ? bundle.entryFile : "AGENTS.md";
+        }
+        if (action === "read") {
+          const file = await ctx.api.readAgentInstructionsFile(id, path);
+          return { agent: ref.agent.name, path: file.path ?? path, content: file.content ?? "" };
+        }
+        let body = content;
+        if (action === "append") {
+          const existing = await ctx.api.readAgentInstructionsFile(id, path).catch((err) => {
+            if (err instanceof PaperclipApiError && err.status === 404) return { content: "" };
+            throw err;
+          });
+          const current = typeof existing.content === "string" ? existing.content.replace(/\s+$/, "") : "";
+          body = current ? `${current}\n\n${content}` : content;
+        }
+        const file = await ctx.api.writeAgentInstructionsFile(id, path, body);
+        return { agent: ref.agent.name, path: file.path ?? path, size: file.size ?? body.length, action };
+      });
     },
   };
 }
@@ -624,7 +983,8 @@ function listAgentsTool(ctx: BuildToolsContext): Tool {
         description:
           "List all agents (teammates) in the current company. Returns each agent's id, name, " +
           "role, title, adapter type, model, and status. Use this BEFORE delegating work with " +
-          "create_sub_issue or hire_agent so you can reference real agent ids instead of guessing.",
+          "create_sub_issue or hire_agent so you can reference real agent ids instead of guessing. To change " +
+          "an agent, use get_agent, update_agent, and agent_instructions.",
         parameters: {
           type: "object",
           properties: {},
@@ -2012,6 +2372,9 @@ export function buildTools(ctx: BuildToolsContext): Tool[] {
     listIssuesTool(ctx),
     listAgentsTool(ctx),
     hireAgentTool(ctx),
+    getAgentTool(ctx),
+    updateAgentTool(ctx),
+    agentInstructionsTool(ctx),
     requestApprovalTool(ctx),
     askUserQuestionsTool(ctx),
     listInteractionsTool(ctx),

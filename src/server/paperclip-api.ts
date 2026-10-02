@@ -245,6 +245,41 @@ export class PaperclipApi {
     return this.request("POST", `/api/companies/${encodeURIComponent(companyId)}/agent-hires`, hire);
   }
 
+  getAgent(agentId: string): Promise<Record<string, unknown>> {
+    return this.request("GET", `/api/agents/${encodeURIComponent(agentId)}`);
+  }
+
+  updateAgent(agentId: string, patch: Record<string, unknown>): Promise<Record<string, unknown>> {
+    return this.request("PATCH", `/api/agents/${encodeURIComponent(agentId)}`, patch);
+  }
+
+  pauseAgent(agentId: string): Promise<Record<string, unknown>> {
+    return this.request("POST", `/api/agents/${encodeURIComponent(agentId)}/pause`, {});
+  }
+
+  resumeAgent(agentId: string): Promise<Record<string, unknown>> {
+    return this.request("POST", `/api/agents/${encodeURIComponent(agentId)}/resume`, {});
+  }
+
+  /** The agent's managed instruction files (AGENTS.md etc.): entryFile plus file summaries, no content. */
+  getAgentInstructionsBundle(agentId: string): Promise<Record<string, unknown>> {
+    return this.request("GET", `/api/agents/${encodeURIComponent(agentId)}/instructions-bundle`);
+  }
+
+  readAgentInstructionsFile(agentId: string, path: string): Promise<Record<string, unknown>> {
+    return this.request(
+      "GET",
+      `/api/agents/${encodeURIComponent(agentId)}/instructions-bundle/file?path=${encodeURIComponent(path)}`,
+    );
+  }
+
+  writeAgentInstructionsFile(agentId: string, path: string, content: string): Promise<Record<string, unknown>> {
+    return this.request("PUT", `/api/agents/${encodeURIComponent(agentId)}/instructions-bundle/file`, {
+      path,
+      content,
+    });
+  }
+
   wakeAgent(agentId: string, body: Record<string, unknown>): Promise<Record<string, unknown>> {
     return this.request("POST", `/api/agents/${encodeURIComponent(agentId)}/wakeup`, body);
   }

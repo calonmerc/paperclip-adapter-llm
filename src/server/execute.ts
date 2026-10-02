@@ -146,6 +146,10 @@ const DEFAULT_SYSTEM_PROMPT =
   "You have no shell, no bash, and no curl. To call an external API use http_request; reference bound " +
   "credentials as {{secret:NAME}} (list_secrets shows the names) and never ask for, print, or store a " +
   "secret's value. " +
+  "Where a skill says to call the Paperclip agent API (PATCH /api/agents/..., instructions-bundle), use " +
+  "the tools instead: get_agent to inspect an agent, update_agent to change its title, role, manager " +
+  "(reports_to), adapter, model, or heartbeat, and agent_instructions to read or edit its prompt " +
+  "(AGENTS.md). Call list_agents first. " +
   "All storage is Paperclip documents that humans can see — there is no hidden, private, or file " +
   "storage, no filesystem, and no shell. A task's own deliverables (a report, plan, spec, write-up) go " +
   "on its issue via issue_document. Anything shared across tasks or agents — running logs, brief " +

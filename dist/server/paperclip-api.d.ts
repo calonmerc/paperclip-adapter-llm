@@ -99,6 +99,14 @@ export declare class PaperclipApi {
      */
     listCompanyAgents(companyId: string): Promise<Record<string, unknown>[]>;
     hireAgent(companyId: string, hire: Record<string, unknown>): Promise<Record<string, unknown>>;
+    getAgent(agentId: string): Promise<Record<string, unknown>>;
+    updateAgent(agentId: string, patch: Record<string, unknown>): Promise<Record<string, unknown>>;
+    pauseAgent(agentId: string): Promise<Record<string, unknown>>;
+    resumeAgent(agentId: string): Promise<Record<string, unknown>>;
+    /** The agent's managed instruction files (AGENTS.md etc.): entryFile plus file summaries, no content. */
+    getAgentInstructionsBundle(agentId: string): Promise<Record<string, unknown>>;
+    readAgentInstructionsFile(agentId: string, path: string): Promise<Record<string, unknown>>;
+    writeAgentInstructionsFile(agentId: string, path: string, content: string): Promise<Record<string, unknown>>;
     wakeAgent(agentId: string, body: Record<string, unknown>): Promise<Record<string, unknown>>;
     /** Secrets bound to this agent with "API access" — metadata only, never values. */
     listAgentSecretAccess(): Promise<{

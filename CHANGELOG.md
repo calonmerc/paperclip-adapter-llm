@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+### Added — agent management
+- **`get_agent`, `update_agent`, `agent_instructions`** tools. Agents on this
+  adapter could list and hire agents but not change one, so a CEO couldn't
+  edit another agent's prompt, adapter/model, heartbeat, manager, or title —
+  things it does under Claude Code by curling `/api/agents/...`. Agents are
+  referenced by id, name, or title. Paperclip enforces permission
+  (`agents:configure`); a 403 tells the model to ask a human.
+
+### Fixed — `hire_agent`
+- `hire_agent` sent fields Paperclip no longer reads: `reportsToAgentId`,
+  `mission`, and a top-level `model` were dropped, and a job title in `role`
+  failed Paperclip's role enum. It now sends `title`, `role` (enum; free text
+  becomes the title), `reportsTo` (id or name), `capabilities` (`mission`
+  still accepted), and `adapterConfig.model`, defaults `adapterType` to
+  `llm`, and accepts `instructions` for the new agent's `AGENTS.md`.
+
 ### Fixed — run cost and usage
 - OpenRouter runs reported the cost of the **last** call only: cost came
   from one `/generation` lookup on the final generation id, after a 1.5s

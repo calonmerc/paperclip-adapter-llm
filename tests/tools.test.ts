@@ -32,12 +32,19 @@ function jsonResponse(body: unknown, status = 200): Response {
   });
 }
 
+const AGENTS = [
+  { id: "agent-ceo", name: "Michael", title: "CEO", role: "ceo", adapterType: "llm", status: "idle" },
+  { id: "agent-dwight", name: "Dwight", title: "Sales Lead", role: "general", adapterType: "llm", status: "idle", reportsTo: "agent-ceo" },
+  { id: "agent-jim", name: "Jim", title: "Sales", role: "general", adapterType: "llm", status: "idle" },
+  { id: "agent-jim2", name: "Jim", title: "Intern", role: "general", adapterType: "llm", status: "idle" },
+];
+
 describe("tools.ts", () => {
   it("toolSchemas() returns one schema per tool, matching buildTools()'s output", () => {
     const api = makeApi(async () => jsonResponse({}));
     const tools = buildTools({ api, agentId: "agent-1", companyId: "company-1", currentIssueId: null, autoApprove: false });
 
-    expect(tools.length).toBe(15);
+    expect(tools.length).toBe(18);
     const names = toolSchemas(tools).map((s) => s.function.name);
     expect(names).toEqual([
       "get_issue",
@@ -49,6 +56,9 @@ describe("tools.ts", () => {
       "list_issues",
       "list_agents",
       "hire_agent",
+      "get_agent",
+      "update_agent",
+      "agent_instructions",
       "request_approval",
       "ask_user_questions",
       "list_interactions",
@@ -212,32 +222,52 @@ describe("tools.ts", () => {
     expect(result.content).toContain("No issue_id supplied");
   });
 
-  it("hire_agent routes through createApproval when autoApprove is false", async () => {
-    const paths: string[] = [];
-    const api = makeApi(async (input: any) => {
-      paths.push(new URL(typeof input === "string" ? input : input.url).pathname);
+  it("hire_agent routes through createApproval with Paperclip's field names when autoApprove is false", async () => {
+    const calls: Array<{ path: string; body: any }> = [];
+    const api = makeApi(async (input: any, init: any) => {
+      const url = new URL(typeof input === "string" ? input : input.url);
+      calls.push({ path: url.pathname, body: init?.body ? JSON.parse(init.body) : null });
+      if (url.pathname === "/api/companies/company-1/agents") return jsonResponse(AGENTS);
       return jsonResponse({ ok: true });
     });
     const tools = buildTools({ api, agentId: "agent-1", companyId: "company-1", currentIssueId: null, autoApprove: false });
 
-    await findTool(tools, "hire_agent")!.execute({ name: "Sam", role: "Engineer", mission: "Ship things" });
+    await findTool(tools, "hire_agent")!.execute({
+      name: "Sam", role: "Senior Engineer", mission: "Ship things", reports_to: "michael", model: "openai/gpt-oss-120b",
+    });
 
-    expect(paths).toContain("/api/companies/company-1/approvals");
-    expect(paths).not.toContain("/api/companies/company-1/agent-hires");
+    const approval = calls.find((c) => c.path === "/api/companies/company-1/approvals");
+    expect(approval?.body.payload).toMatchObject({
+      name: "Sam",
+      role: "general",
+      title: "Senior Engineer",
+      capabilities: "Ship things",
+      reportsTo: "agent-ceo",
+      adapterType: "llm",
+      adapterConfig: { model: "openai/gpt-oss-120b" },
+    });
+    expect(calls.map((c) => c.path)).not.toContain("/api/companies/company-1/agent-hires");
   });
 
-  it("hire_agent calls hireAgent directly when autoApprove is true", async () => {
-    const paths: string[] = [];
-    const api = makeApi(async (input: any) => {
-      paths.push(new URL(typeof input === "string" ? input : input.url).pathname);
+  it("hire_agent calls hireAgent directly when autoApprove is true, with instructions as AGENTS.md", async () => {
+    const calls: Array<{ path: string; body: any }> = [];
+    const api = makeApi(async (input: any, init: any) => {
+      const url = new URL(typeof input === "string" ? input : input.url);
+      calls.push({ path: url.pathname, body: init?.body ? JSON.parse(init.body) : null });
       return jsonResponse({ ok: true });
     });
     const tools = buildTools({ api, agentId: "agent-1", companyId: "company-1", currentIssueId: null, autoApprove: true });
 
-    await findTool(tools, "hire_agent")!.execute({ name: "Sam", role: "Engineer", mission: "Ship things" });
+    await findTool(tools, "hire_agent")!.execute({ name: "Sam", title: "Engineer", role: "engineer", instructions: "You are Sam." });
 
-    expect(paths).toContain("/api/companies/company-1/agent-hires");
-    expect(paths).not.toContain("/api/companies/company-1/approvals");
+    const hire = calls.find((c) => c.path === "/api/companies/company-1/agent-hires");
+    expect(hire?.body).toMatchObject({
+      role: "engineer",
+      title: "Engineer",
+      instructionsBundle: { files: { "AGENTS.md": "You are Sam." } },
+    });
+    expect(hire?.body).not.toHaveProperty("reportsTo");
+    expect(calls.map((c) => c.path)).not.toContain("/api/companies/company-1/approvals");
   });
 
   it("add_comment posts to the current issue and requires a body", async () => {
@@ -566,6 +596,166 @@ describe("tools.ts", () => {
     const result = await findTool(tools, "ask_user_questions")!.execute({ questions: [{ prompt: "Which one?" }] });
     expect(result.isError).toBe(true);
     expect(result.content).toContain("No current issue");
+  });
+});
+
+/** Fake Paperclip agent API: list, get, patch, pause/resume, and an in-memory instructions bundle. */
+function fakeAgentServer(opts: { files?: Record<string, string>; forbidWrites?: boolean } = {}) {
+  const files: Record<string, string> = { ...(opts.files ?? { "AGENTS.md": "You are Dwight." }) };
+  const calls: Array<{ method: string; path: string; body: any }> = [];
+  const dwight = {
+    ...AGENTS[1],
+    adapterConfig: { model: "old-model", env: { SECRET: "x" }, instructionsFilePath: "/x/AGENTS.md", maxTurns: 20 },
+    runtimeConfig: { heartbeat: { enabled: false, intervalSec: 3600 }, other: 1 },
+  };
+  const api = makeApi(async (input: any, init: any) => {
+    const url = new URL(typeof input === "string" ? input : input.url);
+    const method = init?.method ?? "GET";
+    const body = init?.body ? JSON.parse(init.body) : null;
+    calls.push({ method, path: url.pathname, body });
+    const forbidden = () => jsonResponse({ error: "Missing permission agents:configure" }, 403);
+    if (url.pathname === "/api/companies/company-1/agents") return jsonResponse(AGENTS);
+    if (url.pathname === "/api/agents/agent-dwight" && method === "GET") return jsonResponse(dwight);
+    if (url.pathname === "/api/agents/agent-dwight" && method === "PATCH") {
+      if (opts.forbidWrites) return forbidden();
+      return jsonResponse({ ...dwight, ...body, adapterConfig: { ...dwight.adapterConfig, ...(body.adapterConfig ?? {}) } });
+    }
+    if (url.pathname === "/api/agents/agent-dwight/pause") return jsonResponse({ ...dwight, status: "paused" });
+    if (url.pathname === "/api/agents/agent-dwight/instructions-bundle") {
+      return jsonResponse({ entryFile: "AGENTS.md", files: Object.keys(files).map((p) => ({ path: p, size: files[p].length })) });
+    }
+    if (url.pathname === "/api/agents/agent-dwight/instructions-bundle/file") {
+      if (method === "GET") {
+        const p = url.searchParams.get("path")!;
+        return p in files ? jsonResponse({ path: p, content: files[p] }) : jsonResponse({ error: "Instructions file not found" }, 404);
+      }
+      if (opts.forbidWrites) return forbidden();
+      files[body.path] = body.content;
+      return jsonResponse({ path: body.path, size: body.content.length });
+    }
+    return jsonResponse({ error: `unexpected ${method} ${url.pathname}` }, 500);
+  });
+  const tools = buildTools({ api, agentId: "agent-ceo", companyId: "company-1", currentIssueId: null, autoApprove: false });
+  return { tools, calls, files };
+}
+
+describe("agent management", () => {
+  it("resolves an agent by id, by name case-insensitively, and by title", async () => {
+    for (const ref of ["agent-dwight", "dwight", "SALES LEAD"]) {
+      const { tools } = fakeAgentServer();
+      const result = await findTool(tools, "get_agent")!.execute({ agent: ref });
+      expect(result.isError).toBe(false);
+      expect(JSON.parse(result.content).id).toBe("agent-dwight");
+    }
+  });
+
+  it("lists the candidates when an agent ref is ambiguous or unknown", async () => {
+    const { tools } = fakeAgentServer();
+    const ambiguous = JSON.parse((await findTool(tools, "get_agent")!.execute({ agent: "Jim" })).content);
+    expect(ambiguous.error).toContain("matches 2 agents");
+    expect(ambiguous.detail.matches.map((m: any) => m.id)).toEqual(["agent-jim", "agent-jim2"]);
+
+    const unknown = JSON.parse((await findTool(tools, "update_agent")!.execute({ agent: "Pam", title: "x" })).content);
+    expect(unknown.error).toContain("No agent matches 'Pam'");
+    expect(unknown.detail.agents).toHaveLength(AGENTS.length);
+  });
+
+  it("get_agent hides secrets and instruction plumbing, and names the manager", async () => {
+    const { tools } = fakeAgentServer();
+    const agent = JSON.parse((await findTool(tools, "get_agent")!.execute({ agent: "Dwight" })).content);
+    expect(agent.reportsTo).toEqual({ id: "agent-ceo", name: "Michael" });
+    expect(agent.model).toBe("old-model");
+    expect(agent.adapterConfig).toEqual({ maxTurns: 20 });
+    expect(agent.instructions).toEqual({ entryFile: "AGENTS.md", files: ["AGENTS.md"] });
+  });
+
+  it("update_agent maps reports_to, model, and a free-text role into Paperclip's fields", async () => {
+    const { tools, calls } = fakeAgentServer();
+    const result = await findTool(tools, "update_agent")!.execute({
+      agent: "Dwight", role: "VP of Sales", reports_to: "Sales", model: "new-model",
+    });
+    expect(result.isError).toBe(false);
+    const patch = calls.find((c) => c.method === "PATCH")!.body;
+    expect(patch).toEqual({ title: "VP of Sales", reportsTo: "agent-jim", adapterConfig: { model: "new-model" } });
+  });
+
+  it("update_agent clears the manager with reports_to 'none' and refuses self-reporting", async () => {
+    const { tools, calls } = fakeAgentServer();
+    await findTool(tools, "update_agent")!.execute({ agent: "Dwight", reports_to: "none" });
+    expect(calls.find((c) => c.method === "PATCH")!.body).toEqual({ reportsTo: null });
+
+    const self = await findTool(tools, "update_agent")!.execute({ agent: "Dwight", reports_to: "Dwight" });
+    expect(self.isError).toBe(true);
+    expect(self.content).toContain("cannot report to itself");
+  });
+
+  it("update_agent merges heartbeat changes over the existing runtimeConfig", async () => {
+    const { tools, calls } = fakeAgentServer();
+    await findTool(tools, "update_agent")!.execute({ agent: "Dwight", heartbeat_enabled: true });
+    expect(calls.find((c) => c.method === "PATCH")!.body.runtimeConfig).toEqual({
+      heartbeat: { enabled: true, intervalSec: 3600 },
+      other: 1,
+    });
+  });
+
+  it("update_agent pauses through the pause endpoint", async () => {
+    const { tools, calls } = fakeAgentServer();
+    const result = JSON.parse((await findTool(tools, "update_agent")!.execute({ agent: "Dwight", status: "paused" })).content);
+    expect(calls.some((c) => c.path === "/api/agents/agent-dwight/pause")).toBe(true);
+    expect(calls.some((c) => c.method === "PATCH")).toBe(false);
+    expect(result.agent.status).toBe("paused");
+  });
+
+  it("update_agent with nothing to change lists the editable fields", async () => {
+    const { tools } = fakeAgentServer();
+    const result = await findTool(tools, "update_agent")!.execute({ agent: "Dwight" });
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain("reports_to");
+    expect(result.content).toContain("heartbeat_enabled");
+  });
+
+  it("update_agent turns a 403 into a next step instead of a bare failure", async () => {
+    const { tools } = fakeAgentServer({ forbidWrites: true });
+    const result = await findTool(tools, "update_agent")!.execute({ agent: "Dwight", title: "VP" });
+    expect(result.isError).toBe(true);
+    const body = JSON.parse(result.content);
+    expect(body.error).toContain("Missing permission agents:configure");
+    expect(body.next_step).toContain("request_approval");
+  });
+
+  it("agent_instructions lists, reads the entry file by default, writes, and appends", async () => {
+    const { tools, files } = fakeAgentServer();
+    const tool = findTool(tools, "agent_instructions")!;
+
+    const list = JSON.parse((await tool.execute({ agent: "Dwight", action: "list" })).content);
+    expect(list.files).toEqual([{ path: "AGENTS.md", size: 15 }]);
+
+    const read = JSON.parse((await tool.execute({ agent: "Dwight", action: "read" })).content);
+    expect(read).toMatchObject({ path: "AGENTS.md", content: "You are Dwight." });
+
+    await tool.execute({ agent: "Dwight", action: "append", content: "Report weekly." });
+    expect(files["AGENTS.md"]).toBe("You are Dwight.\n\nReport weekly.");
+
+    await tool.execute({ agent: "Dwight", action: "write", path: "TOOLS.md", content: "Use the CRM." });
+    expect(files["TOOLS.md"]).toBe("Use the CRM.");
+  });
+
+  it("agent_instructions append creates a missing file, and write requires content", async () => {
+    const { tools, files } = fakeAgentServer({ files: {} });
+    const tool = findTool(tools, "agent_instructions")!;
+    await tool.execute({ agent: "Dwight", action: "append", path: "NOTES.md", content: "First." });
+    expect(files["NOTES.md"]).toBe("First.");
+
+    const empty = await tool.execute({ agent: "Dwight", action: "write" });
+    expect(empty.isError).toBe(true);
+    expect(empty.content).toContain("needs 'content'");
+  });
+
+  it("agent_instructions surfaces a 403 with a next step", async () => {
+    const { tools } = fakeAgentServer({ forbidWrites: true });
+    const result = await findTool(tools, "agent_instructions")!.execute({ agent: "Dwight", action: "write", content: "x" });
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content).next_step).toContain("agents:configure");
   });
 });
 
