@@ -449,6 +449,20 @@ function retryableFailureEvidence(runError, toolCallsExecuted) {
     }
     return { resultJson: { conversationContinuation: CONVERSATION_CONTINUATION_POLICY } };
 }
+const REPEAT_WARNING = "You sent this exact call last time and got the same error. Change the arguments as the error says — " +
+    "one more identical call stops the run.";
+function appendRepeatWarning(resultContent) {
+    try {
+        const parsed = JSON.parse(resultContent);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+            return JSON.stringify({ ...parsed, warning: REPEAT_WARNING });
+        }
+    }
+    catch {
+        // Not JSON: append as text.
+    }
+    return `${resultContent}\n\n${REPEAT_WARNING}`;
+}
 // ----- main -----
 export async function execute(ctx) {
     const config = (ctx.config ?? {});
@@ -950,6 +964,12 @@ export async function execute(ctx) {
                         isError = true;
                     }
                 }
+                const callSig = `${toolName}::${JSON.stringify(args)}`;
+                // The model gets no other signal that the guard below is about to end
+                // the run; weak models resend a failing call verbatim.
+                if (isError && recentCalls[recentCalls.length - 1] === callSig) {
+                    resultContent = appendRepeatWarning(resultContent);
+                }
                 await emitToolResult(onLog, {
                     toolUseId: tc.id,
                     toolName,
@@ -974,8 +994,6 @@ export async function execute(ctx) {
                     tool_call_id: tc.id,
                     content: resultContent,
                 });
-                // Track repeat calls
-                const callSig = `${toolName}::${JSON.stringify(args)}`;
                 recentCalls.push(callSig);
                 if (recentCalls.length > REPEAT_THRESHOLD)
                     recentCalls.shift();

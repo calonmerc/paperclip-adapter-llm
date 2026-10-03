@@ -1002,6 +1002,53 @@ describe("execute()", () => {
     expect(resultEntry?.subtype).toBe("repeat_loop");
   });
 
+  it("warns on a 2nd identical failing call so the model can fix it before the repeat guard fires", async () => {
+    // DEBA-66: glm-5.3-flash sent library(append) without `key` three times
+    // and the run was stopped as a repeat loop.
+    const noKey = toolCallResponse([
+      { id: "call-a", name: "library", args: { action: "append", body: "## Cleanup log\n\nNo removals." } },
+    ]);
+    const withKey = toolCallResponse([
+      {
+        id: "call-b",
+        name: "library",
+        args: { action: "append", key: "content-log", body: "## Cleanup log\n\nNo removals." },
+      },
+    ]);
+    fetchMock = setupFetchMock([noKey, noKey, withKey, assistantResponse("Logged.")], {
+      api: (method, path) => {
+        if (method !== "GET") return undefined;
+        if (path === "/api/companies/company-1/issues") {
+          return Response.json([
+            { id: "lib-1", identifier: "DEBA-45", issueNumber: 45, title: "Company Library", status: "backlog" },
+          ]);
+        }
+        if (path === "/api/issues/lib-1/documents") {
+          return Response.json([{ key: "analytics-latest-6-posts" }, { key: "content-log" }]);
+        }
+        if (path === "/api/issues/lib-1/documents/content-log") {
+          return Response.json({ key: "content-log", body: "# Content Log", latestRevisionId: "rev-7" });
+        }
+        return undefined;
+      },
+    });
+
+    const ctx = makeContext();
+    await execute(ctx);
+
+    const chatBodies = fetchMock.calls.filter((c) => c.path.endsWith("/chat/completions")).map((c) => c.body as any);
+    const toolResults = (n: number) => chatBodies[n].messages.filter((m: any) => m.role === "tool");
+    const first = JSON.parse(toolResults(1)[0].content);
+    expect(first.error).toContain("Existing keys: analytics-latest-6-posts, content-log");
+    expect(first.warning).toBeUndefined();
+    const second = JSON.parse(toolResults(2)[1].content);
+    expect(second.warning).toContain("one more identical call stops the run");
+
+    const put = fetchMock.calls.find((c) => c.method === "PUT" && c.path === "/api/issues/lib-1/documents/content-log");
+    expect((put!.body as any).body).toContain("No removals.");
+    expect(findTranscriptResultEntry(ctx)?.subtype).toBe("completed");
+  });
+
   it("stops at max_turns and blocks the issue with a reason", async () => {
     fetchMock = setupFetchMock([toolCallResponse([{ id: "call-1", name: "list_agents", args: {} }])]);
 

@@ -1257,6 +1257,33 @@ function summarizeDocumentList(docs: Record<string, unknown>[]): Record<string, 
   });
 }
 
+/**
+ * Weak models resend a call that's missing `key` unchanged until the repeat
+ * guard kills the run, so name the keys they can pick from.
+ */
+async function missingKeyError(
+  ctx: BuildToolsContext,
+  issueId: string,
+  action: "read" | "write" | "append",
+): Promise<ToolExecutionResult> {
+  const what = action === "append" ? "the document to add to" : action === "read" ? "the document to read" : "the document to write";
+  const head = `key is required for action='${action}' — ${what}.`;
+  let keys: string[];
+  try {
+    keys = (await ctx.api.listIssueDocuments(issueId))
+      .map((d) => d.key)
+      .filter((k): k is string => typeof k === "string" && k.length > 0);
+  } catch {
+    return fail(`${head} Use action='list' to see the existing keys, then resend with key set.`);
+  }
+  const newKey = action === "write" ? " (or a new key to create a document)" : "";
+  if (keys.length === 0) {
+    return fail(`${head} There are no documents yet${action === "write" ? "" : "; use action='write' to create one"}. Resend with key set${newKey}.`);
+  }
+  const shown = keys.slice(0, 30).join(", ") + (keys.length > 30 ? `, … (${keys.length - 30} more)` : "");
+  return fail(`${head} Existing keys: ${shown}. Resend the same call with key set to one of them${newKey}.`);
+}
+
 /** read / write / list documents on one issue — shared by issue_document and library. */
 async function runDocumentAction(
   ctx: BuildToolsContext,
@@ -1272,12 +1299,12 @@ async function runDocumentAction(
       );
     case "read": {
       const rawKey = asString(args.key);
-      if (!rawKey) return fail("key is required for action='read'.");
+      if (!rawKey) return missingKeyError(ctx, issueId, "read");
       return safeCall(`${label}(read)`, () => ctx.api.getIssueDocument(issueId, slugifyDocumentKey(rawKey)));
     }
     case "write": {
       const rawKey = asString(args.key);
-      if (!rawKey) return fail("key is required for action='write'.");
+      if (!rawKey) return missingKeyError(ctx, issueId, "write");
       if (typeof args.body !== "string" || !args.body) return fail("body is required for action='write'.");
       return safeCall(`${label}(write)`, () =>
         writeDocument(issueDocumentStore(ctx, issueId), slugifyDocumentKey(rawKey), args),
@@ -1285,7 +1312,7 @@ async function runDocumentAction(
     }
     case "append": {
       const rawKey = asString(args.key);
-      if (!rawKey) return fail("key is required for action='append'.");
+      if (!rawKey) return missingKeyError(ctx, issueId, "append");
       if (typeof args.body !== "string" || !args.body) {
         return fail("body is required for action='append' — the new text to add, not the whole document.");
       }

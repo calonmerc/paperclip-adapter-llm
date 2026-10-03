@@ -916,6 +916,21 @@ describe("library", () => {
     expect(result.content).toContain("use action='write' to create it first");
   });
 
+  it("a call missing key lists the existing keys so the model can resend it", async () => {
+    const server = fakeLibraryServer();
+    const tool = libraryTool(server.api);
+    await tool.execute({ action: "write", key: "analytics-latest", body: "a" });
+    await tool.execute({ action: "write", key: "content-log", body: "# Log" });
+
+    const result = await tool.execute({ action: "append", body: "## Cleanup\n\nNo removals." });
+    expect(result.isError).toBe(true);
+    const error = JSON.parse(result.content).error;
+    expect(error).toContain("key is required for action='append'");
+    expect(error).toContain("Existing keys: analytics-latest, content-log");
+    expect(error).toContain("Resend the same call with key set");
+    expect(server.docs.get("lib-1")!.get("content-log")!.body).toBe("# Log");
+  });
+
   it("reuses the oldest existing Library issue instead of creating another", async () => {
     const server = fakeLibraryServer([
       { id: "newer", identifier: "DEBA-60", issueNumber: 60, title: "Company Library", status: "backlog", assigneeAgentId: null },

@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Fixed — repeat loop on a missing document key
+- On DEBA-66, `z-ai/glm-5.3-flash` sent `library(action='append')` without
+  `key` three times. Its reasoning even said "pass key='content-log'". Each
+  call got a bare "key is required", and the repeat-loop guard blocked the
+  issue. `library` / `issue_document` now answer a missing `key` with the
+  existing keys and "resend the same call with key set".
+- A tool call that fails with the same arguments as the call before it now
+  gets a `warning` in its result: one more identical call stops the run.
+  The model used to get no notice before the guard fired.
+
 ### Fixed — LLM quota and upstream errors stranded the issue
 - Any LLM HTTP error set the issue to `blocked` with a generic
   `llm_request_failed`, so Paperclip never retried it. When OpenRouter's
