@@ -6,11 +6,18 @@
 - On DEBA-77, `z-ai/glm-5.3-flash` POSTed to Google Search Console's
   `searchAnalytics/query` three times with no body and got `400 startDate
   field is required` each time. Its reasoning planned two different JSON
-  bodies, but every call arrived without `body`, the only tool parameter
-  with no `type` in its schema. `http_request` now takes a typed `json`
-  object for JSON bodies; `body` is typed as a raw string (an object `body`
-  is still sent as JSON). A 4xx on a POST/PUT/PATCH sent with no body says
-  so in its `hint`.
+  bodies, but every call arrived with only `url`, `method` and `auth`.
+  `http_request` now takes a typed `json` object for JSON bodies; `body` is
+  typed as a raw string (an object `body` is still sent as JSON).
+- Typing `body` was not the fix. On the rerun the model sent the dates in
+  `json`, then `body`, then `query`, and every call still arrived with only
+  `url`, `method` and `auth`: the model loses fields from calls with many
+  arguments (as with `library` on DEBA-66/69). `http_request` now works
+  with as few fields as possible. `method` defaults to POST when there's a
+  payload. `auth` is remembered per host once it has worked. A `json` sent
+  without `url` is held and attached to the next call. A 4xx on a bodiless
+  POST/PUT/PATCH lists the fields that arrived and names the short call to
+  send: `{url, json}`.
 - The third call came in the same response as the second, so the model
   never saw the "one more identical call stops the run" warning before the
   repeat-loop guard fired. Identical calls batched into one response now run

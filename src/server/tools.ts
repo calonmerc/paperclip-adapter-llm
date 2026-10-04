@@ -1631,6 +1631,11 @@ function httpRequestTool(ctx: BuildToolsContext): Tool {
   // cache them for the run and redact them alongside the raw values.
   const tokenCache = new Map<string, string>();
   const sensitive = () => [...store.sensitiveValues(), ...tokenCache.values()];
+  // Weak models lose arguments from calls with many fields (DEBA-77: every
+  // 4th+ field vanished), so a call must work with as few as possible: auth
+  // is remembered per host, and a payload sent alone is held for the next call.
+  const hostAuth = new Map<string, Record<string, unknown>>();
+  let heldPayload: unknown = null;
 
   return {
     schema: {
@@ -1644,11 +1649,13 @@ function httpRequestTool(ctx: BuildToolsContext): Tool {
           "response. Send a JSON request body in `json` (an object); `body` is only for raw string bodies. " +
           "For Google APIs authenticated by a service-account key secret, set " +
           'auth={"type":"google_service_account","secret":"NAME","scopes":["https://www.googleapis.com/auth/webmasters.readonly"]} ' +
-          "instead of an Authorization header. Responses are truncated to ~32KB.",
+          "instead of an Authorization header. Once auth works for a host it is remembered for the run, so " +
+          "later calls to that host can leave auth out. Method defaults to POST when `json` is set, so a JSON " +
+          "API call can be just {url, json}. Responses are truncated to ~32KB.",
         parameters: {
           type: "object",
           properties: {
-            method: { type: "string", enum: HTTP_METHODS, description: "Default GET." },
+            method: { type: "string", enum: HTTP_METHODS, description: "Default GET, or POST when json/body is set." },
             url: { type: "string", description: "Absolute http(s) URL." },
             headers: {
               type: "object",
@@ -1664,7 +1671,8 @@ function httpRequestTool(ctx: BuildToolsContext): Tool {
               type: "object",
               description:
                 "JSON request body, sent with Content-Type: application/json. Use this for JSON APIs, e.g. " +
-                '{"startDate":"2026-01-01","endDate":"2026-01-07","dimensions":["query"]}.',
+                '{"startDate":"2026-01-01","endDate":"2026-01-07","dimensions":["query"]}. Can also be sent ' +
+                "alone in its own call: it is held and attached to your next request.",
             },
             body: {
               type: "string",
@@ -1672,6 +1680,7 @@ function httpRequestTool(ctx: BuildToolsContext): Tool {
             },
             auth: {
               type: "object",
+              description: "Remembered per host once it works — omit it on later calls to the same host.",
               properties: {
                 type: { type: "string", enum: ["google_service_account"] },
                 secret: { type: "string", description: "Name of the secret holding the service-account JSON key." },
@@ -1686,8 +1695,22 @@ function httpRequestTool(ctx: BuildToolsContext): Tool {
     },
     execute: async (args) => {
       const redact = (text: string) => redactSecrets(text, sensitive());
-      const method = asString(args.method, "GET").toUpperCase();
+      // An object `body` is the same intent as `json`; send it as JSON rather than reject it.
+      const sentPayload = args.json ?? args.body ?? null;
+      if (!asString(args.url)) {
+        if (sentPayload === null) return fail("url is required.");
+        heldPayload = sentPayload;
+        return fail(
+          "url is required. Your json body was received and is held: now call http_request with url " +
+            "(auth too unless it's remembered for that host). Don't resend json — the held body is attached.",
+        );
+      }
+      // A held payload belongs to the very next call only.
+      const payload = sentPayload ?? heldPayload;
+      heldPayload = null;
+      const method = asString(args.method, payload !== null ? "POST" : "GET").toUpperCase();
       if (!HTTP_METHODS.includes(method)) return fail(`method must be one of: ${HTTP_METHODS.join(", ")}.`);
+      const writes = method !== "GET" && method !== "HEAD";
 
       let url: URL;
       const headers: Record<string, string> = {};
@@ -1696,7 +1719,7 @@ function httpRequestTool(ctx: BuildToolsContext): Tool {
       try {
         // API-access secrets are fetched from Paperclip on demand, so resolve
         // everything this request references before substituting.
-        secrets = await resolveSecrets(referencedSecretNames([args.url, args.headers, args.query, args.json, args.body]), store);
+        secrets = await resolveSecrets(referencedSecretNames([args.url, args.headers, args.query, payload]), store);
       } catch (err) {
         if (err instanceof SecretReferenceError) return fail(err.message);
         return fail(`Could not load secret: ${redact(err instanceof Error ? err.message : String(err))}`);
@@ -1723,9 +1746,7 @@ function httpRequestTool(ctx: BuildToolsContext): Tool {
             headers[k] = substituteSecrets(String(v), secrets);
           }
         }
-        // An object `body` is the same intent as `json`; send it as JSON rather than reject it.
-        const payload = args.json ?? args.body;
-        if (payload !== undefined && payload !== null && method !== "GET" && method !== "HEAD") {
+        if (payload !== null && writes) {
           if (typeof payload === "string") {
             body = substituteSecrets(payload, secrets);
           } else {
@@ -1740,7 +1761,9 @@ function httpRequestTool(ctx: BuildToolsContext): Tool {
         return fail(`Invalid request: ${redact(err instanceof Error ? err.message : String(err))}`);
       }
 
-      const auth = args.auth && typeof args.auth === "object" ? (args.auth as Record<string, unknown>) : null;
+      const explicitAuth = args.auth && typeof args.auth === "object" ? (args.auth as Record<string, unknown>) : null;
+      const hasAuthHeader = Object.keys(headers).some((h) => h.toLowerCase() === "authorization");
+      const auth = explicitAuth ?? (hasAuthHeader ? null : (hostAuth.get(url.host) ?? null));
       if (auth) {
         if (auth.type !== "google_service_account") return fail("auth.type must be 'google_service_account'.");
         const secretName = asString(auth.secret);
@@ -1774,6 +1797,8 @@ function httpRequestTool(ctx: BuildToolsContext): Tool {
         return fail(`Request failed: ${redact(err instanceof Error ? err.message : String(err))}`);
       }
 
+      if (explicitAuth && response.status !== 401 && response.status !== 403) hostAuth.set(url.host, explicitAuth);
+
       let text = method === "HEAD" ? "" : await response.text().catch(() => "");
       const truncated = text.length > MAX_RESPONSE_CHARS;
       if (truncated) text = text.slice(0, MAX_RESPONSE_CHARS);
@@ -1789,12 +1814,14 @@ function httpRequestTool(ctx: BuildToolsContext): Tool {
         // and models otherwise tend to retry it until the repeat-loop breaker
         // kills the run.
         const underscored = Object.keys(headers).filter((h) => h.includes("_"));
-        // glm-5.3-flash planned a JSON body but its POSTs arrived without one (DEBA-77).
         const noBody = body === undefined && ["POST", "PUT", "PATCH"].includes(method);
+        const authKnown = hostAuth.has(url.host);
         result.hint =
           (noBody
-            ? "This request was sent with NO body — no `json` or `body` field arrived. If the API needs a " +
-              "request body, resend with `json` set to the request object. "
+            ? `This request was sent with NO body — only these fields arrived: ${Object.keys(args).join(", ")}. ` +
+              "Fields are getting lost from your calls, so send fewer: method defaults to POST when json is set" +
+              (authKnown ? ", and auth for this host is remembered — leave it out. Resend as just {url, json}. " : ". Resend as just {url, json, auth}. ") +
+              "Or send {json} alone first: it is held and attached to your next request. "
             : "") +
           "Do not resend this request unchanged — a 4xx means the URL, method, headers, or credentials are wrong. " +
           (underscored.length > 0

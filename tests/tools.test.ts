@@ -1430,8 +1430,8 @@ describe("secrets & http_request", () => {
       new Response('{"error":{"message":"startDate field is required."}}', { status: 400 })) as typeof fetch;
     const tool = findTool(toolsWith({ K: "v-value" }), "http_request")!;
     const post = JSON.parse((await tool.execute({ url: "https://x.example.com/q", method: "POST" })).content);
-    expect(post.hint).toContain("sent with NO body");
-    expect(post.hint).toContain("`json`");
+    expect(post.hint).toContain("sent with NO body — only these fields arrived: url, method");
+    expect(post.hint).toContain("Resend as just {url, json, auth}");
     const get = JSON.parse((await tool.execute({ url: "https://x.example.com/q" })).content);
     expect(get.hint).not.toContain("NO body");
     const withBody = JSON.parse((await tool.execute({ url: "https://x.example.com/q", method: "POST", json: { a: 1 } })).content);
@@ -1525,6 +1525,55 @@ describe("secrets & http_request", () => {
 
     await call();
     expect(tokenRequests).toBe(1); // cached for the run
+  });
+
+  it("lets a weak model reach Search Console with only {url, json}: remembered auth, implicit POST, held body", async () => {
+    // DEBA-77 rerun: glm-5.3-flash's GSC calls never carried more than url, method and auth;
+    // json, body and query were all lost in transit.
+    const crypto = await import("node:crypto");
+    const { privateKey } = crypto.generateKeyPairSync("rsa", { modulusLength: 2048 });
+    const serviceAccount = JSON.stringify({
+      type: "service_account",
+      client_email: "gsc@proj.iam.gserviceaccount.com",
+      private_key: privateKey.export({ type: "pkcs8", format: "pem" }).toString(),
+      token_uri: "https://oauth2.googleapis.com/token",
+    });
+    const sent: { method: string; url: string; auth?: string; body?: string }[] = [];
+    globalThis.fetch = (async (input: any, init: any) => {
+      const url = String(input);
+      if (url === "https://oauth2.googleapis.com/token") return jsonResponse({ access_token: "ya29.t", expires_in: 3600 });
+      sent.push({ method: init.method, url, auth: init.headers.Authorization, body: init.body });
+      if (url.endsWith("/sites")) return jsonResponse({ siteEntry: [{ siteUrl: "sc-domain:debtrelief.win" }] });
+      return init.body ? jsonResponse({ rows: [] }) : jsonResponse({ error: { message: "startDate field is required." } }, 400);
+    }) as typeof fetch;
+
+    const tool = findTool(toolsWith({ google_search_console_key: serviceAccount }), "http_request")!;
+    const auth = {
+      type: "google_service_account",
+      secret: "google_search_console_key",
+      scopes: ["https://www.googleapis.com/auth/webmasters.readonly"],
+    };
+    const base = "https://searchconsole.googleapis.com/webmasters/v3/sites";
+    const queryUrl = `${base}/sc-domain%3Adebtrelief.win/searchAnalytics/query`;
+    const json = { startDate: "2026-09-27", endDate: "2026-10-04", dimensions: ["query"] };
+
+    expect((await tool.execute({ url: base, auth })).isError).toBe(false);
+
+    const bodiless = JSON.parse((await tool.execute({ url: queryUrl, method: "POST", auth })).content);
+    expect(bodiless.hint).toContain("auth for this host is remembered — leave it out. Resend as just {url, json}");
+
+    const short = await tool.execute({ url: queryUrl, json });
+    expect(short.isError).toBe(false);
+    expect(sent.at(-1)).toMatchObject({ method: "POST", auth: "Bearer ya29.t", body: JSON.stringify(json) });
+
+    const held = await tool.execute({ json });
+    expect(held.content).toContain("is held");
+    expect((await tool.execute({ url: queryUrl })).isError).toBe(false);
+    expect(sent.at(-1)).toMatchObject({ method: "POST", auth: "Bearer ya29.t", body: JSON.stringify(json) });
+
+    // The held body went with that call; the next bare call is a plain GET again.
+    await tool.execute({ url: base });
+    expect(sent.at(-1)).toMatchObject({ method: "GET", body: undefined });
   });
 
   it("reports a bad service-account secret without leaking it", async () => {
