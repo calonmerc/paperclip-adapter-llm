@@ -1128,9 +1128,12 @@ function summarizeDocumentList(docs) {
  * Weak models resend a call that's missing `key` unchanged until the repeat
  * guard kills the run, so name the keys they can pick from.
  */
-async function missingKeyError(ctx, issueId, action) {
+async function missingKeyError(ctx, issueId, action, bodyHeld = false) {
     const what = action === "append" ? "the document to add to" : action === "read" ? "the document to read" : "the document to write";
     const head = `key is required for action='${action}' — ${what}.`;
+    const resend = bodyHeld
+        ? `Your body was received and is held: resend action='${action}' with just key set — you don't need to resend body`
+        : "Resend the same call with key set";
     let keys;
     try {
         keys = (await ctx.api.listIssueDocuments(issueId))
@@ -1138,43 +1141,68 @@ async function missingKeyError(ctx, issueId, action) {
             .filter((k) => typeof k === "string" && k.length > 0);
     }
     catch {
-        return fail(`${head} Use action='list' to see the existing keys, then resend with key set.`);
+        return fail(`${head} Use action='list' to see the existing keys. ${resend}.`);
     }
     const newKey = action === "write" ? " (or a new key to create a document)" : "";
     if (keys.length === 0) {
-        return fail(`${head} There are no documents yet${action === "write" ? "" : "; use action='write' to create one"}. Resend with key set${newKey}.`);
+        return fail(`${head} There are no documents yet${action === "write" ? "" : "; use action='write' to create one"}. ${resend}${newKey}.`);
     }
     const shown = keys.slice(0, 30).join(", ") + (keys.length > 30 ? `, … (${keys.length - 30} more)` : "");
-    return fail(`${head} Existing keys: ${shown}. Resend the same call with key set to one of them${newKey}.`);
+    return fail(`${head} Existing keys: ${shown}. ${resend}, using one of them${newKey}.`);
+}
+const partialDocumentCalls = new WeakMap();
+const DOCUMENT_CALL_FIELDS = ["key", "body", "title", "change_summary"];
+/**
+ * glm-5.3-flash calls carrying a long `body` repeatedly arrived without `key`
+ * (even when the model said it was sending it), while key-only calls came
+ * through. Holding the half that arrived lets the next call supply the rest.
+ */
+function mergePartialDocumentCall(partial, label, issueId, action, args) {
+    if (!partial || partial.label !== label || partial.issueId !== issueId || partial.action !== action)
+        return args;
+    const merged = { ...args };
+    for (const field of DOCUMENT_CALL_FIELDS) {
+        const current = merged[field];
+        if ((current === undefined || current === "") && partial.args[field] !== undefined)
+            merged[field] = partial.args[field];
+    }
+    return merged;
 }
 /** read / write / list documents on one issue — shared by issue_document and library. */
-async function runDocumentAction(ctx, label, issueId, args) {
-    const action = asString(args.action);
+async function runDocumentAction(ctx, label, issueId, rawArgs) {
+    const action = asString(rawArgs.action);
+    // A held half is only good for the very next document call.
+    const partial = partialDocumentCalls.get(ctx);
+    partialDocumentCalls.delete(ctx);
     switch (action) {
         case "list":
             return safeCall(`${label}(list)`, async () => summarizeDocumentList(await ctx.api.listIssueDocuments(issueId)));
         case "read": {
-            const rawKey = asString(args.key);
+            const rawKey = asString(rawArgs.key);
             if (!rawKey)
                 return missingKeyError(ctx, issueId, "read");
             return safeCall(`${label}(read)`, () => ctx.api.getIssueDocument(issueId, slugifyDocumentKey(rawKey)));
         }
-        case "write": {
-            const rawKey = asString(args.key);
-            if (!rawKey)
-                return missingKeyError(ctx, issueId, "write");
-            if (typeof args.body !== "string" || !args.body)
-                return fail("body is required for action='write'.");
-            return safeCall(`${label}(write)`, () => writeDocument(issueDocumentStore(ctx, issueId), slugifyDocumentKey(rawKey), args));
-        }
+        case "write":
         case "append": {
+            const args = mergePartialDocumentCall(partial, label, issueId, action, rawArgs);
             const rawKey = asString(args.key);
-            if (!rawKey)
-                return missingKeyError(ctx, issueId, "append");
-            if (typeof args.body !== "string" || !args.body) {
-                return fail("body is required for action='append' — the new text to add, not the whole document.");
+            const hasBody = typeof args.body === "string" && args.body.length > 0;
+            if (!rawKey || !hasBody) {
+                partialDocumentCalls.set(ctx, { label, issueId, action, args });
             }
-            return safeCall(`${label}(append)`, () => appendDocument(issueDocumentStore(ctx, issueId), slugifyDocumentKey(rawKey), args, "action='write'"));
+            if (!rawKey)
+                return missingKeyError(ctx, issueId, action, hasBody);
+            if (!hasBody) {
+                const what = action === "append" ? " — the new text to add, not the whole document" : "";
+                return fail(`body is required for action='${action}'${what}. key='${rawKey}' is held: resend action='${action}' ` +
+                    "with body set — you don't need to resend key.");
+            }
+            const key = slugifyDocumentKey(rawKey);
+            if (action === "write") {
+                return safeCall(`${label}(write)`, () => writeDocument(issueDocumentStore(ctx, issueId), key, args));
+            }
+            return safeCall(`${label}(append)`, () => appendDocument(issueDocumentStore(ctx, issueId), key, args, "action='write'"));
         }
         default:
             return fail("action must be one of: read, write, append, list.");

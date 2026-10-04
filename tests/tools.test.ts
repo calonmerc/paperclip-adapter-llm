@@ -927,8 +927,42 @@ describe("library", () => {
     const error = JSON.parse(result.content).error;
     expect(error).toContain("key is required for action='append'");
     expect(error).toContain("Existing keys: analytics-latest, content-log");
-    expect(error).toContain("Resend the same call with key set");
+    expect(error).toContain("Your body was received and is held");
     expect(server.docs.get("lib-1")!.get("content-log")!.body).toBe("# Log");
+
+    // The model sends just the key; the held body is appended.
+    const finish = await tool.execute({ action: "append", key: "content-log" });
+    expect(finish.isError).toBe(false);
+    expect(server.docs.get("lib-1")!.get("content-log")!.body).toContain("No removals.");
+  });
+
+  it("merges a write split across two calls — key in one, body in the next", async () => {
+    // DEBA-69: glm-5.3-flash sent write(key, title) with no body, then
+    // write(body) with no key, three times, until the repeat guard fired.
+    const server = fakeLibraryServer();
+    const tool = libraryTool(server.api);
+
+    const first = await tool.execute({ action: "write", key: "publish-2026-10-04-dmp", title: "publish/2026-10-04-dmp.md" });
+    expect(first.isError).toBe(true);
+    expect(JSON.parse(first.content).error).toContain("key='publish-2026-10-04-dmp' is held");
+
+    const second = await tool.execute({ action: "write", body: "---\ntitle: x\n---\n\n## Body", change_summary: "SEO pass" });
+    expect(second.isError).toBe(false);
+    const stored = server.docs.get("lib-1")!.get("publish-2026-10-04-dmp")!;
+    expect(stored.body).toContain("## Body");
+    expect(stored.title).toBe("publish/2026-10-04-dmp.md");
+  });
+
+  it("only holds a partial call for the very next document call", async () => {
+    const server = fakeLibraryServer();
+    const tool = libraryTool(server.api);
+    await tool.execute({ action: "write", key: "draft", body: "x" });
+
+    await tool.execute({ action: "write", key: "other" });
+    await tool.execute({ action: "list" });
+    const result = await tool.execute({ action: "write", body: "y" });
+    expect(result.isError).toBe(true);
+    expect(server.docs.get("lib-1")!.has("other")).toBe(false);
   });
 
   it("reuses the oldest existing Library issue instead of creating another", async () => {

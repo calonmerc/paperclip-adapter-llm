@@ -11,6 +11,15 @@
 - A tool call that fails with the same arguments as the call before it now
   gets a `warning` in its result: one more identical call stops the run.
   The model used to get no notice before the guard fired.
+- That wasn't enough: on DEBA-69, after the fix above was deployed,
+  glm-5.3-flash sent `library(write, key, title)` without `body`, then
+  `library(write, body)` without `key` (and without `title`) three times.
+  Its reasoning again said it was sending `key`. Every call that carried a
+  long `body` arrived without `key`, so resending the whole call could never
+  work. A `write`/`append` missing `key` or `body` now holds the half that
+  arrived, and the next document call with the same action fills in
+  whatever it leaves out. The error tells the model to send only the
+  missing field.
 
 ### Fixed — LLM quota and upstream errors stranded the issue
 - Any LLM HTTP error set the issue to `blocked` with a generic
