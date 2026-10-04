@@ -70,6 +70,23 @@ describe("tools.ts", () => {
     expect(names).not.toContain("memory_fs");
   });
 
+  it("gives every tool parameter a single type, so provider grammars don't drop it", () => {
+    // DEBA-77: http_request's untyped `body` never arrived from glm-5.3-flash.
+    const api = makeApi(async () => jsonResponse({}));
+    const tools = buildTools({
+      api, agentId: "agent-1", companyId: "company-1", currentIssueId: "issue-1", autoApprove: false,
+      secrets: { K: "v" }, config: { httpToolEnabled: true }, features: { cases: true, statusCards: true },
+    });
+    const bad: string[] = [];
+    const walk = (path: string, schema: any) => {
+      if (typeof schema.type !== "string") bad.push(`${path}: ${JSON.stringify(schema.type)}`);
+      for (const [k, v] of Object.entries(schema.properties ?? {})) walk(`${path}.${k}`, v);
+      if (schema.items) walk(`${path}[]`, schema.items);
+    };
+    for (const s of toolSchemas(tools)) walk(s.function.name, s.function.parameters);
+    expect(bad).toEqual([]);
+  });
+
   it("findTool() finds a tool by name and returns null for unknown names", () => {
     const api = makeApi(async () => jsonResponse({}));
     const tools = buildTools({ api, agentId: "agent-1", companyId: "company-1", currentIssueId: null, autoApprove: false });
@@ -1391,6 +1408,54 @@ describe("secrets & http_request", () => {
     expect(result.content).toContain("Unknown secret 'NOPE'");
     expect(result.content).toContain("UMAMI_API_KEY");
     expect(called).toBe(false);
+  });
+
+  it("sends `json` as JSON, a string `body` as-is, and still accepts an object `body`", async () => {
+    const sent: { body: string; contentType?: string }[] = [];
+    globalThis.fetch = (async (_input: any, init: any) => {
+      sent.push({ body: init.body, contentType: init.headers["Content-Type"] });
+      return jsonResponse({});
+    }) as typeof fetch;
+    const tool = findTool(toolsWith({ K: "v-value" }), "http_request")!;
+    await tool.execute({ url: "https://x.example.com/q", method: "POST", json: { startDate: "2026-09-27", k: "{{secret:K}}" } });
+    await tool.execute({ url: "https://x.example.com/q", method: "POST", body: "a=1&b=2" });
+    await tool.execute({ url: "https://x.example.com/q", method: "POST", body: { endDate: "2026-10-04" } });
+    expect(sent[0]).toEqual({ body: '{"startDate":"2026-09-27","k":"v-value"}', contentType: "application/json" });
+    expect(sent[1]).toEqual({ body: "a=1&b=2", contentType: undefined });
+    expect(sent[2]).toEqual({ body: '{"endDate":"2026-10-04"}', contentType: "application/json" });
+  });
+
+  it("says a 4xx POST had no body when none arrived (DEBA-77), but not for a GET", async () => {
+    globalThis.fetch = (async () =>
+      new Response('{"error":{"message":"startDate field is required."}}', { status: 400 })) as typeof fetch;
+    const tool = findTool(toolsWith({ K: "v-value" }), "http_request")!;
+    const post = JSON.parse((await tool.execute({ url: "https://x.example.com/q", method: "POST" })).content);
+    expect(post.hint).toContain("sent with NO body");
+    expect(post.hint).toContain("`json`");
+    const get = JSON.parse((await tool.execute({ url: "https://x.example.com/q" })).content);
+    expect(get.hint).not.toContain("NO body");
+    const withBody = JSON.parse((await tool.execute({ url: "https://x.example.com/q", method: "POST", json: { a: 1 } })).content);
+    expect(withBody.hint).not.toContain("NO body");
+  });
+
+  it("matches a secret name ignoring case when only one bound name fits", async () => {
+    let seen: Record<string, string> = {};
+    globalThis.fetch = (async (_input: any, init: any) => {
+      seen = init.headers;
+      return jsonResponse({});
+    }) as typeof fetch;
+    const tool = findTool(toolsWith({ umami_api_key: "umami-secret-value" }), "http_request")!;
+    const result = await tool.execute({
+      url: "https://umami.example.com/api",
+      headers: { "x-umami-api-key": "{{secret:UMAMI_API_KEY}}" },
+    });
+    expect(result.isError).toBe(false);
+    expect(seen["x-umami-api-key"]).toBe("umami-secret-value");
+
+    const ambiguous = await findTool(toolsWith({ key: "a-value", KEY: "b-value" }), "http_request")!.execute({
+      url: "https://x.example.com/?k={{secret:Key}}",
+    });
+    expect(ambiguous.content).toContain("Unknown secret 'Key'");
   });
 
   it("enforces httpAllowedHosts and rejects non-http schemes", async () => {

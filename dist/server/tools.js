@@ -681,8 +681,8 @@ function updateAgentTool(ctx) {
                         title: { type: "string", description: "Job title, e.g. 'VP of Sales'." },
                         role: { type: "string", enum: [...AGENT_ROLES], description: ROLE_DESCRIPTION },
                         reports_to: {
-                            type: ["string", "null"],
-                            description: "New manager's agent id or name. 'none' or null removes the manager.",
+                            type: "string",
+                            description: "New manager's agent id or name. 'none' removes the manager.",
                         },
                         capabilities: { type: "string", description: "What this agent is responsible for." },
                         adapter_type: { type: "string", description: "Adapter (harness), e.g. 'llm' or 'claude_local'." },
@@ -978,20 +978,15 @@ function askUserQuestionsTool(ctx) {
                                     options: {
                                         type: "array",
                                         description: "Answer choices — set this whenever there's a nameable short list of likely answers " +
-                                            "(see the tool description). Each item is either a plain string or {label, description}. " +
+                                            "(see the tool description). Each item is {label, description}. " +
                                             "Only omit/leave empty for a genuinely open-ended free-text question.",
                                         items: {
-                                            anyOf: [
-                                                { type: "string" },
-                                                {
-                                                    type: "object",
-                                                    properties: {
-                                                        label: { type: "string" },
-                                                        description: { type: "string" },
-                                                    },
-                                                    required: ["label"],
-                                                },
-                                            ],
+                                            type: "object",
+                                            properties: {
+                                                label: { type: "string" },
+                                                description: { type: "string" },
+                                            },
+                                            required: ["label"],
                                         },
                                     },
                                 },
@@ -1451,7 +1446,8 @@ function httpRequestTool(ctx) {
                 description: "Make an HTTP request to an external API. There is no shell or curl — this is the only way to " +
                     "call an outside service. Reference a bound secret anywhere in url/headers/query/body as " +
                     "{{secret:NAME}} (see list_secrets); it is substituted server-side and redacted from the " +
-                    "response. For Google APIs authenticated by a service-account key secret, set " +
+                    "response. Send a JSON request body in `json` (an object); `body` is only for raw string bodies. " +
+                    "For Google APIs authenticated by a service-account key secret, set " +
                     'auth={"type":"google_service_account","secret":"NAME","scopes":["https://www.googleapis.com/auth/webmasters.readonly"]} ' +
                     "instead of an Authorization header. Responses are truncated to ~32KB.",
                 parameters: {
@@ -1462,15 +1458,21 @@ function httpRequestTool(ctx) {
                         headers: {
                             type: "object",
                             additionalProperties: { type: "string" },
-                            description: 'e.g. {"x-umami-api-key": "{{secret:UMAMI_API_KEY}}"}',
+                            description: 'e.g. {"x-umami-api-key": "{{secret:NAME}}"}',
                         },
                         query: {
                             type: "object",
                             additionalProperties: { type: "string" },
                             description: "Query-string parameters appended to the url.",
                         },
+                        json: {
+                            type: "object",
+                            description: "JSON request body, sent with Content-Type: application/json. Use this for JSON APIs, e.g. " +
+                                '{"startDate":"2026-01-01","endDate":"2026-01-07","dimensions":["query"]}.',
+                        },
                         body: {
-                            description: "Request body. An object/array is sent as JSON; a string is sent as-is.",
+                            type: "string",
+                            description: "Raw request body, sent as-is (e.g. form-encoded). For JSON use `json` instead.",
                         },
                         auth: {
                             type: "object",
@@ -1498,7 +1500,7 @@ function httpRequestTool(ctx) {
             try {
                 // API-access secrets are fetched from Paperclip on demand, so resolve
                 // everything this request references before substituting.
-                secrets = await resolveSecrets(referencedSecretNames([args.url, args.headers, args.query, args.body]), store);
+                secrets = await resolveSecrets(referencedSecretNames([args.url, args.headers, args.query, args.json, args.body]), store);
             }
             catch (err) {
                 if (err instanceof SecretReferenceError)
@@ -1530,12 +1532,14 @@ function httpRequestTool(ctx) {
                         headers[k] = substituteSecrets(String(v), secrets);
                     }
                 }
-                if (args.body !== undefined && args.body !== null && method !== "GET" && method !== "HEAD") {
-                    if (typeof args.body === "string") {
-                        body = substituteSecrets(args.body, secrets);
+                // An object `body` is the same intent as `json`; send it as JSON rather than reject it.
+                const payload = args.json ?? args.body;
+                if (payload !== undefined && payload !== null && method !== "GET" && method !== "HEAD") {
+                    if (typeof payload === "string") {
+                        body = substituteSecrets(payload, secrets);
                     }
                     else {
-                        body = JSON.stringify(substituteSecretsDeep(args.body, secrets));
+                        body = JSON.stringify(substituteSecretsDeep(payload, secrets));
                         if (!Object.keys(headers).some((h) => h.toLowerCase() === "content-type")) {
                             headers["Content-Type"] = "application/json";
                         }
@@ -1601,8 +1605,14 @@ function httpRequestTool(ctx) {
                 // and models otherwise tend to retry it until the repeat-loop breaker
                 // kills the run.
                 const underscored = Object.keys(headers).filter((h) => h.includes("_"));
+                // glm-5.3-flash planned a JSON body but its POSTs arrived without one (DEBA-77).
+                const noBody = body === undefined && ["POST", "PUT", "PATCH"].includes(method);
                 result.hint =
-                    "Do not resend this request unchanged — a 4xx means the URL, method, headers, or credentials are wrong. " +
+                    (noBody
+                        ? "This request was sent with NO body — no `json` or `body` field arrived. If the API needs a " +
+                            "request body, resend with `json` set to the request object. "
+                        : "") +
+                        "Do not resend this request unchanged — a 4xx means the URL, method, headers, or credentials are wrong. " +
                         (underscored.length > 0
                             ? `Header names normally use hyphens, not underscores (got: ${underscored.join(", ")}). `
                             : "") +

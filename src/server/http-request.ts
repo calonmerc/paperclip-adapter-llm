@@ -97,11 +97,23 @@ export class SecretStore {
     return [...new Set([...Object.keys(this.env), ...this.apiKeys])].sort();
   }
 
-  has(name: string): boolean {
-    return Object.prototype.hasOwnProperty.call(this.env, name) || this.apiKeys.has(name);
+  /**
+   * The bound name `name` refers to: an exact match, else the single name that
+   * matches ignoring case (models uppercase lowercase bindings, e.g. UMAMI_API_KEY).
+   */
+  private canonical(name: string): string | null {
+    if (Object.prototype.hasOwnProperty.call(this.env, name) || this.apiKeys.has(name)) return name;
+    const lower = name.toLowerCase();
+    const matches = this.names().filter((n) => n.toLowerCase() === lower);
+    return matches.length === 1 ? matches[0]! : null;
   }
 
-  async get(name: string): Promise<string> {
+  has(name: string): boolean {
+    return this.canonical(name) !== null;
+  }
+
+  async get(requested: string): Promise<string> {
+    const name = this.canonical(requested) ?? requested;
     if (Object.prototype.hasOwnProperty.call(this.env, name)) return this.env[name]!;
     if (!this.apiKeys.has(name) || !this.api) throw new SecretReferenceError(this.unknownMessage(name));
     const cached = this.fetched.get(name);

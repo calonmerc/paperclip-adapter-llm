@@ -2,6 +2,31 @@
 
 ## [Unreleased]
 
+### Fixed — repeat loop on a bodiless http_request POST
+- On DEBA-77, `z-ai/glm-5.3-flash` POSTed to Google Search Console's
+  `searchAnalytics/query` three times with no body and got `400 startDate
+  field is required` each time. Its reasoning planned two different JSON
+  bodies, but every call arrived without `body`, the only tool parameter
+  with no `type` in its schema. `http_request` now takes a typed `json`
+  object for JSON bodies; `body` is typed as a raw string (an object `body`
+  is still sent as JSON). A 4xx on a POST/PUT/PATCH sent with no body says
+  so in its `hint`.
+- The third call came in the same response as the second, so the model
+  never saw the "one more identical call stops the run" warning before the
+  repeat-loop guard fired. Identical calls batched into one response now run
+  once and count once toward the guard, for every tool.
+- Every failing tool result now carries `received_fields`, the argument
+  names that actually arrived. DEBA-66, DEBA-69 and DEBA-77 all came from
+  the model believing it sent a field it dropped.
+- A new test requires every tool parameter to have a single `type`. It also
+  caught `update_agent.reports_to` (`["string","null"]`; "none" still
+  clears it) and `ask_user_questions` options (string-or-object `anyOf`;
+  plain strings are still accepted). Both are now single-typed.
+- Secret names match ignoring case when exactly one bound name fits. The
+  model wrote `UMAMI_API_KEY` for the `umami_api_key` binding, copying the
+  uppercase example in the `headers` description, which now says
+  `{{secret:NAME}}`.
+
 ### Fixed — repeat loop on a missing document key
 - On DEBA-66, `z-ai/glm-5.3-flash` sent `library(action='append')` without
   `key` three times. Its reasoning even said "pass key='content-log'". Each

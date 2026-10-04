@@ -55,8 +55,13 @@ export declare class SecretStore {
     /** Load the API-access binding names. Failure just means none are available. */
     init(onError?: (reason: string) => void): Promise<void>;
     names(): string[];
+    /**
+     * The bound name `name` refers to: an exact match, else the single name that
+     * matches ignoring case (models uppercase lowercase bindings, e.g. UMAMI_API_KEY).
+     */
+    private canonical;
     has(name: string): boolean;
-    get(name: string): Promise<string>;
+    get(requested: string): Promise<string>;
     /** Values that must never reach the model: all env secrets plus every API value fetched so far. */
     sensitiveValues(): string[];
     unknownMessage(name: string): string;

@@ -46,11 +46,13 @@ Paperclip has two ways to bind a secret to an agent, and both work:
 This adapter has no child process and no shell, so instead:
 
 - `list_secrets` returns the bound secret **names** (never values): the secrets' keys as `GET /api/agents/me/secrets` reports them, covering both kinds. `adapterConfig.env` is consulted only when that endpoint is unavailable, since it also carries non-secret runtime variables. The adapter's own `llm.apikey.*` key is always excluded.
-- `http_request` makes an HTTP(S) call. The model writes `{{secret:NAME}}` anywhere in the url, headers, query or body, and the value is substituted in-process. For Google APIs, `auth: {type: "google_service_account", secret, scopes}` turns a service-account key secret into an access token (signed RS256 JWT → `oauth2.googleapis.com/token`, cached for the run). Every secret value and minted token is redacted to `***` from responses and errors before the model sees them. Responses are capped at ~32 KB; requests time out after 30 s.
+- `http_request` makes an HTTP(S) call. A JSON request body goes in `json` (an object, sent with `Content-Type: application/json`); `body` is a raw string sent as-is (an object `body` is still sent as JSON). A 4xx on a POST/PUT/PATCH that carried no body says so in its `hint`. The model writes `{{secret:NAME}}` anywhere in the url, headers, query, `json` or `body`, and the value is substituted in-process. A secret name that matches exactly one bound name ignoring case resolves to it (models write `UMAMI_API_KEY` for `umami_api_key`). For Google APIs, `auth: {type: "google_service_account", secret, scopes}` turns a service-account key secret into an access token (signed RS256 JWT → `oauth2.googleapis.com/token`, cached for the run). Every secret value and minted token is redacted to `***` from responses and errors before the model sees them. Responses are capped at ~32 KB; requests time out after 30 s.
 
 Both tools are registered only when at least one secret is bound; set `httpToolEnabled: true` to get `http_request` without secrets. `httpAllowedHosts` (comma-separated, `*.example.com` wildcards) restricts which hosts it may call.
 
 Calling a tool that doesn't exist (e.g. `bash`) returns the list of available tools, plus a pointer to `http_request` for shell-like names, so the model can correct itself instead of retrying.
+
+Every failing tool result carries `received_fields`, the argument names that actually arrived, because weak models drop a field and then insist they sent it. The repeat-loop guard stops a run after 3 identical calls in a row; the 2nd identical failing call gets a `warning` first. Identical calls batched into one response run once and count once, since the model can't read the warning between them. Every tool parameter has a single JSON-schema `type` (a test enforces it): untyped and union-typed parameters get dropped by some providers' tool-call grammars.
 
 ### Disposition handling
 

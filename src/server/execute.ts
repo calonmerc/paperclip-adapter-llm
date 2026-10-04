@@ -145,7 +145,7 @@ const DEFAULT_SYSTEM_PROMPT =
   "on this run — they're more specific than any general rule here. " +
   "You have no shell, no bash, and no curl. To call an external API use http_request; reference bound " +
   "credentials as {{secret:NAME}} (list_secrets shows the names) and never ask for, print, or store a " +
-  "secret's value. " +
+  "secret's value. Put a JSON request body in http_request's `json` argument. " +
   "Where a skill says to call the Paperclip agent API (PATCH /api/agents/..., instructions-bundle), use " +
   "the tools instead: get_agent to inspect an agent, update_agent to change its title, role, manager " +
   "(reports_to), adapter, model, or heartbeat, and agent_instructions to read or edit its prompt " +
@@ -571,16 +571,18 @@ const REPEAT_WARNING =
   "You sent this exact call last time and got the same error. Change the arguments as the error says — " +
   "one more identical call stops the run.";
 
-function appendRepeatWarning(resultContent: string): string {
+/** Merge `extra` into a JSON-object tool result; a non-JSON result gets the values appended as text. */
+function annotateResult(resultContent: string, extra: Record<string, unknown>): string {
   try {
     const parsed = JSON.parse(resultContent);
     if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-      return JSON.stringify({ ...parsed, warning: REPEAT_WARNING });
+      return JSON.stringify({ ...parsed, ...extra });
     }
   } catch {
     // Not JSON: append as text.
   }
-  return `${resultContent}\n\n${REPEAT_WARNING}`;
+  const lines = Object.entries(extra).map(([k, v]) => `${k}: ${typeof v === "string" ? v : JSON.stringify(v)}`);
+  return `${resultContent}\n\n${lines.join("\n")}`;
 }
 
 // ----- main -----
@@ -1088,6 +1090,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         })),
       });
 
+      // Identical calls batched into one response are one attempt: the model
+      // can't see the first one's result (or the repeat warning) before
+      // sending the others, so they must not count toward the repeat guard.
+      const ranThisResponse = new Map<string, boolean>();
+
       // Execute each tool call and append the results.
       for (const { tc, parsed } of parsedCalls) {
         const toolName = tc.function.name;
@@ -1098,6 +1105,19 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           input: parsed.ok ? args : { unparseableArguments: `${rawLength} chars of invalid JSON` },
           toolUseId: tc.id,
         });
+
+        const callSig = `${toolName}::${JSON.stringify(args)}`;
+        const earlierIsError = ranThisResponse.get(callSig);
+        if (earlierIsError !== undefined) {
+          const duplicateContent = JSON.stringify({
+            [earlierIsError ? "error" : "note"]:
+              "Not run: identical to an earlier call in this same response. See that call's result" +
+              (earlierIsError ? " and change the arguments before trying again." : "."),
+          });
+          await emitToolResult(onLog, { toolUseId: tc.id, toolName, content: duplicateContent, isError: earlierIsError });
+          messages.push({ role: "tool", tool_call_id: tc.id, content: duplicateContent });
+          continue;
+        }
 
         const tool = findTool(tools, toolName);
         let resultContent: string;
@@ -1127,11 +1147,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           }
         }
 
-        const callSig = `${toolName}::${JSON.stringify(args)}`;
-        // The model gets no other signal that the guard below is about to end
-        // the run; weak models resend a failing call verbatim.
-        if (isError && recentCalls[recentCalls.length - 1] === callSig) {
-          resultContent = appendRepeatWarning(resultContent);
+        ranThisResponse.set(callSig, isError);
+        if (isError) {
+          const extra: Record<string, unknown> = {};
+          // Weak models drop fields they believe they sent (DEBA-66/69/77) and
+          // then resend the "same" call; show them which fields actually arrived.
+          if (parsed.ok) extra.received_fields = Object.keys(args);
+          // The model gets no other signal that the guard below is about to end
+          // the run; weak models resend a failing call verbatim.
+          if (recentCalls[recentCalls.length - 1] === callSig) extra.warning = REPEAT_WARNING;
+          if (Object.keys(extra).length > 0) resultContent = annotateResult(resultContent, extra);
         }
 
         await emitToolResult(onLog, {

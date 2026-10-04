@@ -129,7 +129,7 @@ function setupFetchMock(
   const original = globalThis.fetch;
 
   globalThis.fetch = (async (input: any, init?: any) => {
-    const url = typeof input === "string" ? input : input.url;
+    const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
     const method = (init?.method || "GET").toUpperCase();
     const body = init?.body ? JSON.parse(String(init.body)) : undefined;
     const parsed = new URL(url);
@@ -1000,6 +1000,63 @@ describe("execute()", () => {
 
     const resultEntry = findTranscriptResultEntry(ctx);
     expect(resultEntry?.subtype).toBe("repeat_loop");
+  });
+
+  it("runs identical calls batched in one response once, so they count once toward the repeat guard", async () => {
+    // DEBA-77: glm-5.3-flash's GSC POST arrived without a body and failed; it then sent the same call
+    // twice in one response, so the 3rd identical call came before it could read the warning on the 2nd.
+    const url = "https://searchconsole.googleapis.com/webmasters/v3/sites/sc-domain%3Ax.win/searchAnalytics/query";
+    const bodiless = { id: "call-1", name: "http_request", args: { url, method: "POST" } };
+    const fixed = {
+      id: "call-4",
+      name: "http_request",
+      args: { url, method: "POST", json: { startDate: "2026-09-27", endDate: "2026-10-04", dimensions: ["query"] } },
+    };
+    fetchMock = setupFetchMock(
+      [
+        toolCallResponse([bodiless]),
+        toolCallResponse([{ ...bodiless, id: "call-2" }, { ...bodiless, id: "call-3" }]),
+        toolCallResponse([fixed]),
+        assistantResponse("No search data yet."),
+      ],
+      {
+        api: (method, path, body) => {
+          if (!path.endsWith("/searchAnalytics/query")) return undefined;
+          return body === undefined
+            ? Response.json({ error: { message: "startDate field is required." } }, { status: 400 })
+            : Response.json({ rows: [] });
+        },
+      },
+    );
+
+    const ctx = makeContext({ config: { model: "z-ai/glm-5.3-flash", apiKey: "test-key", httpToolEnabled: true } });
+    await execute(ctx);
+
+    expect(fetchMock.calls.filter((c) => c.path.endsWith("/searchAnalytics/query"))).toHaveLength(3);
+    const chatBodies = fetchMock.calls.filter((c) => c.path.endsWith("/chat/completions")).map((c) => c.body as any);
+    const toolResults = (n: number) => chatBodies[n].messages.filter((m: any) => m.role === "tool");
+    const first = JSON.parse(toolResults(1)[0].content);
+    expect(first.hint).toContain("sent with NO body");
+    expect(first.received_fields).toEqual(["url", "method"]);
+    const [second, third] = toolResults(2).slice(1).map((m: any) => JSON.parse(m.content));
+    expect(second.warning).toContain("one more identical call stops the run");
+    expect(third.error).toContain("identical to an earlier call in this same response");
+    expect(findTranscriptResultEntry(ctx)?.subtype).toBe("completed");
+  });
+
+  it("adds received_fields to failing tool results only", async () => {
+    fetchMock = setupFetchMock([
+      toolCallResponse([
+        { id: "call-a", name: "add_comment", args: { issue_id: "issue-1" } },
+        { id: "call-b", name: "list_agents", args: {} },
+      ]),
+      assistantResponse("ok"),
+    ], { api: (method, path) => (path === "/api/companies/company-1/agents" ? Response.json([]) : undefined) });
+    await execute(makeContext());
+    const chatBodies = fetchMock.calls.filter((c) => c.path.endsWith("/chat/completions")).map((c) => c.body as any);
+    const [failed, ok] = chatBodies[1].messages.filter((m: any) => m.role === "tool").map((m: any) => m.content);
+    expect(JSON.parse(failed).received_fields).toEqual(["issue_id"]);
+    expect(ok).not.toContain("received_fields");
   });
 
   it("warns on a 2nd identical failing call so the model can fix it before the repeat guard fires", async () => {
