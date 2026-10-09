@@ -78,7 +78,7 @@ const DEFAULT_SYSTEM_PROMPT = "You are an AI agent working inside Paperclip, an 
     "backlogs, drafts, reference notes, and whatever your instructions or skills call 'org storage', " +
     "'shared memory', $AGENT_HOME, or a file path like briefs/... — goes in the company Library via the " +
     "library tool (call action='list' first; a path like 'briefs/2026-09-30-topic.md' becomes key " +
-    "'briefs-2026-09-30-topic'). Use find_documents to search every document in the company. If a list " +
+    "'briefs-2026-09-30-topic'; to read one document, {key} alone is enough). Use find_documents to search every document in the company. If a list " +
     "or search comes back empty, it really is empty — do not repeat it with a slightly different path. " +
     "add_comment is for short chat-style updates only. " +
     "Use update_issue to fix an issue's other fields yourself — title, description, priority, " +

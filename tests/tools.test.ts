@@ -953,6 +953,61 @@ describe("library", () => {
     expect(server.docs.get("lib-1")!.get("content-log")!.body).toContain("No removals.");
   });
 
+  it("reads a document from whatever field carries the key (DEBA-97)", async () => {
+    // DEBA-97: glm-5.3-flash sent library({action:'read'}) without key three
+    // times; only `action` ever arrived.
+    const server = fakeLibraryServer();
+    const tool = libraryTool(server.api);
+    await tool.execute({ action: "write", key: "content-log", body: "# Log" });
+
+    for (const args of [
+      { key: "content-log" },
+      { action: "read content-log" },
+      { action: "read:content-log" },
+      { action: "content-log" },
+      { action: "read", name: "content-log" },
+      { action: "READ", document: "content-log" },
+    ]) {
+      const result = await tool.execute(args);
+      expect(result.isError, JSON.stringify(args)).toBe(false);
+      expect(result.content).toContain("# Log");
+    }
+  });
+
+  it("a read missing key names the one-field call", async () => {
+    const server = fakeLibraryServer();
+    const tool = libraryTool(server.api);
+    await tool.execute({ action: "write", key: "analytics-latest", body: "a" });
+
+    const result = await tool.execute({ action: "read" });
+    expect(result.isError).toBe(true);
+    const error = JSON.parse(result.content).error;
+    expect(error).toContain("Existing keys: analytics-latest");
+    expect(error).toContain('Send just {"key":"analytics-latest"}');
+  });
+
+  it("an action that isn't a known action or key still fails with the valid actions", async () => {
+    const server = fakeLibraryServer();
+    const tool = libraryTool(server.api);
+    const result = await tool.execute({ action: "nonexistent" });
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain("action must be one of: read, write, append, list");
+  });
+
+  it("holds a body sent without action until write or append claims it", async () => {
+    const server = fakeLibraryServer();
+    const tool = libraryTool(server.api);
+    await tool.execute({ action: "write", key: "content-log", body: "# Log" });
+
+    const held = await tool.execute({ body: "- new entry" });
+    expect(held.isError).toBe(true);
+    expect(held.content).toContain("Your body was received and is held");
+
+    const finish = await tool.execute({ action: "append", key: "content-log" });
+    expect(finish.isError).toBe(false);
+    expect(server.docs.get("lib-1")!.get("content-log")!.body).toContain("- new entry");
+  });
+
   it("merges a write split across two calls — key in one, body in the next", async () => {
     // DEBA-69: glm-5.3-flash sent write(key, title) with no body, then
     // write(body) with no key, three times, until the repeat guard fired.
@@ -1212,6 +1267,19 @@ describe("issue_document", () => {
     const tools = buildTools({ api, agentId: "agent-1", companyId: "company-1", currentIssueId: "issue-7", autoApprove: false });
 
     const result = await findTool(tools, "issue_document")!.execute({ action: "read", key: "design-doc" });
+    expect(result.isError).toBe(false);
+    expect(paths).toContain("/api/issues/issue-7/documents/design-doc");
+  });
+
+  it("issue_document reads with just {key}", async () => {
+    const paths: string[] = [];
+    const api = makeApi(async (input: any) => {
+      paths.push(new URL(typeof input === "string" ? input : input.url).pathname);
+      return jsonResponse({ key: "design-doc", body: "# Design" });
+    });
+    const tools = buildTools({ api, agentId: "agent-1", companyId: "company-1", currentIssueId: "issue-7", autoApprove: false });
+
+    const result = await findTool(tools, "issue_document")!.execute({ key: "design-doc" });
     expect(result.isError).toBe(false);
     expect(paths).toContain("/api/issues/issue-7/documents/design-doc");
   });

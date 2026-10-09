@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+### Fixed — repeat loop on a keyless library read
+- On DEBA-97, `z-ai/glm-5.3-flash` sent `library(action='read')` without
+  `key` three times in one response, then three more times, even after the error
+  listed every key and warned that one more identical call would stop the
+  run. Its reasoning named the documents it meant to read. Only `action`
+  ever arrived. Resending `{action, key}` was the call that kept
+  failing, so the fix gives it a call with fewer fields:
+  - `{key}` alone reads a document (`action` is no longer required on
+    `library` / `issue_document`), and `key` now comes first in the schema.
+  - The key is also taken from `action` itself (`"read content-log"`,
+    `"read:content-log"`, or an `action` that is an existing key) and from
+    `name`, `document`, `doc`, `path`, `file`, `document_key` or `id`.
+  - A read missing `key` now says `Send just {"key":"…"}` instead of
+    "resend the same call".
+  - A `body` sent with no `action` is held for the next `write`/`append`.
+
 ### Fixed — repeat loop on a bodiless http_request POST
 - On DEBA-77, `z-ai/glm-5.3-flash` POSTed to Google Search Console's
   `searchAnalytics/query` three times with no body and got `400 startDate

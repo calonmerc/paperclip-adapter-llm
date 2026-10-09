@@ -1077,12 +1077,19 @@ function listInteractionsTool(ctx) {
         },
     };
 }
+// `key` comes first: models emit fields in schema order and lose the later
+// ones, and the key is what identifies the document.
 const DOCUMENT_ACTION_PROPERTIES = {
-    action: { type: "string", enum: ["read", "write", "append", "list"] },
     key: {
         type: "string",
         description: "Short id for the document, e.g. 'content-log' or 'weekly-report'. Lowercase letters, " +
-            "numbers, - and _ only — anything else is auto-slugified. Required for read/write/append.",
+            "numbers, - and _ only — anything else is auto-slugified. Required for read/write/append. " +
+            "{key} alone reads that document.",
+    },
+    action: {
+        type: "string",
+        enum: ["read", "write", "append", "list"],
+        description: "Optional for a read: {key} alone reads the document.",
     },
     title: { type: "string", description: "Display title. Optional for write/append." },
     body: {
@@ -1143,7 +1150,55 @@ async function missingKeyError(ctx, issueId, action, bodyHeld = false) {
         return fail(`${head} There are no documents yet${action === "write" ? "" : "; use action='write' to create one"}. ${resend}${newKey}.`);
     }
     const shown = keys.slice(0, 30).join(", ") + (keys.length > 30 ? `, … (${keys.length - 30} more)` : "");
+    if (action === "read") {
+        // Resending {action, key} is the call that keeps arriving without key;
+        // name a one-field call instead.
+        return fail(`${head} Existing keys: ${shown}. Send just {"key":"${keys[0]}"} (with one of these keys) — ` +
+            "action can be left out for a read.");
+    }
     return fail(`${head} Existing keys: ${shown}. ${resend}, using one of them${newKey}.`);
+}
+const DOCUMENT_ACTIONS = ["read", "write", "append", "list"];
+const KEY_ALIASES = ["name", "document", "document_key", "doc", "path", "file", "id"];
+/**
+ * Weak models drop `key` from document calls they believe carry it
+ * (DEBA-66/69/97), so take the document key from wherever it arrived:
+ * an alias field, or `action` itself ("read content-log", or just a key).
+ */
+async function normalizeDocumentArgs(ctx, issueId, rawArgs) {
+    const args = { ...rawArgs };
+    if (!asString(args.key).trim()) {
+        const alias = KEY_ALIASES.map((f) => args[f]).find((v) => typeof v === "string" && v.trim());
+        if (alias)
+            args.key = alias;
+    }
+    const action = asString(args.action).trim();
+    const hasBody = typeof args.body === "string" && args.body.length > 0;
+    if (!action) {
+        if (asString(args.key).trim() && !hasBody)
+            args.action = "read";
+        return args;
+    }
+    const lower = action.toLowerCase();
+    if (DOCUMENT_ACTIONS.includes(lower)) {
+        args.action = lower;
+        return args;
+    }
+    const embedded = /^(read|write|append)\s*[:/\s]\s*(\S.*)$/i.exec(action);
+    if (embedded) {
+        args.action = embedded[1].toLowerCase();
+        if (!asString(args.key).trim())
+            args.key = embedded[2].trim();
+        return args;
+    }
+    if (!hasBody && !asString(args.key).trim()) {
+        const keys = await ctx.api.listIssueDocuments(issueId).catch(() => []);
+        if (keys.some((d) => d.key === slugifyDocumentKey(action))) {
+            args.action = "read";
+            args.key = action;
+        }
+    }
+    return args;
 }
 const partialDocumentCalls = new WeakMap();
 const DOCUMENT_CALL_FIELDS = ["key", "body", "title", "change_summary"];
@@ -1153,7 +1208,9 @@ const DOCUMENT_CALL_FIELDS = ["key", "body", "title", "change_summary"];
  * through. Holding the half that arrived lets the next call supply the rest.
  */
 function mergePartialDocumentCall(partial, label, issueId, action, args) {
-    if (!partial || partial.label !== label || partial.issueId !== issueId || partial.action !== action)
+    if (!partial || partial.label !== label || partial.issueId !== issueId)
+        return args;
+    if (partial.action !== action && partial.action !== "")
         return args;
     const merged = { ...args };
     for (const field of DOCUMENT_CALL_FIELDS) {
@@ -1164,12 +1221,22 @@ function mergePartialDocumentCall(partial, label, issueId, action, args) {
     return merged;
 }
 /** read / write / list documents on one issue — shared by issue_document and library. */
-async function runDocumentAction(ctx, label, issueId, rawArgs) {
+async function runDocumentAction(ctx, label, issueId, originalArgs) {
+    const rawArgs = await normalizeDocumentArgs(ctx, issueId, originalArgs);
     const action = asString(rawArgs.action);
     // A held half is only good for the very next document call.
     const partial = partialDocumentCalls.get(ctx);
     partialDocumentCalls.delete(ctx);
     switch (action) {
+        case "": {
+            if (typeof rawArgs.body === "string" && rawArgs.body.length > 0) {
+                // Either write or append may claim it; the model chose neither.
+                partialDocumentCalls.set(ctx, { label, issueId, action: "", args: rawArgs });
+                return fail("action is missing. Your body was received and is held: send action='write' (create/replace) or " +
+                    "action='append' (add to the end), with key — you don't need to resend body.");
+            }
+            return fail("action is missing. Send action='list' to see documents, or just {\"key\":\"<key>\"} to read one.");
+        }
         case "list":
             return safeCall(`${label}(list)`, async () => summarizeDocumentList(await ctx.api.listIssueDocuments(issueId)));
         case "read": {
@@ -1200,7 +1267,7 @@ async function runDocumentAction(ctx, label, issueId, rawArgs) {
             return safeCall(`${label}(append)`, () => appendDocument(issueDocumentStore(ctx, issueId), key, args, "action='write'"));
         }
         default:
-            return fail("action must be one of: read, write, append, list.");
+            return fail("action must be one of: read, write, append, list. To read a document you can send just {\"key\":\"<key>\"}.");
     }
 }
 function issueDocumentStore(ctx, issueId) {
@@ -1280,14 +1347,13 @@ function issueDocumentTool(ctx) {
                     "shared material other agents and future runs rely on, use `library`. Writing to an existing " +
                     "key adds a new revision; it does not delete history. To add one entry to an existing document " +
                     "instead of changing it, use action='append' with just the new text — much cheaper than " +
-                    "action='write', which requires resending the whole document every time.",
+                    "action='write', which requires resending the whole document every time. {key} alone reads a document.",
                 parameters: {
                     type: "object",
                     properties: {
                         ...DOCUMENT_ACTION_PROPERTIES,
                         issue_id: { type: "string", description: "Issue id or identifier. Omit to use the current issue." },
                     },
-                    required: ["action"],
                 },
             },
         },
@@ -1329,11 +1395,11 @@ function libraryTool(ctx) {
                     "review-log line, a sign-off, a status update — use action='append' and send only the new text; " +
                     "it's far cheaper than action='write', which requires resending the entire document every time. " +
                     "Reserve 'write' for creating a new document or changing content earlier in an existing one. " +
+                    "To read a document, {key} alone is enough. " +
                     "There is no private or hidden storage.",
                 parameters: {
                     type: "object",
                     properties: DOCUMENT_ACTION_PROPERTIES,
-                    required: ["action"],
                 },
             },
         },

@@ -1106,6 +1106,43 @@ describe("execute()", () => {
     expect(findTranscriptResultEntry(ctx)?.subtype).toBe("completed");
   });
 
+  it("recovers from batched keyless library reads with a key-only read (DEBA-97)", async () => {
+    // DEBA-97: three library({action:'read'}) calls in one response, then the
+    // same again, until the repeat guard fired. The error now names {key}.
+    const noKey = toolCallResponse([
+      { id: "call-a", name: "library", args: { action: "read" } },
+      { id: "call-b", name: "library", args: { action: "read" } },
+      { id: "call-c", name: "library", args: { action: "read" } },
+    ]);
+    const keyOnly = toolCallResponse([{ id: "call-d", name: "library", args: { key: "analytics-latest-6-posts" } }]);
+    fetchMock = setupFetchMock([noKey, keyOnly, assistantResponse("Read it.")], {
+      api: (method, path) => {
+        if (method !== "GET") return undefined;
+        if (path === "/api/companies/company-1/issues") {
+          return Response.json([
+            { id: "lib-1", identifier: "DEBA-45", issueNumber: 45, title: "Company Library", status: "backlog" },
+          ]);
+        }
+        if (path === "/api/issues/lib-1/documents") {
+          return Response.json([{ key: "analytics-latest-6-posts" }, { key: "content-log" }]);
+        }
+        if (path === "/api/issues/lib-1/documents/analytics-latest-6-posts") {
+          return Response.json({ key: "analytics-latest-6-posts", body: "# Analytics", latestRevisionId: "rev-9" });
+        }
+        return undefined;
+      },
+    });
+
+    const ctx = makeContext();
+    await execute(ctx);
+
+    const chatBodies = fetchMock.calls.filter((c) => c.path.endsWith("/chat/completions")).map((c) => c.body as any);
+    const toolResults = (n: number) => chatBodies[n].messages.filter((m: any) => m.role === "tool");
+    expect(JSON.parse(toolResults(1)[0].content).error).toContain('Send just {"key":"analytics-latest-6-posts"}');
+    expect(toolResults(2)[3].content).toContain("# Analytics");
+    expect(findTranscriptResultEntry(ctx)?.subtype).toBe("completed");
+  });
+
   it("stops at max_turns and blocks the issue with a reason", async () => {
     fetchMock = setupFetchMock([toolCallResponse([{ id: "call-1", name: "list_agents", args: {} }])]);
 
