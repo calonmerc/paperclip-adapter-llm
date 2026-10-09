@@ -319,7 +319,7 @@ function configuredMaxTokens(config) {
     const n = Number(config.maxTokens);
     return Number.isFinite(n) && n > 0 ? Math.floor(n) : undefined;
 }
-async function callChatCompletions(apiKey, config, endpoints, messages, tools, maxTokensOverride) {
+async function callChatCompletions(apiKey, config, endpoints, messages, tools, maxTokensOverride, toolChoice = "auto") {
     const body = {
         model: config.model || "openrouter/auto",
         messages,
@@ -335,7 +335,7 @@ async function callChatCompletions(apiKey, config, endpoints, messages, tools, m
         body.max_tokens = maxTokens;
     if (tools.length > 0) {
         body.tools = toolSchemas(tools);
-        body.tool_choice = "auto";
+        body.tool_choice = toolChoice;
     }
     if (config.reasoning)
         body.reasoning = { effort: config.reasoningEffort ?? "medium" };
@@ -465,6 +465,65 @@ function annotateResult(resultContent, extra) {
     }
     const lines = Object.entries(extra).map(([k, v]) => `${k}: ${typeof v === "string" ? v : JSON.stringify(v)}`);
     return `${resultContent}\n\n${lines.join("\n")}`;
+}
+/**
+ * Sent (outside the kept history) after a 2nd identical failing call. Weak
+ * models' tool calls lose fields their reasoning says they sent, so no error
+ * text can fix the call; their plain-text replies keep them.
+ */
+function restatePrompt(toolName, arrivedFields) {
+    return (`Your last two ${toolName} calls were identical and failed the same way. Only these fields arrived: ` +
+        `${arrivedFields.length > 0 ? arrivedFields.join(", ") : "none"}. Anything else you put in the call was lost ` +
+        `before it reached the tool. Don't call a tool in this reply: write the ${toolName} arguments as one JSON ` +
+        "object and nothing else, and it will be run for you. The fields that arrived are kept, so you can send " +
+        "only the missing or wrong ones. If the error says this call can't work, change the arguments the way it says.");
+}
+function asArgsObject(value) {
+    return value && typeof value === "object" && !Array.isArray(value) ? value : null;
+}
+/**
+ * The arguments a model wrote as text when asked to restate a failing call:
+ * a JSON object (fenced or in prose, or wrapped as {name, arguments}), or
+ * GLM's raw <arg_key>/<arg_value> markup when the provider leaves it unparsed.
+ */
+export function parseRestatedArgs(text, toolName) {
+    // Markup first: its values can hold JSON objects of their own.
+    const pairs = [...text.matchAll(/<arg_key>([\s\S]*?)<\/arg_key>\s*<arg_value>([\s\S]*?)<\/arg_value>/g)];
+    if (pairs.length > 0) {
+        return Object.fromEntries(pairs.map(([, key, value]) => {
+            const trimmed = value.trim();
+            if (/^[[{]/.test(trimmed)) {
+                try {
+                    return [key.trim(), JSON.parse(trimmed)];
+                }
+                catch {
+                    // Keep it as text.
+                }
+            }
+            return [key.trim(), trimmed];
+        }));
+    }
+    const end = text.lastIndexOf("}");
+    for (let start = text.indexOf("{"); start !== -1 && start < end; start = text.indexOf("{", start + 1)) {
+        let parsed;
+        try {
+            parsed = asArgsObject(JSON.parse(text.slice(start, end + 1)));
+        }
+        catch {
+            continue;
+        }
+        if (!parsed)
+            continue;
+        if (parsed.name === toolName && "arguments" in parsed) {
+            const inner = parsed.arguments;
+            if (typeof inner !== "string")
+                return asArgsObject(inner);
+            const unwrapped = parseToolArgs(inner);
+            return unwrapped.ok ? unwrapped.args : null;
+        }
+        return parsed;
+    }
+    return null;
 }
 // ----- main -----
 export async function execute(ctx) {
@@ -777,10 +836,10 @@ export async function execute(ctx) {
                 reportedCostUsd += usage.cost_details?.upstream_inference_cost ?? 0;
         }
     };
-    const timedChatCall = async (maxTokensOverride) => {
+    const timedChatCall = async (maxTokensOverride, request = {}) => {
         const started = performance.now();
         try {
-            return await withTransientRetry(() => callChatCompletions(apiKey, config, endpoints, messages, tools, maxTokensOverride), (msg) => emitSystem(onLog, msg));
+            return await withTransientRetry(() => callChatCompletions(apiKey, config, endpoints, request.messages ?? messages, tools, maxTokensOverride, request.toolChoice), (msg) => emitSystem(onLog, msg));
         }
         finally {
             modelMs += performance.now() - started;
@@ -831,6 +890,102 @@ export async function execute(ctx) {
     // misreads an error message and keeps "fixing" it the same wrong way.
     const recentCalls = [];
     const REPEAT_THRESHOLD = 3;
+    const rememberCall = (callSig) => {
+        recentCalls.push(callSig);
+        if (recentCalls.length > REPEAT_THRESHOLD)
+            recentCalls.shift();
+    };
+    // Failing calls already restated once; a second restate of the same call
+    // wouldn't learn anything new, so the repeat guard takes it from there.
+    const restatedSigs = new Set();
+    /** Runs a call whose arguments parsed and records any disposition it makes. */
+    const runParsedCall = async (toolName, args) => {
+        const tool = findTool(tools, toolName);
+        let content;
+        let isError;
+        if (!tool) {
+            content = JSON.stringify(unknownToolError(toolName, tools));
+            isError = true;
+        }
+        else {
+            toolCallsExecuted += 1;
+            try {
+                ({ content, isError } = await tool.execute(args));
+            }
+            catch (err) {
+                content = JSON.stringify({ error: err instanceof Error ? err.message : String(err) });
+                isError = true;
+            }
+        }
+        if (isError) {
+            // Weak models drop fields they believe they sent (DEBA-66/69/77) and
+            // then resend the "same" call; show them which fields actually arrived.
+            return { content: annotateResult(content, { received_fields: Object.keys(args) }), isError };
+        }
+        if (targetsCurrentIssue({ currentIssueId, currentIssueIdentifier }, args.issue_id)) {
+            // update_issue_status refuses non-disposition statuses on the
+            // current issue, so any success here is a real disposition.
+            // update_issue accepts a status too (models mix the two up).
+            if (toolName === "update_issue_status" ||
+                (toolName === "update_issue" && typeof args.status === "string" && args.status)) {
+                dispositionRecorded = true;
+                if (typeof args.comment === "string" && args.comment.trim())
+                    commentedOnCurrentIssue = true;
+            }
+            if (toolName === "add_comment")
+                commentedOnCurrentIssue = true;
+        }
+        return { content, isError };
+    };
+    /**
+     * After a 2nd identical failing call, asks the model for the arguments as
+     * plain text and runs the tool with them. Any failure here leaves the run
+     * as it was: the model has the repeat warning, and the guard still applies.
+     */
+    const restateFailingCall = async (failing) => {
+        restatedSigs.add(failing.callSig);
+        const { toolName } = failing;
+        let response;
+        try {
+            response = await timedChatCall(undefined, {
+                messages: [...messages, { role: "user", content: restatePrompt(toolName, Object.keys(failing.args)) }],
+                toolChoice: "none",
+            });
+            addUsage(response);
+        }
+        catch (err) {
+            await emitSystem(onLog, `Asking the model to restate its ${toolName} arguments failed: ${err instanceof Error ? err.message : String(err)}`);
+            return;
+        }
+        const reply = response.choices?.[0]?.message;
+        if (typeof reply?.reasoning === "string" && reply.reasoning)
+            await emitThinking(onLog, reply.reasoning);
+        // Providers that ignore tool_choice "none" answer with a tool call instead.
+        const asToolCall = reply?.tool_calls?.find((tc) => tc.function.name === toolName);
+        const replyText = asToolCall ? asToolCall.function.arguments : typeof reply?.content === "string" ? reply.content : "";
+        const parsedToolCall = asToolCall ? parseToolArgs(asToolCall.function.arguments) : null;
+        const restated = parsedToolCall ? (parsedToolCall.ok ? parsedToolCall.args : null) : parseRestatedArgs(replyText, toolName);
+        const shown = replyText.length > 1000 ? `${replyText.slice(0, 1000)}…` : replyText;
+        const merged = restated ? { ...failing.args, ...restated } : null;
+        const mergedSig = merged ? `${toolName}::${JSON.stringify(merged)}` : null;
+        if (!merged || mergedSig === failing.callSig) {
+            await emitSystem(onLog, `${toolName} failed twice with identical arguments; asked the model to restate them as text, but its ` +
+                `reply ${merged ? "changed nothing" : "had no JSON arguments"}: ${shown || "(empty)"}`);
+            return;
+        }
+        await emitSystem(onLog, `${toolName} failed twice with identical arguments; the model restated them as text: ${shown}`);
+        const toolUseId = `${failing.toolUseId}-restated`;
+        messages.push({
+            role: "assistant",
+            content: "",
+            tool_calls: [{ id: toolUseId, type: "function", function: { name: toolName, arguments: JSON.stringify(merged) } }],
+        });
+        await emitToolCall(onLog, { name: toolName, input: merged, toolUseId });
+        const { content, isError } = await runParsedCall(toolName, merged);
+        await emitToolResult(onLog, { toolUseId, toolName, content, isError });
+        messages.push({ role: "tool", tool_call_id: toolUseId, content });
+        rememberCall(mergedSig);
+    };
     try {
         while (turn < maxTurns) {
             turn += 1;
@@ -932,6 +1087,7 @@ export async function execute(ctx) {
             // can't see the first one's result (or the repeat warning) before
             // sending the others, so they must not count toward the repeat guard.
             const ranThisResponse = new Map();
+            let restateCandidate;
             // Execute each tool call and append the results.
             for (const { tc, parsed } of parsedCalls) {
                 const toolName = tc.function.name;
@@ -953,7 +1109,6 @@ export async function execute(ctx) {
                     messages.push({ role: "tool", tool_call_id: tc.id, content: duplicateContent });
                     continue;
                 }
-                const tool = findTool(tools, toolName);
                 let resultContent;
                 let isError;
                 if (!parsed.ok) {
@@ -964,37 +1119,17 @@ export async function execute(ctx) {
                     });
                     isError = true;
                 }
-                else if (!tool) {
-                    resultContent = JSON.stringify(unknownToolError(toolName, tools));
-                    isError = true;
-                }
                 else {
-                    toolCallsExecuted += 1;
-                    try {
-                        const out = await tool.execute(args);
-                        resultContent = out.content;
-                        isError = out.isError;
-                    }
-                    catch (err) {
-                        resultContent = JSON.stringify({
-                            error: err instanceof Error ? err.message : String(err),
-                        });
-                        isError = true;
-                    }
+                    ({ content: resultContent, isError } = await runParsedCall(toolName, args));
                 }
                 ranThisResponse.set(callSig, isError);
-                if (isError) {
-                    const extra = {};
-                    // Weak models drop fields they believe they sent (DEBA-66/69/77) and
-                    // then resend the "same" call; show them which fields actually arrived.
-                    if (parsed.ok)
-                        extra.received_fields = Object.keys(args);
+                if (isError && recentCalls[recentCalls.length - 1] === callSig) {
                     // The model gets no other signal that the guard below is about to end
                     // the run; weak models resend a failing call verbatim.
-                    if (recentCalls[recentCalls.length - 1] === callSig)
-                        extra.warning = REPEAT_WARNING;
-                    if (Object.keys(extra).length > 0)
-                        resultContent = annotateResult(resultContent, extra);
+                    resultContent = annotateResult(resultContent, { warning: REPEAT_WARNING });
+                    if (!restateCandidate && !restatedSigs.has(callSig) && findTool(tools, toolName)) {
+                        restateCandidate = { toolName, args, toolUseId: tc.id, callSig };
+                    }
                 }
                 await emitToolResult(onLog, {
                     toolUseId: tc.id,
@@ -1002,27 +1137,12 @@ export async function execute(ctx) {
                     content: resultContent,
                     isError,
                 });
-                if (!isError && targetsCurrentIssue({ currentIssueId, currentIssueIdentifier }, args.issue_id)) {
-                    // update_issue_status refuses non-disposition statuses on the
-                    // current issue, so any success here is a real disposition.
-                    // update_issue accepts a status too (models mix the two up).
-                    if (toolName === "update_issue_status" ||
-                        (toolName === "update_issue" && typeof args.status === "string" && args.status)) {
-                        dispositionRecorded = true;
-                        if (typeof args.comment === "string" && args.comment.trim())
-                            commentedOnCurrentIssue = true;
-                    }
-                    if (toolName === "add_comment")
-                        commentedOnCurrentIssue = true;
-                }
                 messages.push({
                     role: "tool",
                     tool_call_id: tc.id,
                     content: resultContent,
                 });
-                recentCalls.push(callSig);
-                if (recentCalls.length > REPEAT_THRESHOLD)
-                    recentCalls.shift();
+                rememberCall(callSig);
                 if (recentCalls.length === REPEAT_THRESHOLD &&
                     recentCalls.every((s) => s === callSig)) {
                     await writeRawStderr(onLog, `[llm] Tool "${toolName}" called ${REPEAT_THRESHOLD}x with identical args — breaking loop.`);
@@ -1042,6 +1162,11 @@ export async function execute(ctx) {
                     stoppedReason = "completed";
                     break;
                 }
+            }
+            // Only once every call in the response has its result, so the
+            // restate request's history is valid.
+            if (restateCandidate && stoppedReason !== "repeat_loop" && !interactionCreated.value) {
+                await restateFailingCall(restateCandidate);
             }
             if (stoppedReason === "repeat_loop")
                 break;

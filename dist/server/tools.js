@@ -1126,25 +1126,29 @@ function summarizeDocumentList(docs) {
         };
     });
 }
+/** The issue's document keys, or null if Paperclip couldn't list them. */
+async function documentKeys(ctx, issueId) {
+    try {
+        return (await ctx.api.listIssueDocuments(issueId))
+            .map((d) => d.key)
+            .filter((k) => typeof k === "string" && k.length > 0);
+    }
+    catch {
+        return null;
+    }
+}
 /**
  * Weak models resend a call that's missing `key` unchanged until the repeat
  * guard kills the run, so name the keys they can pick from.
  */
-async function missingKeyError(ctx, issueId, action, bodyHeld = false) {
+function missingKeyError(keys, action, bodyHeld = false) {
     const what = action === "append" ? "the document to add to" : action === "read" ? "the document to read" : "the document to write";
     const head = `key is required for action='${action}' — ${what}.`;
     const resend = bodyHeld
         ? `Your body was received and is held: resend action='${action}' with just key set — you don't need to resend body`
         : "Resend the same call with key set";
-    let keys;
-    try {
-        keys = (await ctx.api.listIssueDocuments(issueId))
-            .map((d) => d.key)
-            .filter((k) => typeof k === "string" && k.length > 0);
-    }
-    catch {
+    if (keys === null)
         return fail(`${head} Use action='list' to see the existing keys. ${resend}.`);
-    }
     const newKey = action === "write" ? " (or a new key to create a document)" : "";
     if (keys.length === 0) {
         return fail(`${head} There are no documents yet${action === "write" ? "" : "; use action='write' to create one"}. ${resend}${newKey}.`);
@@ -1192,8 +1196,8 @@ async function normalizeDocumentArgs(ctx, issueId, rawArgs) {
         return args;
     }
     if (!hasBody && !asString(args.key).trim()) {
-        const keys = await ctx.api.listIssueDocuments(issueId).catch(() => []);
-        if (keys.some((d) => d.key === slugifyDocumentKey(action))) {
+        const keys = (await documentKeys(ctx, issueId)) ?? [];
+        if (keys.includes(slugifyDocumentKey(action))) {
             args.action = "read";
             args.key = action;
         }
@@ -1220,6 +1224,17 @@ function mergePartialDocumentCall(partial, label, issueId, action, args) {
     }
     return merged;
 }
+/** A read whose key didn't arrive is unambiguous when the issue has only one document. */
+async function readDocument(ctx, label, issueId, rawKey) {
+    let key = rawKey ? slugifyDocumentKey(rawKey) : "";
+    if (!key) {
+        const keys = await documentKeys(ctx, issueId);
+        if (keys?.length !== 1)
+            return missingKeyError(keys, "read");
+        key = keys[0];
+    }
+    return safeCall(`${label}(read)`, () => ctx.api.getIssueDocument(issueId, key));
+}
 /** read / write / list documents on one issue — shared by issue_document and library. */
 async function runDocumentAction(ctx, label, issueId, originalArgs) {
     const rawArgs = await normalizeDocumentArgs(ctx, issueId, originalArgs);
@@ -1235,16 +1250,13 @@ async function runDocumentAction(ctx, label, issueId, originalArgs) {
                 return fail("action is missing. Your body was received and is held: send action='write' (create/replace) or " +
                     "action='append' (add to the end), with key — you don't need to resend body.");
             }
-            return fail("action is missing. Send action='list' to see documents, or just {\"key\":\"<key>\"} to read one.");
+            // A bare {issue_id} is a read whose key didn't arrive (DEBA-103).
+            return readDocument(ctx, label, issueId, "");
         }
         case "list":
             return safeCall(`${label}(list)`, async () => summarizeDocumentList(await ctx.api.listIssueDocuments(issueId)));
-        case "read": {
-            const rawKey = asString(rawArgs.key);
-            if (!rawKey)
-                return missingKeyError(ctx, issueId, "read");
-            return safeCall(`${label}(read)`, () => ctx.api.getIssueDocument(issueId, slugifyDocumentKey(rawKey)));
-        }
+        case "read":
+            return readDocument(ctx, label, issueId, asString(rawArgs.key));
         case "write":
         case "append": {
             const args = mergePartialDocumentCall(partial, label, issueId, action, rawArgs);
@@ -1254,7 +1266,7 @@ async function runDocumentAction(ctx, label, issueId, originalArgs) {
                 partialDocumentCalls.set(ctx, { label, issueId, action, args });
             }
             if (!rawKey)
-                return missingKeyError(ctx, issueId, action, hasBody);
+                return missingKeyError(await documentKeys(ctx, issueId), action, hasBody);
             if (!hasBody) {
                 const what = action === "append" ? " — the new text to add, not the whole document" : "";
                 return fail(`body is required for action='${action}'${what}. key='${rawKey}' is held: resend action='${action}' ` +
@@ -1429,7 +1441,7 @@ function findDocumentsTool(ctx) {
                 name: "find_documents",
                 description: "Search every document in the company (the web UI's Artifacts view) by keyword in title, body, " +
                     "or issue. Use it to find other agents' work — briefs, drafts, reports — before redoing it. Each " +
-                    "result gives the issue and key to open with issue_document (action='read', issue_id, key).",
+                    "result gives the issue and key to open with issue_document {issue_id, key}.",
                 parameters: {
                     type: "object",
                     properties: {

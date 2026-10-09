@@ -87,6 +87,12 @@ export declare const llmRetry: {
     delaysMs: number[];
     maxRetryAfterMs: number;
 };
+/**
+ * The arguments a model wrote as text when asked to restate a failing call:
+ * a JSON object (fenced or in prose, or wrapped as {name, arguments}), or
+ * GLM's raw <arg_key>/<arg_value> markup when the provider leaves it unparsed.
+ */
+export declare function parseRestatedArgs(text: string, toolName: string): Record<string, unknown> | null;
 export declare function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult>;
 export {};
 //# sourceMappingURL=execute.d.ts.map

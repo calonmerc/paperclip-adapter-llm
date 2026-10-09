@@ -27,7 +27,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { execute, llmRetry, resolveRunCost } from "../src/server/execute.js";
+import { execute, llmRetry, parseRestatedArgs, resolveRunCost } from "../src/server/execute.js";
 
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "llm-adapter-test-"));
 
@@ -972,7 +972,9 @@ describe("execute()", () => {
 
   it("breaks the loop and blocks the issue after 3 identical repeat tool calls", async () => {
     const repeatedCall = toolCallResponse([{ id: "call-x", name: "list_agents", args: {} }]);
-    fetchMock = setupFetchMock([repeatedCall, repeatedCall, repeatedCall]);
+    // The 2nd identical failure asks for the arguments as text; a reply with
+    // none leaves the guard to stop the 3rd.
+    fetchMock = setupFetchMock([repeatedCall, repeatedCall, assistantResponse("Not sure."), repeatedCall]);
 
     const ctx = makeContext();
     const result = await execute(ctx);
@@ -1100,6 +1102,9 @@ describe("execute()", () => {
     expect(first.warning).toBeUndefined();
     const second = JSON.parse(toolResults(2)[1].content);
     expect(second.warning).toContain("one more identical call stops the run");
+    // withKey answers the restate request as a tool call, as a provider that
+    // ignores tool_choice "none" would; its arguments are used all the same.
+    expect(chatBodies[2].tool_choice).toBe("none");
 
     const put = fetchMock.calls.find((c) => c.method === "PUT" && c.path === "/api/issues/lib-1/documents/content-log");
     expect((put!.body as any).body).toContain("No removals.");
@@ -1141,6 +1146,100 @@ describe("execute()", () => {
     expect(JSON.parse(toolResults(1)[0].content).error).toContain('Send just {"key":"analytics-latest-6-posts"}');
     expect(toolResults(2)[3].content).toContain("# Analytics");
     expect(findTranscriptResultEntry(ctx)?.subtype).toBe("completed");
+  });
+
+  describe("restating a repeated failing call as text", () => {
+    // DEBA-103: glm-5.3-flash's reasoning said "add key='review-log'", but every
+    // issue_document read arrived as {action, issue_id} until the repeat guard
+    // stopped the run. Two documents, so the tool can't pick one itself.
+    const noKey = toolCallResponse([
+      { id: "call-a", name: "issue_document", args: { action: "read", issue_id: "DEBA-103" } },
+    ]);
+    const reviewIssueApi = (method: string, path: string) => {
+      if (method !== "GET") return undefined;
+      if (path === "/api/issues/DEBA-103/documents") return Response.json([{ key: "review-log" }, { key: "notes" }]);
+      if (path === "/api/issues/DEBA-103/documents/review-log") {
+        return Response.json({ key: "review-log", body: "2026-10-09 — draft v2: APPROVED" });
+      }
+      return undefined;
+    };
+    const chatBodies = () =>
+      fetchMock.calls.filter((c) => c.path.endsWith("/chat/completions")).map((c) => c.body as any);
+    const logged = (ctx: Parameters<typeof execute>[0]) =>
+      (ctx.onLog as any).mock.calls.map((c: [string, string]) => c[1]).join("\n");
+
+    it("runs the call with the arguments the model writes as text (DEBA-103)", async () => {
+      fetchMock = setupFetchMock(
+        [noKey, noKey, assistantResponse('{"issue_id":"DEBA-103","key":"review-log"}'), assistantResponse("Approved.")],
+        { api: reviewIssueApi },
+      );
+
+      const ctx = makeContext();
+      await execute(ctx);
+
+      expect(fetchMock.calls.some((c) => c.method === "GET" && c.path === "/api/issues/DEBA-103/documents/review-log")).toBe(true);
+      const [, , restate, next] = chatBodies();
+      expect(restate.tool_choice).toBe("none");
+      expect(restate.messages.at(-1)).toMatchObject({ role: "user" });
+      expect(restate.messages.at(-1).content).toContain("Only these fields arrived: action, issue_id");
+      // The restate prompt isn't kept; the history shows the call that ran.
+      expect(JSON.stringify(next.messages)).not.toContain("Only these fields arrived");
+      const restatedCall = next.messages.find((m: any) => m.tool_calls?.[0]?.id === "call-a-restated");
+      expect(JSON.parse(restatedCall.tool_calls[0].function.arguments)).toEqual({
+        action: "read",
+        issue_id: "DEBA-103",
+        key: "review-log",
+      });
+      expect(next.messages.at(-1)).toMatchObject({ role: "tool", tool_call_id: "call-a-restated" });
+      expect(next.messages.at(-1).content).toContain("APPROVED");
+      expect(logged(ctx)).toContain("the model restated them as text");
+      expect(findTranscriptResultEntry(ctx)?.subtype).toBe("completed");
+    });
+
+    it("falls back to the repeat guard when the reply has no arguments", async () => {
+      fetchMock = setupFetchMock([noKey, noKey, assistantResponse("I'm not sure what went wrong."), noKey], {
+        api: reviewIssueApi,
+      });
+
+      const ctx = makeContext();
+      await execute(ctx);
+
+      expect(chatBodies()[2].tool_choice).toBe("none");
+      expect(logged(ctx)).toContain("had no JSON arguments");
+      expect(findTranscriptResultEntry(ctx)?.subtype).toBe("repeat_loop");
+    });
+
+    it("falls back to the repeat guard when the restated arguments change nothing", async () => {
+      fetchMock = setupFetchMock(
+        [noKey, noKey, assistantResponse('{"action":"read","issue_id":"DEBA-103"}'), noKey],
+        { api: reviewIssueApi },
+      );
+
+      const ctx = makeContext();
+      await execute(ctx);
+
+      expect(logged(ctx)).toContain("changed nothing");
+      expect(findTranscriptResultEntry(ctx)?.subtype).toBe("repeat_loop");
+    });
+
+    it("keeps the run going when the restate request itself fails", async () => {
+      const keyOnly = toolCallResponse([
+        { id: "call-b", name: "issue_document", args: { issue_id: "DEBA-103", key: "review-log" } },
+      ]);
+      fetchMock = setupFetchMock([noKey, noKey, keyOnly, assistantResponse("Approved.")], {
+        api: reviewIssueApi,
+        chatFailureStatus: 400,
+        chatFailAfter: 2,
+        chatFailTimes: 1,
+      });
+
+      const ctx = makeContext();
+      await execute(ctx);
+
+      expect(logged(ctx)).toContain("Asking the model to restate its issue_document arguments failed");
+      expect(fetchMock.calls.some((c) => c.path === "/api/issues/DEBA-103/documents/review-log")).toBe(true);
+      expect(findTranscriptResultEntry(ctx)?.subtype).toBe("completed");
+    });
   });
 
   it("stops at max_turns and blocks the issue with a reason", async () => {
@@ -1324,7 +1423,7 @@ describe("execute()", () => {
 
   it("keeps the repeat-loop failure as the primary error when the blocked write also fails", async () => {
     const repeatedCall = toolCallResponse([{ id: "call-x", name: "list_agents", args: {} }]);
-    fetchMock = setupFetchMock([repeatedCall, repeatedCall, repeatedCall]);
+    fetchMock = setupFetchMock([repeatedCall, repeatedCall, assistantResponse("Not sure."), repeatedCall]);
     const recordingFetch = globalThis.fetch;
     globalThis.fetch = (async (input: any, init?: any) => {
       const url = typeof input === "string" ? input : input.url;
@@ -1553,5 +1652,40 @@ describe("resolveRunCost", () => {
         source: "none",
       });
     }
+  });
+});
+
+describe("parseRestatedArgs", () => {
+  it("reads a JSON object, fenced or inside prose", () => {
+    expect(parseRestatedArgs('{"key":"review-log"}', "issue_document")).toEqual({ key: "review-log" });
+    expect(parseRestatedArgs('```json\n{"key":"review-log"}\n```', "issue_document")).toEqual({ key: "review-log" });
+    expect(parseRestatedArgs('Use {key} here: {"issue_id":"DEBA-103","key":"review-log"}', "issue_document")).toEqual({
+      issue_id: "DEBA-103",
+      key: "review-log",
+    });
+  });
+
+  it("unwraps {name, arguments} for the same tool, with arguments as an object or a string", () => {
+    expect(parseRestatedArgs('{"name":"issue_document","arguments":{"key":"a"}}', "issue_document")).toEqual({ key: "a" });
+    expect(parseRestatedArgs('{"name":"issue_document","arguments":"{\\"key\\":\\"a\\"}"}', "issue_document")).toEqual({
+      key: "a",
+    });
+    // A tool's own `name` argument isn't a wrapper.
+    expect(parseRestatedArgs('{"name":"Ryan","role":"seo"}', "hire_agent")).toEqual({ name: "Ryan", role: "seo" });
+  });
+
+  it("reads GLM <arg_key>/<arg_value> markup left unparsed by the provider", () => {
+    const markup =
+      "<tool_call>http_request\n<arg_key>url</arg_key>\n<arg_value>https://x.test/q</arg_value>\n" +
+      '<arg_key>json</arg_key>\n<arg_value>{"startDate":"2026-10-01"}</arg_value>\n</tool_call>';
+    expect(parseRestatedArgs(markup, "http_request")).toEqual({
+      url: "https://x.test/q",
+      json: { startDate: "2026-10-01" },
+    });
+  });
+
+  it("returns null when there are no arguments", () => {
+    expect(parseRestatedArgs("I'm not sure what went wrong.", "issue_document")).toBeNull();
+    expect(parseRestatedArgs("", "issue_document")).toBeNull();
   });
 });

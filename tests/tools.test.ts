@@ -978,12 +978,33 @@ describe("library", () => {
     const server = fakeLibraryServer();
     const tool = libraryTool(server.api);
     await tool.execute({ action: "write", key: "analytics-latest", body: "a" });
+    await tool.execute({ action: "write", key: "content-log", body: "b" });
 
     const result = await tool.execute({ action: "read" });
     expect(result.isError).toBe(true);
     const error = JSON.parse(result.content).error;
-    expect(error).toContain("Existing keys: analytics-latest");
+    expect(error).toContain("Existing keys: analytics-latest, content-log");
     expect(error).toContain('Send just {"key":"analytics-latest"}');
+  });
+
+  it("a keyless read of an issue's only document reads it (DEBA-103)", async () => {
+    // DEBA-103: glm-5.3-flash's reads of a review issue's one document kept
+    // arriving as {action:'read', issue_id} or {issue_id}, without key.
+    const server = fakeLibraryServer();
+    server.docs.set("DEBA-103", new Map([["review-log", { title: "Review Log", body: "APPROVED", latestRevisionId: "rev-1" }]]));
+    const tools = buildTools({ api: server.api, agentId: "agent-1", companyId: "company-1", currentIssueId: "issue-1", autoApprove: false });
+    const tool = findTool(tools, "issue_document")!;
+
+    for (const args of [{ action: "read", issue_id: "DEBA-103" }, { issue_id: "DEBA-103" }]) {
+      const result = await tool.execute(args);
+      expect(result.isError, JSON.stringify(args)).toBe(false);
+      expect(JSON.parse(result.content).body).toBe("APPROVED");
+    }
+
+    server.docs.get("DEBA-103")!.set("notes", { title: null, body: "x", latestRevisionId: "rev-2" });
+    const ambiguous = await tool.execute({ issue_id: "DEBA-103" });
+    expect(ambiguous.isError).toBe(true);
+    expect(JSON.parse(ambiguous.content).error).toContain("Existing keys: review-log, notes");
   });
 
   it("an action that isn't a known action or key still fails with the valid actions", async () => {

@@ -69,6 +69,11 @@ Users paste the run's JSON-lines transcript. To read one:
 - Every tool error must say what to do next: the right tool, the missing field, the valid values.
   A bare "invalid input" makes the model retry the same call until the repeat-loop guard kills the
   run.
+- When a call is missing a field and only one value is valid (e.g. the issue's only document), use
+  that value instead of returning an error.
+- A dropped field doesn't need its own fix in each tool. On the 2nd identical failing call,
+  `restateFailingCall` in `execute.ts` asks for the arguments as plain text and runs them. If a run
+  log still dies in `repeat_loop`, read its "restated them as text" system line first.
 - Changing what a tool does means updating all of these in the same commit: the tool's `description`,
   `DEFAULT_SYSTEM_PROMPT` if it mentions that tool, the README "Tools" section, `CHANGELOG.md` under
   `[Unreleased]`, and the tests.

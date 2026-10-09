@@ -2,6 +2,29 @@
 
 ## [Unreleased]
 
+### Fixed — repeat loop when a model's tool calls lose fields
+- On DEBA-103/104, `z-ai/glm-5.3-flash` tried to read each review issue's
+  `review-log` nine times. Every call arrived as `{action:'read', issue_id}`
+  or `{issue_id}`, even right after its reasoning said "Let me add
+  key='review-log'". The third identical call stopped the run. It was the
+  fifth incident of this kind (DEBA-66, 69, 77, 97), and each earlier fix
+  patched only the one tool involved.
+  - The 2nd identical failing call to any tool now gets one more chance. The
+    adapter asks the model, outside the kept history and with
+    `tool_choice: "none"`, to write the call's arguments as plain JSON. It
+    merges them over the fields that arrived and runs the tool itself. The
+    reply can be fenced JSON, prose with JSON in it, `{name, arguments}`, a
+    tool call (from providers that ignore `"none"`), or GLM's raw
+    `<arg_key>`/`<arg_value>` markup. If the reply has no arguments or
+    changes nothing, the run carries on as before: the warning stands and a
+    3rd identical call still stops it. The run log shows the restated text,
+    which tells whether the model or the provider's tool-call parser is
+    losing the field.
+  - `library` / `issue_document`: a read with no key (including a bare
+    `{issue_id}`) on an issue with exactly one document reads it.
+  - `find_documents` now says to open a result with `issue_document
+    {issue_id, key}` (no `action`), since fewer fields means fewer to lose.
+
 ### Fixed — repeat loop on a keyless library read
 - On DEBA-97, `z-ai/glm-5.3-flash` sent `library(action='read')` without
   `key` three times in one response, then three more times, even after the error
