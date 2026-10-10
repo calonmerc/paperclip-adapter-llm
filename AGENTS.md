@@ -71,9 +71,13 @@ Users paste the run's JSON-lines transcript. To read one:
   run.
 - When a call is missing a field and only one value is valid (e.g. the issue's only document), use
   that value instead of returning an error.
+- A field a call can't work without goes in the schema's `required`. Providers drop optional fields,
+  deliver fields in schema order (an optional field before the first one the model sends is lost),
+  and can't deliver fields that aren't in the schema, so aliases only help when they're schema fields.
 - A dropped field doesn't need its own fix in each tool. On the 2nd identical failing call,
-  `restateFailingCall` in `execute.ts` asks for the arguments as plain text and runs them. If a run
-  log still dies in `repeat_loop`, read its "restated them as text" system line first.
+  `restateFailingCall` in `execute.ts` asks for the arguments as JSON in a tool-free request and runs
+  them. If a run log still dies in `repeat_loop`, read its "Model served by" and "restate" system
+  lines first: they name the provider and what the restate reply contained.
 - Changing what a tool does means updating all of these in the same commit: the tool's `description`,
   `DEFAULT_SYSTEM_PROMPT` if it mentions that tool, the README "Tools" section, `CHANGELOG.md` under
   `[Unreleased]`, and the tests.

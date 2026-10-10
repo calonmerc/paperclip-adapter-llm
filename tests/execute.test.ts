@@ -1040,7 +1040,8 @@ describe("execute()", () => {
     const first = JSON.parse(toolResults(1)[0].content);
     expect(first.hint).toContain("sent with NO body");
     expect(first.received_fields).toEqual(["url", "method"]);
-    const [second, third] = toolResults(2).slice(1).map((m: any) => JSON.parse(m.content));
+    // chatBodies[2] is the restate request after the 2nd identical failure; `fixed` answers it.
+    const [second, third] = toolResults(3).slice(1, 3).map((m: any) => JSON.parse(m.content));
     expect(second.warning).toContain("one more identical call stops the run");
     expect(third.error).toContain("identical to an earlier call in this same response");
     expect(findTranscriptResultEntry(ctx)?.subtype).toBe("completed");
@@ -1100,11 +1101,11 @@ describe("execute()", () => {
     const first = JSON.parse(toolResults(1)[0].content);
     expect(first.error).toContain("Existing keys: analytics-latest-6-posts, content-log");
     expect(first.warning).toBeUndefined();
-    const second = JSON.parse(toolResults(2)[1].content);
+    const second = JSON.parse(toolResults(3)[1].content);
     expect(second.warning).toContain("one more identical call stops the run");
-    // withKey answers the restate request as a tool call, as a provider that
-    // ignores tool_choice "none" would; its arguments are used all the same.
-    expect(chatBodies[2].tool_choice).toBe("none");
+    // withKey answers the restate request (chatBodies[2]) with a tool call, as
+    // some providers do even with no tools sent; its arguments are used.
+    expect(chatBodies[2].tools).toBeUndefined();
 
     const put = fetchMock.calls.find((c) => c.method === "PUT" && c.path === "/api/issues/lib-1/documents/content-log");
     expect((put!.body as any).body).toContain("No removals.");
@@ -1152,14 +1153,33 @@ describe("execute()", () => {
     // DEBA-103: glm-5.3-flash's reasoning said "add key='review-log'", but every
     // issue_document read arrived as {action, issue_id} until the repeat guard
     // stopped the run. Two documents, so the tool can't pick one itself.
-    const noKey = toolCallResponse([
-      { id: "call-a", name: "issue_document", args: { action: "read", issue_id: "DEBA-103" } },
-    ]);
+    const withReasoning = (response: any, reasoning: string) => ({
+      ...response,
+      choices: [{ ...response.choices[0], message: { ...response.choices[0].message, reasoning } }],
+    });
+    const noKey = withReasoning(
+      toolCallResponse([{ id: "call-a", name: "issue_document", args: { action: "read", issue_id: "DEBA-103" } }]),
+      "Let me add key='review-log' and read Angela's verdict.",
+    );
     const reviewIssueApi = (method: string, path: string) => {
       if (method !== "GET") return undefined;
       if (path === "/api/issues/DEBA-103/documents") return Response.json([{ key: "review-log" }, { key: "notes" }]);
       if (path === "/api/issues/DEBA-103/documents/review-log") {
         return Response.json({ key: "review-log", body: "2026-10-09 — draft v2: APPROVED" });
+      }
+      return undefined;
+    };
+    const libraryApi = (method: string, path: string) => {
+      if (method !== "GET") return undefined;
+      if (path === "/api/companies/company-1/issues") {
+        return Response.json([{ id: "lib-1", identifier: "DEBA-45", issueNumber: 45, title: "Company Library", status: "backlog" }]);
+      }
+      if (path === "/api/issues/lib-1/documents") {
+        return Response.json([{ key: "analytics-latest-6-posts" }, { key: "content-log" }, { key: "published-articles" }]);
+      }
+      if (path.startsWith("/api/issues/lib-1/documents/")) {
+        const key = path.split("/").pop();
+        return Response.json({ key, body: `# ${key}`, latestRevisionId: "rev-1" });
       }
       return undefined;
     };
@@ -1179,11 +1199,17 @@ describe("execute()", () => {
 
       expect(fetchMock.calls.some((c) => c.method === "GET" && c.path === "/api/issues/DEBA-103/documents/review-log")).toBe(true);
       const [, , restate, next] = chatBodies();
-      expect(restate.tool_choice).toBe("none");
-      expect(restate.messages.at(-1)).toMatchObject({ role: "user" });
-      expect(restate.messages.at(-1).content).toContain("Only these fields arrived: action, issue_id");
-      // The restate prompt isn't kept; the history shows the call that ran.
-      expect(JSON.stringify(next.messages)).not.toContain("Only these fields arrived");
+      // A standalone request: no tools to reach for, no history, JSON only.
+      expect(restate.tools).toBeUndefined();
+      expect(restate.response_format).toEqual({ type: "json_object" });
+      expect(restate.messages).toHaveLength(2);
+      const prompt = restate.messages[1].content;
+      expect(prompt).toContain('Only these arrived: {"action":"read","issue_id":"DEBA-103"}');
+      expect(prompt).toContain("key is required for action='read'");
+      expect(prompt).toContain("Let me add key='review-log'");
+      expect(prompt).toContain('"key":{"type":"string"');
+      // The history shows only the call that ran.
+      expect(JSON.stringify(next.messages)).not.toContain("You repair a tool call");
       const restatedCall = next.messages.find((m: any) => m.tool_calls?.[0]?.id === "call-a-restated");
       expect(JSON.parse(restatedCall.tool_calls[0].function.arguments)).toEqual({
         action: "read",
@@ -1196,7 +1222,65 @@ describe("execute()", () => {
       expect(findTranscriptResultEntry(ctx)?.subtype).toBe("completed");
     });
 
-    it("falls back to the repeat guard when the reply has no arguments", async () => {
+    it("recovers a keyless library read that arrived with empty filler fields (DEBA-112)", async () => {
+      // DEBA-112: library arrived as {action:'read', body:'', change_summary:''}; the restate
+      // request with tools and full history came back empty.
+      const filler = toolCallResponse([
+        { id: "call-r", name: "library", args: { action: "read", body: "", change_summary: "" } },
+      ]);
+      fetchMock = setupFetchMock(
+        [filler, filler, assistantResponse('```json\n{"key": "published-articles"}\n```'), assistantResponse("Read it.")],
+        { api: libraryApi },
+      );
+
+      const ctx = makeContext();
+      await execute(ctx);
+
+      expect(fetchMock.calls.some((c) => c.path === "/api/issues/lib-1/documents/published-articles")).toBe(true);
+      expect(findTranscriptResultEntry(ctx)?.subtype).toBe("completed");
+    });
+
+    it("elides a long arrived value in the request and keeps it through the merge", async () => {
+      const entry = `## Review\n\n${"Checked every claim against the brief. ".repeat(20)}`;
+      const noKeyAppend = toolCallResponse([{ id: "call-p", name: "library", args: { action: "append", body: entry } }]);
+      fetchMock = setupFetchMock(
+        [
+          noKeyAppend,
+          noKeyAppend,
+          assistantResponse(`{"key":"content-log","body":"<${entry.length} chars, kept>"}`),
+          assistantResponse("Logged."),
+        ],
+        { api: libraryApi },
+      );
+
+      const ctx = makeContext();
+      await execute(ctx);
+
+      const prompt = chatBodies()[2].messages[1].content;
+      expect(prompt).toContain(`<${entry.length} chars, kept>`);
+      expect(prompt).not.toContain("Checked every claim");
+      const put = fetchMock.calls.find((c) => c.method === "PUT" && c.path === "/api/issues/lib-1/documents/content-log");
+      expect((put!.body as any).body).toContain(entry);
+    });
+
+    it("retries the restate request without response_format when the endpoint rejects it", async () => {
+      fetchMock = setupFetchMock(
+        [noKey, noKey, assistantResponse('{"key":"review-log"}'), assistantResponse("Approved.")],
+        { api: reviewIssueApi, chatFailureStatus: 400, chatFailAfter: 2, chatFailTimes: 1 },
+      );
+
+      const ctx = makeContext();
+      await execute(ctx);
+
+      const [, , rejected, retried] = chatBodies();
+      expect(rejected.response_format).toEqual({ type: "json_object" });
+      expect(retried.response_format).toBeUndefined();
+      expect(retried.messages).toEqual(rejected.messages);
+      expect(fetchMock.calls.some((c) => c.path === "/api/issues/DEBA-103/documents/review-log")).toBe(true);
+      expect(findTranscriptResultEntry(ctx)?.subtype).toBe("completed");
+    });
+
+    it("falls back to the repeat guard when the reply has no arguments, and logs why", async () => {
       fetchMock = setupFetchMock([noKey, noKey, assistantResponse("I'm not sure what went wrong."), noKey], {
         api: reviewIssueApi,
       });
@@ -1204,8 +1288,7 @@ describe("execute()", () => {
       const ctx = makeContext();
       await execute(ctx);
 
-      expect(chatBodies()[2].tool_choice).toBe("none");
-      expect(logged(ctx)).toContain("had no JSON arguments");
+      expect(logged(ctx)).toContain("had no JSON arguments (finish_reason=stop, content 29 chars, reasoning 0 chars)");
       expect(findTranscriptResultEntry(ctx)?.subtype).toBe("repeat_loop");
     });
 
@@ -1230,7 +1313,7 @@ describe("execute()", () => {
         api: reviewIssueApi,
         chatFailureStatus: 400,
         chatFailAfter: 2,
-        chatFailTimes: 1,
+        chatFailTimes: 2,
       });
 
       const ctx = makeContext();
@@ -1240,6 +1323,22 @@ describe("execute()", () => {
       expect(fetchMock.calls.some((c) => c.path === "/api/issues/DEBA-103/documents/review-log")).toBe(true);
       expect(findTranscriptResultEntry(ctx)?.subtype).toBe("completed");
     });
+  });
+
+  it("logs which provider served the model, once per change", async () => {
+    const served = (response: any, provider: string) => ({ ...response, provider });
+    fetchMock = setupFetchMock([
+      served(toolCallResponse([{ id: "call-1", name: "list_agents", args: {} }]), "Novita"),
+      served(toolCallResponse([{ id: "call-2", name: "get_issue", args: { issue_id: "issue-1" } }]), "Novita"),
+      served(assistantResponse("Done."), "Z.AI"),
+    ]);
+
+    const ctx = makeContext();
+    await execute(ctx);
+
+    const lines = (ctx.onLog as any).mock.calls.map((c: [string, string]) => c[1]).join("\n");
+    expect(lines.match(/Model served by Novita/g)).toHaveLength(1);
+    expect(lines.match(/Model served by Z\.AI/g)).toHaveLength(1);
   });
 
   it("stops at max_turns and blocks the issue with a reason", async () => {

@@ -2,6 +2,36 @@
 
 ## [Unreleased]
 
+### Fixed — `key` dropped as an optional field; restate got an empty reply
+- On DEBA-112 (Oscar's analytics run), `z-ai/glm-5.3-flash` read the library
+  as `{action:'read', body:'', change_summary:''}` three times, with empty
+  filler where `key` should be. The restate step below ran, but its request
+  (full history, `tool_choice: "none"`) came back with reasoning and **empty
+  content**, and the third identical call stopped the run.
+- Across all six incidents, only **optional** fields were lost. Tools with
+  `required` fields (`http_request.url`, `add_comment.body`,
+  `update_issue_status.status`) never lost them. `library` and
+  `issue_document` declared no `required` at all. The fields that arrived were
+  always in schema order, and an optional field before the first one the
+  model sent never arrived. That is how grammar-constrained tool decoding
+  behaves, though a provider parser bug can't be ruled out without a live
+  probe.
+  - `library` / `issue_document`: `key` is now `required` (and stays first).
+    A list call carries a key, which it ignores.
+  - A read without a key also takes a document named in `title` or `body`
+    (by key, by key without `.md`, or by title), since only schema fields get
+    through such grammars. The model said it would "put the key inside body".
+  - The restate request is now standalone: no tools, no history,
+    `response_format: {type: "json_object"}` (retried without it on a 400).
+    It carries the tool's schema, the fields that arrived (long values shown as
+    `<N chars, kept>` and kept through the merge), the error, and the model's
+    reasoning from the failing turn.
+  - A failed restate logs its `finish_reason`, content and reasoning lengths,
+    and any tool calls, instead of "(empty)".
+  - The run log names the provider that served the model ("Model served by
+    …"), and again whenever it changes. The DEBA-103 and DEBA-112 runs came
+    from different providers.
+
 ### Fixed — repeat loop when a model's tool calls lose fields
 - On DEBA-103/104, `z-ai/glm-5.3-flash` tried to read each review issue's
   `review-log` nine times. Every call arrived as `{action:'read', issue_id}`

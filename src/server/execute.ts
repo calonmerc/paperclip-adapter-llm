@@ -91,6 +91,8 @@ interface ChatMessage {
 
 interface ChatCompletionResponse {
   id: string;
+  /** OpenRouter: the upstream provider that served this response. */
+  provider?: string;
   choices: Array<{
     finish_reason: string | null;
     message: {
@@ -425,7 +427,7 @@ async function callChatCompletions(
   messages: ChatMessage[],
   tools: Tool[],
   maxTokensOverride?: number,
-  toolChoice: "auto" | "none" = "auto",
+  responseFormat?: { type: "json_object" },
 ): Promise<ChatCompletionResponse> {
   const body: Record<string, unknown> = {
     model: config.model || "openrouter/auto",
@@ -441,8 +443,9 @@ async function callChatCompletions(
   if (maxTokens) body.max_tokens = maxTokens;
   if (tools.length > 0) {
     body.tools = toolSchemas(tools);
-    body.tool_choice = toolChoice;
+    body.tool_choice = "auto";
   }
+  if (responseFormat) body.response_format = responseFormat;
   if (config.reasoning) body.reasoning = { effort: config.reasoningEffort ?? "medium" };
   const transforms = Array.isArray(config.transforms)
     ? config.transforms
@@ -587,19 +590,70 @@ function annotateResult(resultContent: string, extra: Record<string, unknown>): 
   return `${resultContent}\n\n${lines.join("\n")}`;
 }
 
+/** A 2nd identical failing call, to be restated as plain-text arguments. */
+interface RestateCandidate {
+  toolName: string;
+  args: Record<string, unknown>;
+  toolUseId: string;
+  callSig: string;
+  /** The failing response's reasoning and text: the model's own record of what it meant to send. */
+  notes: string;
+  /** The failing call's result. */
+  error: string;
+}
+
+const ELIDE_OVER = 300;
+
+/** Stands in for a long arrived value in the restate request; the value itself is kept. */
+function elisionMarker(value: string): string {
+  return `<${value.length} chars, kept>`;
+}
+
 /**
- * Sent (outside the kept history) after a 2nd identical failing call. Weak
- * models' tool calls lose fields their reasoning says they sent, so no error
- * text can fix the call; their plain-text replies keep them.
+ * Weak models' tool calls lose fields their reasoning says they sent, so no
+ * error text can fix the call. This asks for the arguments as JSON text in a
+ * standalone request with no tools or history: with them, glm-5.3-flash still
+ * reached for a tool call and replied with nothing (DEBA-112).
  */
-function restatePrompt(toolName: string, arrivedFields: string[]): string {
-  return (
-    `Your last two ${toolName} calls were identical and failed the same way. Only these fields arrived: ` +
-    `${arrivedFields.length > 0 ? arrivedFields.join(", ") : "none"}. Anything else you put in the call was lost ` +
-    `before it reached the tool. Don't call a tool in this reply: write the ${toolName} arguments as one JSON ` +
-    "object and nothing else, and it will be run for you. The fields that arrived are kept, so you can send " +
-    "only the missing or wrong ones. If the error says this call can't work, change the arguments the way it says."
+function restateMessages(failing: RestateCandidate, tool: Tool): ChatMessage[] {
+  const arrived = Object.fromEntries(
+    Object.entries(failing.args).map(([k, v]) => [
+      k,
+      typeof v === "string" && v.length > ELIDE_OVER ? elisionMarker(v) : v,
+    ]),
   );
+  const notes = failing.notes.length > 4000 ? `…${failing.notes.slice(-4000)}` : failing.notes;
+  const error = failing.error.length > 3000 ? `${failing.error.slice(0, 3000)}…` : failing.error;
+  const { description, parameters } = tool.schema.function;
+  const user = [
+    `A call to the tool \`${failing.toolName}\` failed twice with the same arguments: fields were lost before ` +
+      `they reached the tool. Only these arrived: ${JSON.stringify(arrived)}`,
+    `The tool replied: ${error}`,
+    `The tool: ${description}`,
+    `Its parameters (JSON schema): ${JSON.stringify(parameters)}`,
+    notes ? `What you were doing when you made the call (your own notes from that turn):\n${notes}` : "",
+    "Reply with the arguments for the call you meant to make, as one JSON object. Fields that arrived are " +
+      "kept, so you can send only the missing or wrong ones. If the tool's reply says the call can't work as " +
+      "written, change the arguments the way it says.",
+  ].filter(Boolean);
+  return [
+    {
+      role: "system",
+      content: "You repair a tool call. Reply with one JSON object, the call's complete arguments, and nothing else.",
+    },
+    { role: "user", content: user.join("\n\n") },
+  ];
+}
+
+/** Restated arguments over the ones that arrived, keeping any long value shown as its marker. */
+function mergeRestated(arrived: Record<string, unknown>, restated: Record<string, unknown>): Record<string, unknown> {
+  const merged = { ...arrived };
+  for (const [k, v] of Object.entries(restated)) {
+    const prev = arrived[k];
+    if (typeof prev === "string" && prev.length > ELIDE_OVER && v === elisionMarker(prev)) continue;
+    merged[k] = v;
+  }
+  return merged;
 }
 
 function asArgsObject(value: unknown): Record<string, unknown> | null {
@@ -990,7 +1044,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   };
   const timedChatCall = async (
     maxTokensOverride?: number,
-    request: { messages?: ChatMessage[]; toolChoice?: "auto" | "none" } = {},
+    request: { messages?: ChatMessage[]; tools?: Tool[]; responseFormat?: { type: "json_object" } } = {},
   ): Promise<ChatCompletionResponse> => {
     const started = performance.now();
     try {
@@ -1001,9 +1055,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             config,
             endpoints,
             request.messages ?? messages,
-            tools,
+            request.tools ?? tools,
             maxTokensOverride,
-            request.toolChoice,
+            request.responseFormat,
           ),
         (msg) => emitSystem(onLog, msg),
       );
@@ -1062,6 +1116,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     recentCalls.push(callSig);
     if (recentCalls.length > REPEAT_THRESHOLD) recentCalls.shift();
   };
+  // OpenRouter routes one model to several providers, and they differ in
+  // which tool-call fields they deliver; the log says which one answered.
+  let servedBy: string | undefined;
+  const noteProvider = async (response: ChatCompletionResponse): Promise<void> => {
+    if (!response.provider || response.provider === servedBy) return;
+    servedBy = response.provider;
+    await emitSystem(onLog, `Model served by ${servedBy}`);
+  };
   // Failing calls already restated once; a second restate of the same call
   // wouldn't learn anything new, so the repeat guard takes it from there.
   const restatedSigs = new Set<string>();
@@ -1112,21 +1174,23 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
    * plain text and runs the tool with them. Any failure here leaves the run
    * as it was: the model has the repeat warning, and the guard still applies.
    */
-  const restateFailingCall = async (failing: {
-    toolName: string;
-    args: Record<string, unknown>;
-    toolUseId: string;
-    callSig: string;
-  }): Promise<void> => {
+  const restateFailingCall = async (failing: RestateCandidate): Promise<void> => {
     restatedSigs.add(failing.callSig);
     const { toolName } = failing;
+    const tool = findTool(tools, toolName);
+    if (!tool) return;
+    const request = { messages: restateMessages(failing, tool), tools: [] };
     let response: ChatCompletionResponse;
     try {
-      response = await timedChatCall(undefined, {
-        messages: [...messages, { role: "user", content: restatePrompt(toolName, Object.keys(failing.args)) }],
-        toolChoice: "none",
-      });
+      try {
+        response = await timedChatCall(undefined, { ...request, responseFormat: { type: "json_object" } });
+      } catch (err) {
+        // Some endpoints reject response_format; the prompt asks for JSON anyway.
+        if (!(err instanceof LlmHttpError && err.status === 400)) throw err;
+        response = await timedChatCall(undefined, request);
+      }
       addUsage(response);
+      await noteProvider(response);
     } catch (err) {
       await emitSystem(
         onLog,
@@ -1134,21 +1198,26 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       );
       return;
     }
-    const reply = response.choices?.[0]?.message;
-    if (typeof reply?.reasoning === "string" && reply.reasoning) await emitThinking(onLog, reply.reasoning);
-    // Providers that ignore tool_choice "none" answer with a tool call instead.
+    const choice = response.choices?.[0];
+    const reply = choice?.message;
+    const reasoning = typeof reply?.reasoning === "string" ? reply.reasoning : "";
+    if (reasoning) await emitThinking(onLog, reasoning);
+    // The request has no tools, but some providers answer with a tool call anyway.
     const asToolCall = reply?.tool_calls?.find((tc) => tc.function.name === toolName);
     const replyText = asToolCall ? asToolCall.function.arguments : typeof reply?.content === "string" ? reply.content : "";
     const parsedToolCall = asToolCall ? parseToolArgs(asToolCall.function.arguments) : null;
     const restated = parsedToolCall ? (parsedToolCall.ok ? parsedToolCall.args : null) : parseRestatedArgs(replyText, toolName);
     const shown = replyText.length > 1000 ? `${replyText.slice(0, 1000)}…` : replyText;
-    const merged = restated ? { ...failing.args, ...restated } : null;
+    const merged = restated ? mergeRestated(failing.args, restated) : null;
     const mergedSig = merged ? `${toolName}::${JSON.stringify(merged)}` : null;
     if (!merged || mergedSig === failing.callSig) {
+      const toolCallNames = (reply?.tool_calls ?? []).map((tc) => tc.function.name);
       await emitSystem(
         onLog,
         `${toolName} failed twice with identical arguments; asked the model to restate them as text, but its ` +
-          `reply ${merged ? "changed nothing" : "had no JSON arguments"}: ${shown || "(empty)"}`,
+          `reply ${merged ? "changed nothing" : "had no JSON arguments"} (finish_reason=${choice?.finish_reason ?? "none"}, ` +
+          `content ${typeof reply?.content === "string" ? reply.content.length : 0} chars, reasoning ${reasoning.length} chars` +
+          `${toolCallNames.length > 0 ? `, tool calls: ${toolCallNames.join(", ")}` : ""}): ${shown || "(empty)"}`,
       );
       return;
     }
@@ -1189,6 +1258,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         break;
       }
 
+      await noteProvider(response);
       const choice = response.choices?.[0];
       if (!choice) {
         runError = { message: "LLM API returned no choices", code: "llm_empty_response" };
@@ -1277,7 +1347,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       // can't see the first one's result (or the repeat warning) before
       // sending the others, so they must not count toward the repeat guard.
       const ranThisResponse = new Map<string, boolean>();
-      let restateCandidate: Parameters<typeof restateFailingCall>[0] | undefined;
+      let restateCandidate: RestateCandidate | undefined;
 
       // Execute each tool call and append the results.
       for (const { tc, parsed } of parsedCalls) {
@@ -1323,7 +1393,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           // the run; weak models resend a failing call verbatim.
           resultContent = annotateResult(resultContent, { warning: REPEAT_WARNING });
           if (!restateCandidate && !restatedSigs.has(callSig) && findTool(tools, toolName)) {
-            restateCandidate = { toolName, args, toolUseId: tc.id, callSig };
+            restateCandidate = {
+              toolName,
+              args,
+              toolUseId: tc.id,
+              callSig,
+              notes: [reasoning, text].filter(Boolean).join("\n\n"),
+              error: resultContent,
+            };
           }
         }
 

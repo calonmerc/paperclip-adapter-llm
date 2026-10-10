@@ -87,6 +87,32 @@ describe("tools.ts", () => {
     expect(bad).toEqual([]);
   });
 
+  it("requires the document key, and every required name is a real property", () => {
+    // DEBA-66/97/103/112: the optional `key` was the field that never arrived;
+    // required fields always have.
+    const api = makeApi(async () => jsonResponse({}));
+    const tools = buildTools({
+      api, agentId: "agent-1", companyId: "company-1", currentIssueId: "issue-1", autoApprove: false,
+      secrets: { K: "v" }, config: { httpToolEnabled: true }, features: { cases: true, statusCards: true },
+    });
+    const bad: string[] = [];
+    const walk = (path: string, schema: any) => {
+      for (const name of schema.required ?? []) {
+        if (!(name in (schema.properties ?? {}))) bad.push(`${path}.${name}`);
+      }
+      for (const [k, v] of Object.entries(schema.properties ?? {})) walk(`${path}.${k}`, v);
+      if (schema.items) walk(`${path}[]`, schema.items);
+    };
+    const schemas = toolSchemas(tools);
+    for (const s of schemas) walk(s.function.name, s.function.parameters);
+    expect(bad).toEqual([]);
+    for (const name of ["library", "issue_document"]) {
+      const params = schemas.find((s) => s.function.name === name)!.function.parameters as any;
+      expect(params.required, name).toEqual(["key"]);
+      expect(Object.keys(params.properties)[0], name).toBe("key");
+    }
+  });
+
   it("findTool() finds a tool by name and returns null for unknown names", () => {
     const api = makeApi(async () => jsonResponse({}));
     const tools = buildTools({ api, agentId: "agent-1", companyId: "company-1", currentIssueId: null, autoApprove: false });
@@ -1005,6 +1031,37 @@ describe("library", () => {
     const ambiguous = await tool.execute({ issue_id: "DEBA-103" });
     expect(ambiguous.isError).toBe(true);
     expect(JSON.parse(ambiguous.content).error).toContain("Existing keys: review-log, notes");
+  });
+
+  it("a keyless read takes the document named in title or body (DEBA-112)", async () => {
+    // DEBA-112: glm-5.3-flash's reads arrived as {action, body:'', change_summary:''}, and it
+    // planned to "put the key inside body". Only in-schema fields get through some grammars.
+    const server = fakeLibraryServer();
+    const tool = libraryTool(server.api);
+    await tool.execute({ action: "write", key: "published-articles", title: "Published Articles", body: "# Live" });
+    await tool.execute({ action: "write", key: "content-log", body: "# Log" });
+
+    for (const args of [
+      { action: "read", body: "published-articles", change_summary: "" },
+      { action: "read", title: "Published Articles" },
+      { action: "read", body: "published-articles.md" },
+    ]) {
+      const result = await tool.execute(args);
+      expect(result.isError, JSON.stringify(args)).toBe(false);
+      expect(JSON.parse(result.content).body, JSON.stringify(args)).toBe("# Live");
+    }
+  });
+
+  it("a list ignores the key that the schema now requires", async () => {
+    const server = fakeLibraryServer();
+    const tool = libraryTool(server.api);
+    await tool.execute({ action: "write", key: "content-log", body: "# Log" });
+
+    for (const key of ["", "content-log"]) {
+      const result = await tool.execute({ key, action: "list" });
+      expect(result.isError).toBe(false);
+      expect(JSON.parse(result.content).documents.map((d: any) => d.key)).toEqual(["content-log"]);
+    }
   });
 
   it("an action that isn't a known action or key still fails with the valid actions", async () => {

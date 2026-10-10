@@ -1206,15 +1206,16 @@ function listInteractionsTool(ctx: BuildToolsContext): Tool {
   };
 }
 
-// `key` comes first: models emit fields in schema order and lose the later
-// ones, and the key is what identifies the document.
+// `key` is first and required: tool calls arrive in schema order, and an
+// optional field before the first one the model sends never arrives
+// (DEBA-66/97/103/112). Required fields always have.
 const DOCUMENT_ACTION_PROPERTIES = {
   key: {
     type: "string",
     description:
       "Short id for the document, e.g. 'content-log' or 'weekly-report'. Lowercase letters, " +
-      "numbers, - and _ only — anything else is auto-slugified. Required for read/write/append. " +
-      "{key} alone reads that document.",
+      "numbers, - and _ only — anything else is auto-slugified. Required. For action='list' send " +
+      "any value; it's ignored. {key} alone reads that document.",
   },
   action: {
     type: "string",
@@ -1259,12 +1260,15 @@ function summarizeDocumentList(docs: Record<string, unknown>[]): Record<string, 
   });
 }
 
-/** The issue's document keys, or null if Paperclip couldn't list them. */
-async function documentKeys(ctx: BuildToolsContext, issueId: string): Promise<string[] | null> {
+/** The issue's documents, or null if Paperclip couldn't list them. */
+async function listDocuments(
+  ctx: BuildToolsContext,
+  issueId: string,
+): Promise<Array<{ key: string; title: string | null }> | null> {
   try {
     return (await ctx.api.listIssueDocuments(issueId))
-      .map((d) => d.key)
-      .filter((k): k is string => typeof k === "string" && k.length > 0);
+      .filter((d): d is Record<string, unknown> & { key: string } => typeof d.key === "string" && d.key.length > 0)
+      .map((d) => ({ key: d.key, title: typeof d.title === "string" ? d.title : null }));
   } catch {
     return null;
   }
@@ -1333,8 +1337,8 @@ async function normalizeDocumentArgs(
     return args;
   }
   if (!hasBody && !asString(args.key).trim()) {
-    const keys = (await documentKeys(ctx, issueId)) ?? [];
-    if (keys.includes(slugifyDocumentKey(action))) {
+    const docs = (await listDocuments(ctx, issueId)) ?? [];
+    if (docs.some((d) => d.key === slugifyDocumentKey(action))) {
       args.action = "read";
       args.key = action;
     }
@@ -1375,18 +1379,33 @@ function mergePartialDocumentCall(
   return merged;
 }
 
-/** A read whose key didn't arrive is unambiguous when the issue has only one document. */
+/**
+ * A read whose key didn't arrive: the issue's only document, or one named in
+ * `title`/`body`. Only in-schema fields get through some providers' tool-call
+ * grammars, and glm-5.3-flash planned to "put the key inside body" (DEBA-112).
+ */
 async function readDocument(
   ctx: BuildToolsContext,
   label: string,
   issueId: string,
-  rawKey: string,
+  args: Record<string, unknown>,
 ): Promise<ToolExecutionResult> {
+  const rawKey = asString(args.key);
   let key = rawKey ? slugifyDocumentKey(rawKey) : "";
   if (!key) {
-    const keys = await documentKeys(ctx, issueId);
-    if (keys?.length !== 1) return missingKeyError(keys, "read");
-    key = keys[0]!;
+    const docs = await listDocuments(ctx, issueId);
+    const named = [args.title, args.body]
+      .map((v) => (typeof v === "string" && v.length <= 200 ? v.trim() : ""))
+      .filter(Boolean)
+      .map((v) => {
+        const asKeys = [slugifyDocumentKey(v), slugifyDocumentKey(v.replace(/\.md$/i, ""))];
+        return docs?.find((d) => asKeys.includes(d.key) || d.title === v);
+      })
+      .find(Boolean);
+    const only = docs?.length === 1 ? docs[0] : undefined;
+    const doc = named ?? only;
+    if (!doc) return missingKeyError(docs?.map((d) => d.key) ?? null, "read");
+    key = doc.key;
   }
   return safeCall(`${label}(read)`, () => ctx.api.getIssueDocument(issueId, key));
 }
@@ -1414,14 +1433,14 @@ async function runDocumentAction(
         );
       }
       // A bare {issue_id} is a read whose key didn't arrive (DEBA-103).
-      return readDocument(ctx, label, issueId, "");
+      return readDocument(ctx, label, issueId, rawArgs);
     }
     case "list":
       return safeCall(`${label}(list)`, async () =>
         summarizeDocumentList(await ctx.api.listIssueDocuments(issueId)),
       );
     case "read":
-      return readDocument(ctx, label, issueId, asString(rawArgs.key));
+      return readDocument(ctx, label, issueId, rawArgs);
     case "write":
     case "append": {
       const args = mergePartialDocumentCall(partial, label, issueId, action, rawArgs);
@@ -1430,7 +1449,7 @@ async function runDocumentAction(
       if (!rawKey || !hasBody) {
         partialDocumentCalls.set(ctx, { label, issueId, action, args });
       }
-      if (!rawKey) return missingKeyError(await documentKeys(ctx, issueId), action, hasBody);
+      if (!rawKey) return missingKeyError((await listDocuments(ctx, issueId))?.map((d) => d.key) ?? null, action, hasBody);
       if (!hasBody) {
         const what = action === "append" ? " — the new text to add, not the whole document" : "";
         return fail(
@@ -1563,6 +1582,7 @@ function issueDocumentTool(ctx: BuildToolsContext): Tool {
             ...DOCUMENT_ACTION_PROPERTIES,
             issue_id: { type: "string", description: "Issue id or identifier. Omit to use the current issue." },
           },
+          required: ["key"],
         },
       },
     },
@@ -1610,6 +1630,7 @@ function libraryTool(ctx: BuildToolsContext): Tool {
         parameters: {
           type: "object",
           properties: DOCUMENT_ACTION_PROPERTIES,
+          required: ["key"],
         },
       },
     },
